@@ -113,7 +113,6 @@
   "account.name.copy": "Kopeeri kasutajatunnus",
   "account.name.help.domain": "{domain} on server, kus antud konto koos profiiliga asub ning kust postitused saavad alguse.",
   "account.name.help.domain_self": "{domain} on server, kus sinu konto koos profiiliga asub ning kust sinu postitused saavad alguse.",
-  "account.name.help.footer": "Nii nagu saad saata e-kirju inimestele, kes kasutavad erinevaid e-posti teenusepakkujaid, saad suhelda ka teiste Mastodoni serverite kasutajatega ning kõigi teiste kasutajatega, kelle sotsiaalrakendused ühilduvad Mastodoniga.",
   "account.name.help.header": "Kasutajatunnus on nagu e-posti aadress",
   "account.name.help.username": "{username} on selle konto kasutajanimi tema serveris. Kellelgi teisel mõnes muus serveris võib olla sama kasutajanimi.",
   "account.name.help.username_self": "{username} on sinu kasutajanimi selles serveris. Kellelgi teisel mõnes muus serveris võib olla sama kasutajanimi.",

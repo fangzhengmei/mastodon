@@ -113,7 +113,6 @@
   "account.name.copy": "Fióknév másolása",
   "account.name.help.domain": "A(z) {domain} a kiszolgáló, amely a felhasználó profilját és bejegyzéseit szolgálja ki.",
   "account.name.help.domain_self": "A(z) {domain} a kiszolgáló, amely a profilodat és bejegyzéseidet szolgálja ki.",
-  "account.name.help.footer": "Ahogy bárkinek küldhetsz e-mailt, annak is, aki más e-mail-szolgáltatót használ, úgy kapcsolatba léphetsz a más Mastodon-kiszolgálókon lévő emberekkel, és bárki mással, aki más Mastodonnal kompatibilis közösségimédia-alkalmazást használ.",
   "account.name.help.header": "A fióknév olyan, mint egy e-mail-cím",
   "account.name.help.username": "Ez a fiók felhasználóneve a kiszolgálóján: {username}. Lehet, hogy másnak egy másik kiszolgálón ugyanez a felhasználóneve.",
   "account.name.help.username_self": "Ez a felhasználóneved ezen a kiszolgálón: {username}. Lehet, hogy másnak egy másik kiszolgálón ugyanez a felhasználóneve.",

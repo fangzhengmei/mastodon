@@ -113,7 +113,6 @@
   "account.name.copy": "Láimhseáil chóipeála",
   "account.name.help.domain": "Is é {domain} an freastalaí a óstálann próifíl agus poist an úsáideora.",
   "account.name.help.domain_self": "Is é {domain} an freastalaí a óstálann do phróifíl agus do phoist.",
-  "account.name.help.footer": "Díreach mar is féidir leat ríomhphoist a sheoladh chuig daoine ag baint úsáide as soláthraithe ríomhphoist éagsúla, is féidir leat idirghníomhú le daoine ar fhreastalaithe Mastodon eile, agus le duine ar bith ar aipeanna sóisialta eile atá comhoiriúnach le Mastodon.",
   "account.name.help.header": "Is cosúil le seoladh ríomhphoist é láimhseáil",
   "account.name.help.username": "Is é {username} ainm úsáideora an chuntais seo ar a bhfreastalaí. D’fhéadfadh an t-ainm úsáideora céanna a bheith ag duine éigin ar fhreastalaí eile.",
   "account.name.help.username_self": "Is é {username} d'ainm úsáideora ar an bhfreastalaí seo. D'fhéadfadh an t-ainm úsáideora céanna a bheith ag duine éigin ar fhreastalaí eile.",
