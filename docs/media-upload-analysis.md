@@ -1,146 +1,71 @@
-# Mastodon 媒体上传完整链路分析
+# Mastodon 媒体上传完整链路深度分析
 
 ## 目录
 
 1. [概述](#概述)
-2. [客户端上传流程](#客户端上传流程)
-3. [服务端转码处理](#服务端转码处理)
-4. [存储系统实现](#存储系统实现)
-5. [远端实例缓存机制](#远端实例缓存机制)
-6. [缓存生命周期管理](#缓存生命周期管理)
-7. [总结](#总结)
+2. [API v1 与 v2 的精确差异](#api-v1-与-v2-的精确差异)
+3. [延迟处理机制深度解析](#延迟处理机制深度解析)
+4. [不同媒体类型的处理差异](#不同媒体类型的处理差异)
+5. [存储系统实现](#存储系统实现)
+6. [远程媒体缓存完整生命周期](#远程媒体缓存完整生命周期)
+7. [缓存保留策略的设计取舍](#缓存保留策略的设计取舍)
+8. [总结](#总结)
 
 ---
 
 ## 概述
 
-Mastodon 的媒体处理系统是一个复杂的多阶段流程，涵盖了从客户端上传、服务端转码、分布式存储，到联邦网络中的缓存同步与生命周期管理的完整链路。本文档基于代码分析，详细解析这一流程的每个环节。
+本文档是对 Mastodon 媒体处理系统的深度源码分析，纠正了之前的一些误解，特别是关于 API v1/v2 的状态码行为、延迟处理机制的精确触发条件，以及远程缓存的完整生命周期和保留策略的设计取舍。
 
 ---
 
-## 客户端上传流程
+## API v1 与 v2 的精确差异
 
-### API 版本差异
+### 之前的误解
 
-Mastodon 提供了两个版本的媒体上传 API，它们在处理方式上有重要差异：
+❌ **错误理解**:
+- API v1 可能返回 206 Partial Content
+- API v2 对所有媒体类型都延迟处理
 
-#### API v1 (`/api/v1/media`)
+### 精确分析
 
-**文件位置**: `app/controllers/api/v1/media_controller.rb`
+#### 核心代码位置
 
-**核心特性**:
-- 同步处理：上传后立即进行转码处理
-- 响应状态码：
-  - `200 OK` - 处理完成
-  - `206 Partial Content` - 仍在处理中（`not_processed?`）
-- 适用场景：简单图片上传，即时可用
-
-**关键代码**:
+**状态码决定逻辑**:
 ```ruby
-# app/controllers/api/v1/media_controller.rb:13-21
-def create
-  @media_attachment = current_account.media_attachments.create!(media_attachment_params)
-  render json: @media_attachment, serializer: REST::MediaAttachmentSerializer
-end
-
+# app/controllers/api/v1/media_controller.rb:39-41
 def status_code_for_media_attachment
   @media_attachment.not_processed? ? 206 : 200
 end
-```
 
-#### API v2 (`/api/v2/media`)
-
-**文件位置**: `app/controllers/api/v2/media_controller.rb`
-
-**核心特性**:
-- 异步处理：使用 `delay_processing: true` 标志
-- 响应状态码：
-  - `202 Accepted` - 已接受，正在处理中
-  - `200 OK` - 处理完成
-- 适用场景：大文件（视频、音频）上传，后台处理
-
-**关键代码**:
-```ruby
-# app/controllers/api/v2/media_controller.rb:4-22
-def create
-  @media_attachment = current_account.media_attachments.create!(media_and_delay_params)
-  render json: @media_attachment, serializer: REST::MediaAttachmentSerializer, status: status_from_media_processing
-end
-
-private
-
-def media_and_delay_params
-  { delay_processing: true }.merge(media_attachment_params)
-end
-
+# app/controllers/api/v2/media_controller.rb:20-22
 def status_from_media_processing
   @media_attachment.not_processed? ? 202 : 200
 end
 ```
 
-### 上传参数
-
-两种 API 都接受以下参数：
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `file` | File | **必填** 媒体文件本体 |
-| `thumbnail` | File | 可选缩略图（用于音频/视频） |
-| `description` | String | 媒体描述（无障碍文本，最大 1500 字符） |
-| `focus` | String | 焦点坐标，格式为 `"x,y"`，用于智能裁剪 |
-
-### 媒体类型枚举
-
-**文件位置**: `app/models/media_attachment.rb:38-39`
-
+**`not_processed?` 的定义**:
 ```ruby
-enum :type, { image: 0, gifv: 1, video: 2, unknown: 3, audio: 4 }
+# app/models/media_attachment.rb:235-237
+def not_processed?
+  processing.present? && !processing_complete?
+end
+
+# app/models/media_attachment.rb:39
 enum :processing, { queued: 0, in_progress: 1, complete: 2, failed: 3 }, prefix: true
 ```
 
-### 文件大小限制
-
-**文件位置**: `app/models/media_attachment.rb:46-51`
-
-| 媒体类型 | 大小限制 | 说明 |
-|---------|---------|------|
-| 图片 | 16 MB | `IMAGE_LIMIT` |
-| 视频/音频/GIFV | 99 MB | `VIDEO_LIMIT` |
-| 视频分辨率 | 3840×2160 px | `MAX_VIDEO_MATRIX_LIMIT` (8,294,400 像素) |
-| 视频帧率 | 120 fps | `MAX_VIDEO_FRAME_RATE` |
-| 视频帧数 | 36,000 帧 | 约 5 分钟 @ 120fps |
-
-### 支持的文件格式
-
-**文件位置**: `app/models/media_attachment.rb:53-68`
-
-**图片格式**:
-- `IMAGE_MIME_TYPES`: `image/jpeg`, `image/png`, `image/gif`, `image/heic`, `image/heif`, `image/webp`, `image/avif`
-- `IMAGE_FILE_EXTENSIONS`: `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`, `.heic`, `.heif`, `.avif`
-
-**视频格式**:
-- `VIDEO_MIME_TYPES`: `video/webm`, `video/mp4`, `video/quicktime`, `video/ogg`
-- `VIDEO_FILE_EXTENSIONS`: `.webm`, `.mp4`, `.m4v`, `.mov`
-
-**音频格式**:
-- `AUDIO_MIME_TYPES`: 多种音频格式（wav, ogg, mp3, flac, aac, m4a 等）
-- `AUDIO_FILE_EXTENSIONS`: `.ogg`, `.oga`, `.mp3`, `.wav`, `.flac`, `.opus`, `.aac`, `.m4a`, `.3gp`, `.wma`
-
----
-
-## 服务端转码处理
-
-### 处理架构
-
-Mastodon 使用 **Paperclip**（现 kt-paperclip）作为文件处理框架，通过自定义处理器（Processor）实现不同媒体类型的转码逻辑。
-
-### 延迟处理机制
-
-**文件位置**: `app/models/media_attachment.rb:283-396`
-
-当使用 API v2 或上传视频/音频等大文件时，系统采用延迟处理模式：
-
+**`processing` 状态的设置**:
 ```ruby
+# app/models/media_attachment.rb:368-370
+def set_processing
+  self.processing = delay_processing? ? :queued : :complete
+end
+```
+
+**`delay_processing?` 的完整条件**:
+```ruby
+# app/models/media_attachment.rb:283-291
 attr_writer :delay_processing
 
 def delay_processing?
@@ -150,61 +75,194 @@ end
 def larger_media_format?
   video? || gifv? || audio?
 end
-
-def set_processing
-  self.processing = delay_processing? ? :queued : :complete
-end
-
-after_commit :enqueue_processing, on: :create
-
-def enqueue_processing
-  PostProcessMediaWorker.perform_async(id) if delay_processing?
-end
 ```
 
-### 异步处理 Worker
+#### 完整真相
 
-**文件位置**: `app/workers/post_process_media_worker.rb`
+| API 版本 | 媒体类型 | `delay_processing` 设置 | `larger_media_format?` | `delay_processing?` | `processing` 状态 | `not_processed?` | 返回状态码 |
+|---------|---------|------------------------|-----------------------|--------------------|------------------|-----------------|-----------|
+| **v1** | 任意 | `nil` (未设置) | 任意 | ❌ `false` | `:complete` | ❌ `false` | **200** |
+| **v2** | 图片/静态 GIF | `true` | ❌ `false` | ❌ `false` | `:complete` | ❌ `false` | **200** |
+| **v2** | 视频/音频/动画 GIF | `true` | ✅ `true` | ✅ `true` | `:queued` | ✅ `true` | **202** |
+
+#### 关键结论
+
+1. **API v1 永远返回 200**，永远同步处理
+   - 不设置 `delay_processing` 属性
+   - `delay_processing?` 永远为 `false`
+   - `processing = :complete`
+   - `not_processed?` 永远为 `false`
+
+2. **API v2 只对视频/音频/动画 GIF 延迟处理**
+   - 设置 `delay_processing: true`
+   - 但还需要 `larger_media_format?` 为 `true`
+   - 图片上传时 v2 行为与 v1 完全相同（同步处理，返回 200）
+   - 只有视频/音频/动画 GIF 才会返回 202 Accepted
+
+3. **状态码含义差异**:
+   - v1: 206 理论上存在，但实际上永远不会触发（v1 不延迟处理）
+   - v2: 202 表示已接受，正在后台处理（仅适用于大媒体）
+
+#### API v2 的实现
 
 ```ruby
-class PostProcessMediaWorker
-  include Sidekiq::Worker
-  
-  sidekiq_options retry: 1, dead: false
+# app/controllers/api/v2/media_controller.rb:4-22
+class Api::V2::MediaController < Api::V1::MediaController
+  def create
+    @media_attachment = current_account.media_attachments.create!(media_and_delay_params)
+    render json: @media_attachment, serializer: REST::MediaAttachmentSerializer, status: status_from_media_processing
+  end
 
-  def perform(media_attachment_id)
-    media_attachment = MediaAttachment.find(media_attachment_id)
-    media_attachment.processing = :in_progress
-    media_attachment.save
+  private
 
-    # 保存原有元数据，因为 paperclip-av-transcoder 会覆盖
-    previous_meta = media_attachment.file_meta
+  def media_and_delay_params
+    { delay_processing: true }.merge(media_attachment_params)
+  end
 
-    media_attachment.file.reprocess!(:original)
-    media_attachment.processing = :complete
-    media_attachment.file_meta = previous_meta.merge(media_attachment.file_meta).with_indifferent_access.slice(*MediaAttachment::META_KEYS)
-    media_attachment.save
+  def status_from_media_processing
+    @media_attachment.not_processed? ? 202 : 200
   end
 end
 ```
 
-**处理失败处理**:
+---
+
+## 延迟处理机制深度解析
+
+### 之前的误解
+
+❌ **错误理解**:
+- 延迟处理会跳过所有样式的处理
+- 延迟处理期间什么都不做
+
+### 精确分析
+
+#### 核心代码：Paperclip 猴子补丁
+
 ```ruby
-sidekiq_retries_exhausted do |msg|
-  media_attachment_id = msg['args'].first
-  # 设置 processing = :failed
-  media_attachment.processing = :failed
+# lib/paperclip/attachment_extensions.rb:37-47
+# We overwrite this method to support delayed processing in
+# Sidekiq. Since we process the original file to reduce disk
+# usage, and we still want to generate thumbnails straight
+# away, it's the only style we need to exclude
+def process_style?(style_name, style_args)
+  if style_name == :original && instance.respond_to?(:delay_processing_for_attachment?) && instance.delay_processing_for_attachment?(name)
+    false  # 跳过 :original
+  else
+    style_args.empty? || style_args.include?(style_name)
+  end
+end
+```
+
+**关键注释翻译**:
+> "我们重写这个方法以支持 Sidekiq 中的延迟处理。由于我们处理 original 文件是为了减少磁盘使用，而我们仍然希望立即生成缩略图，所以这是我们唯一需要排除的样式。"
+
+#### 延迟处理的精确含义
+
+| 样式 | 是否延迟处理 | 原因 |
+|------|-------------|------|
+| **`:original`** | ✅ **延迟** | 可能是大文件（视频转码、音频转码），耗时久 |
+| **`:small`** | ❌ **立即处理** | 缩略图很小，生成快，UI 需要立即显示 |
+
+#### 延迟处理的触发条件
+
+```ruby
+# app/models/media_attachment.rb:289-291
+def delay_processing_for_attachment?(attachment_name)
+  delay_processing? && attachment_name == :file
+end
+```
+
+**完整条件链**:
+```
+delay_processing_for_attachment?(:file)
+  └── delay_processing?
+        ├── @delay_processing == true  (来自 API v2 的参数)
+        └── larger_media_format?
+              └── video? || gifv? || audio?
+```
+
+#### 异步处理 Worker
+
+```ruby
+# app/workers/post_process_media_worker.rb:22-37
+def perform(media_attachment_id)
+  media_attachment = MediaAttachment.find(media_attachment_id)
+  media_attachment.processing = :in_progress
+  media_attachment.save
+
+  # 保存原有元数据，因为 paperclip-av-transcoder 会覆盖
+  previous_meta = media_attachment.file_meta
+
+  # 只重处理 :original 样式！
+  media_attachment.file.reprocess!(:original)
+  
+  media_attachment.processing = :complete
+  media_attachment.file_meta = previous_meta.merge(media_attachment.file_meta).with_indifferent_access.slice(*MediaAttachment::META_KEYS)
   media_attachment.save
 end
 ```
 
-### 媒体类型处理器链
+#### 处理流程图
 
-**文件位置**: `app/models/media_attachment.rb:323-347`
+```
+API v2 上传视频 (large_media_format? = true)
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  MediaAttachment.create!                                      │
+│                                                               │
+│  1. before_create: set_processing                             │
+│     processing = :queued (因为 delay_processing? = true)    │
+│                                                               │
+│  2. Paperclip 处理                                            │
+│     process_style?(:original, ...)                           │
+│       └── style_name == :original && delay_processing? = true │
+│       └── 返回 false → 跳过 :original                         │
+│                                                               │
+│     process_style?(:small, ...)                              │
+│       └── style_name != :original                             │
+│       └── 返回 true → 立即处理 :small (缩略图)               │
+│                                                               │
+│  3. after_commit: enqueue_processing                          │
+│     PostProcessMediaWorker.perform_async(id)                 │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  客户端收到响应                                                │
+│  - status: 202 Accepted                                       │
+│  - processing: "queued"                                       │
+│  - 但缩略图 URL 已经可用！（:small 已处理）                   │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼ (稍后，Sidekiq 异步执行)
+┌─────────────────────────────────────────────────────────────┐
+│  PostProcessMediaWorker#perform                              │
+│                                                               │
+│  1. processing = :in_progress                                 │
+│  2. file.reprocess!(:original)  ◄─── 只处理 :original       │
+│  3. processing = :complete                                    │
+│  4. 保存元数据                                                 │
+└─────────────────────────────────────────────────────────────┘
+```
 
-根据媒体类型的不同，系统使用不同的处理器链（Processor Chain）：
+#### 设计意图
+
+这个设计非常巧妙：
+
+1. **用户体验优先**: 缩略图（`:small`）立即生成，用户在 UI 上能看到预览
+2. **后台处理重任务**: 大文件转码（`:original`）放到后台，不阻塞请求
+3. **状态可追踪**: `processing` 字段记录状态（queued → in_progress → complete/failed）
+
+---
+
+## 不同媒体类型的处理差异
+
+### 处理器链选择逻辑
 
 ```ruby
+# app/models/media_attachment.rb:337-347
 def file_processors(instance)
   if instance.file_content_type == 'image/gif'
     [:gif_transcoder, :blurhash_transcoder]
@@ -218,380 +276,424 @@ def file_processors(instance)
 end
 ```
 
-### 处理样式定义
+### 各类型处理器详解
 
-**文件位置**: `app/models/media_attachment.rb:75-174`
+#### 1. 图片 (JPG/PNG/WebP/HEIC/AVIF)
 
-不同媒体类型有不同的输出样式（Styles）：
+**处理器链**: `lazy_thumbnail` → `blurhash_transcoder` → `type_corrector`
 
+**样式选择**:
 ```ruby
-# 图片样式
-IMAGE_STYLES = {
-  original: { pixels: 8_294_400, ... },  # 3840x2160px
-  small: { pixels: 230_400, blurhash: ... }  # 640x360px
-}
+# app/models/media_attachment.rb:323-335
+def file_styles(attachment)
+  if IMAGE_CONVERTIBLE_MIME_TYPES.include?(...)  # heic, heif, avif
+    IMAGE_CONVERTED_STYLES    # 转换为 JPEG
+  elsif IMAGE_MIME_TYPES.include?(...)
+    IMAGE_STYLES               # 保持原格式
+  end
+end
+```
 
-# 视频格式定义
-VIDEO_FORMAT = {
-  format: 'mp4',
-  content_type: 'video/mp4',
-  convert_options: {
-    output: {
-      'preset' => 'veryfast',
-      'movflags' => 'faststart',      # 元数据前置，支持流式播放
-      'pix_fmt' => 'yuv420p',         # 跨浏览器兼容色彩空间
-      'c:v' => 'h264',                 # H.264 视频编码
-      'c:a' => 'aac',                  # AAC 音频编码
-      'b:a' => '192k',                 # 音频比特率
-    }
-  }
-}
-
-# 音频样式
-AUDIO_STYLES = {
-  original: {
-    format: 'mp3',
-    content_type: 'audio/mpeg',
-    convert_options: { output: { 'q:a' => 2 } }  # VBR 质量
-  }
+**IMAGE_CONVERTED_STYLES**:
+```ruby
+IMAGE_CONVERTED_STYLES = {
+  original: { format: 'jpeg', content_type: 'image/jpeg', ... },
+  small: { format: 'jpeg', ... }
 }
 ```
 
-### 核心处理器详解
+**各处理器作用**:
 
-#### 1. GIF 转码器 (`GifTranscoder`)
+| 处理器 | 作用 |
+|--------|------|
+| `lazy_thumbnail` | 智能调整尺寸，只在需要时转换；剥离元数据（仅本地上传） |
+| `blurhash_transcoder` | 生成 Blurhash 字符串（用于加载占位图） |
+| `type_corrector` | 修正文件扩展名（如 heic → jpg） |
 
-**文件位置**: `lib/paperclip/gif_transcoder.rb`
+#### 2. 静态 GIF
 
-**功能**: 
-- 检测 GIF 是否为动画（多帧）
-- 只有动画 GIF 才会被转码为视频
-- 静态 GIF 保持原样
+**处理器链**: 同图片 → `lazy_thumbnail` + `blurhash_transcoder` + `type_corrector`
 
-**关键逻辑**:
+**关键**: `GifTranscoder` 只在动画 GIF 时触发
+
 ```ruby
+# lib/paperclip/gif_transcoder.rb:122-124
+def needs_convert?
+  GifReader.animated?(file.path)  # 检查是否有超过 1 帧
+end
+```
+
+**GifReader 检测逻辑**:
+```ruby
+# lib/paperclip/gif_transcoder.rb:15-75
 class GifReader
+  def initialize(path, max_frames = 2)
+    # 解析 GIF 文件结构，统计帧数
+    # 只需要检测到第 2 帧就知道是动画
+  end
+  
   def self.animated?(path)
-    new(path).animated  # 检查是否有超过 1 帧
+    new(path).animated  # @nb_frames > 1
   end
 end
+```
 
+#### 3. 动画 GIF
+
+**处理器链**: `gif_transcoder` → `blurhash_transcoder`
+
+**样式**: `VIDEO_CONVERTED_STYLES`（转换为视频）
+
+**转换过程**:
+```ruby
+# lib/paperclip/gif_transcoder.rb:105-118
 class GifTranscoder < Paperclip::Processor
   def make
-    return File.open(@file.path) unless needs_convert?
+    return File.open(@file.path) unless needs_convert?  # 静态 GIF 跳过
     
     # 调用视频转码器转换为 MP4
     final_file = Paperclip::Transcoder.make(file, options, attachment)
     
-    # 更新元数据：类型变为 gifv
-    attachment.instance.type = MediaAttachment.types[:gifv]
-    attachment.instance.file_content_type = 'video/mp4'
-  end
-  
-  def needs_convert?
-    GifReader.animated?(file.path)  # 只处理动画 GIF
+    # 更新类型为 gifv
+    if options[:style] == :original
+      attachment.instance.file_file_name = "#{File.basename(..., '.*')}.mp4"
+      attachment.instance.file_content_type = 'video/mp4'
+      attachment.instance.type = MediaAttachment.types[:gifv]
+    end
   end
 end
 ```
 
-**注意**: 静态 GIF 不会被转码，保持为 `image` 类型；动画 GIF 会被转为 `gifv` 类型（实质上是 MP4 视频）。
+**结果**: 动画 GIF 被转换为无声 MP4，类型标记为 `gifv`
 
-#### 2. 视频转码器 (`Transcoder`)
+#### 4. 视频 (MP4/WebM/MOV)
 
-**文件位置**: `lib/paperclip/transcoder.rb`
+**处理器链**: `transcoder` → `blurhash_transcoder` → `type_corrector`
 
-**功能**:
-- 使用 FFmpeg 进行视频转码
-- 支持"透传"（Passthrough）模式：符合条件的视频直接复用流，不重新编码
-- 自动调整比特率以适应文件大小限制
-
-**关键特性**:
-
-**透传条件**:
+**样式选择**:
 ```ruby
+def file_styles(attachment)
+  if VIDEO_CONVERTIBLE_MIME_TYPES.include?(...)  # webm, quicktime
+    VIDEO_CONVERTED_STYLES    # 强制转码
+  elsif VIDEO_MIME_TYPES.include?(...)
+    VIDEO_STYLES               # 可能透传
+  end
+end
+```
+
+**透传机制（关键优化）**:
+
+```ruby
+# lib/paperclip/transcoder.rb:114-116
 def eligible_to_passthrough?(metadata)
   @passthrough_options && 
-    @passthrough_options[:video_codecs].include?(metadata.video_codec) &&  # 必须是 h264
-    @passthrough_options[:audio_codecs].include?(metadata.audio_codec) &&  # aac 或无音频
-    @passthrough_options[:colorspaces].include?(metadata.colorspace)        # yuv420p
+    @passthrough_options[:video_codecs].include?(metadata.video_codec) && 
+    @passthrough_options[:audio_codecs].include?(metadata.audio_codec) && 
+    @passthrough_options[:colorspaces].include?(metadata.colorspace)
 end
 ```
 
-**透传配置** (`app/models/media_attachment.rb:119-135`):
+**透传条件配置**:
 ```ruby
+# app/models/media_attachment.rb:119-135
 VIDEO_PASSTHROUGH_OPTIONS = {
-  video_codecs: ['h264'].freeze,
-  audio_codecs: ['aac', nil].freeze,    # nil 表示无音频
+  video_codecs: ['h264'].freeze,           # 必须是 H.264
+  audio_codecs: ['aac', nil].freeze,        # AAC 或无音频
   colorspaces: ['yuv420p', 'yuvj420p'].freeze,
   options: {
     format: 'mp4',
     convert_options: {
       output: {
-        'c:v' => 'copy',    # 视频流直接复制
-        'c:a' => 'copy',    # 音频流直接复制
+        'c:v' => 'copy',    # 视频流直接复制，不重新编码
+        'c:a' => 'copy',    # 音频流直接复制，不重新编码
       }
     }
   }
 }
 ```
 
+**透传 vs 转码对比**:
+
+| 条件 | 透传 | 转码 |
+|------|------|------|
+| 视频编码 | H.264 | 其他（VP8, VP9, 等） |
+| 音频编码 | AAC 或无 | 其他（MP3, Vorbis, 等） |
+| 色彩空间 | YUV420P / YUVJ420P | 其他 |
+| 处理方式 | 直接复制流 | FFmpeg 重新编码 |
+| 速度 | 极快 | 较慢（取决于长度） |
+| CPU 占用 | 极低 | 高 |
+
 **智能比特率计算**:
 ```ruby
+# lib/paperclip/transcoder.rb:43-55
 unless eligible_to_passthrough?(metadata)
-  # BITS_PER_PIXEL = 0.11 (H.264 High 配置的经验值)
+  # BITS_PER_PIXEL = 0.11 (H.264 High 经验值)
   desired_bitrate = (metadata.width * metadata.height * 30 * BITS_PER_PIXEL).floor
   
-  # 确保不超过文件大小限制
+  # 确保不超过文件大小限制（99MB）
   size_limit_in_bits = MediaAttachment::VIDEO_LIMIT * 8
   duration = [metadata.duration, 1].max
   maximum_bitrate = (size_limit_in_bits / duration).floor - 192_000  # 预留音频空间
   
   bitrate = [desired_bitrate, maximum_bitrate].min
+  
+  @output_options['b:v'] = bitrate
+  @output_options['maxrate'] = bitrate + 192_000
+  @output_options['bufsize'] = bitrate * 5
 end
 ```
 
 **类型修正**:
 ```ruby
+# lib/paperclip/transcoder.rb:118-120
 def update_attachment_type(metadata)
-  # 如果没有音频流，标记为 gifv 而非 video
+  # 无音频流的视频标记为 gifv
   @attachment.instance.type = MediaAttachment.types[:gifv] unless metadata.audio_codec
 end
 ```
 
-#### 3. 图片提取器 (`ImageExtractor`)
+#### 5. 音频 (MP3/Ogg/FLAC/AAC/WAV)
 
-**文件位置**: `lib/paperclip/image_extractor.rb`
+**处理器链**: `image_extractor` → `transcoder` → `type_corrector`
 
-**功能**: 为音频文件提取封面图（从视频流的第一帧）
+**样式**: `AUDIO_STYLES`（转换为 MP3）
 
+**特殊处理：封面图提取**:
 ```ruby
+# lib/paperclip/image_extractor.rb:6-49
 class ImageExtractor < Paperclip::Processor
   def make
     return @file unless options[:style] == :original
     
-    # 使用 FFmpeg 提取第一帧作为 PNG
+    # 从音频/视频中提取封面图
     image = extract_image_from_file!
     
     unless image.nil?
-      attachment.instance.thumbnail = image if image.size.positive?
+      begin
+        # 保存为缩略图
+        attachment.instance.thumbnail = image if image.size.positive?
+      ensure
+        # 清理临时文件
+        image.close(true)
+      end
     end
   end
   
   def extract_image_from_file!
+    # 使用 FFmpeg 提取第一帧
     # ffmpeg -i source -loglevel fatal -y destination.png
     command = Terrapin::CommandLine.new(
-      Rails.configuration.x.ffmpeg_binary, 
+      Rails.configuration.x.ffmpeg_binary,
       '-i :source -loglevel :loglevel -y :destination'
     )
-    command.run(source: @file.path, destination: dst.path, loglevel: 'fatal')
   end
 end
 ```
 
-#### 4. 延迟缩略图处理器 (`LazyThumbnail`)
-
-**文件位置**: `lib/paperclip/lazy_thumbnail.rb`
-
-**功能**: 智能调整图片尺寸，只在需要时进行转换
-
+**音频转码配置**:
 ```ruby
-def needs_convert?
-  needs_different_geometry? ||   # 尺寸不同
-    needs_different_format? ||    # 格式不同
-    needs_metadata_stripping?     # 本地图片需要剥离元数据
-end
-
-def needs_metadata_stripping?
-  @attachment.instance.respond_to?(:local?) && @attachment.instance.local?
-  # 注意：远程缓存的媒体不会剥离元数据，保持原样
-end
-```
-
-#### 5. 类型修正器 (`TypeCorrector`)
-
-**文件位置**: `lib/paperclip/type_corrector.rb`
-
-**功能**: 修正文件扩展名和 MIME 类型
-
-```ruby
-def make
-  return @file unless options[:format]
-  
-  target_extension = ".#{options[:format]}"
-  extension = File.extname(attachment.instance_read(:file_name))
-  
-  # 仅在 original 样式且扩展名不符时修正
-  return @file unless options[:style] == :original && target_extension && extension != target_extension
-  
-  attachment.instance_write(:content_type, options[:content_type] || ...)
-  attachment.instance_write(:file_name, File.basename(..., '.*') + target_extension)
-end
-```
-
-#### 6. Blurhash 编码器 (`BlurhashTranscoder`)
-
-**文件位置**: `lib/paperclip/blurhash_transcoder.rb`
-
-**功能**: 生成 Blurhash 字符串（用于加载时的占位图）
-
-```ruby
-class BlurhashTranscoder < Paperclip::Processor
-  def make
-    return @file unless options[:style] == :small || options[:blurhash]
-    
-    width, height, data = blurhash_params
-    # Blurhash.encode 生成模糊哈希字符串
-    attachment.instance.blurhash = Blurhash.encode(
-      width, height, data, 
-      **(options[:blurhash] || {})  # 默认 x_comp: 4, y_comp: 4
-    )
-  end
-  
-  def blurhash_params
-    # 使用 libvips 缩小图片后提取像素数据
-    image = Vips::Image.thumbnail(@file.path, 100)
-    [image.width, image.height, image.colourspace(:srgb).extract_band(0, n: 3).to_a.flatten]
-  end
-end
-```
-
-#### 7. 颜色提取器 (`ColorExtractor`)
-
-**文件位置**: `lib/paperclip/color_extractor.rb`
-
-**功能**: 从图片中提取主色调（背景色、前景色、强调色）
-
-```ruby
-def make
-  # 使用 libvips 生成颜色直方图
-  background_palette, foreground_palette = palettes_from_libvips
-  
-  # 计算对比度，选择合适的颜色组合
-  # 要求：背景与前景对比度 >= 3.0 (W3C 标准)
-  #       背景与强调色对比度 >= 2.0
-  
-  meta = {
-    colors: {
-      background: '#xxxxxx',
-      foreground: '#xxxxxx',
-      accent: '#xxxxxx',
-    },
+# app/models/media_attachment.rb:154-165
+AUDIO_STYLES = {
+  original: {
+    format: 'mp3',
+    content_type: 'audio/mpeg',
+    convert_options: {
+      output: {
+        'q:a' => 2,  # VBR 质量 (0-9，2 是高质量)
+      }
+    }
   }
-  
-  attachment.instance.file.instance_write(:meta, ...)
-end
+}
 ```
 
-### 处理样式选择逻辑
+### 媒体类型状态流转图
 
-**文件位置**: `app/models/media_attachment.rb:323-335`
-
-```ruby
-def file_styles(attachment)
-  if attachment.instance.file_content_type == 'image/gif' || VIDEO_CONVERTIBLE_MIME_TYPES.include?(...)
-    VIDEO_CONVERTED_STYLES    # 需要转码为 MP4
-  elsif IMAGE_CONVERTIBLE_MIME_TYPES.include?(...)  # heic, heif, avif
-    IMAGE_CONVERTED_STYLES    # 转换为 JPEG
-  elsif IMAGE_MIME_TYPES.include?(...)
-    IMAGE_STYLES               # 常规图片处理
-  elsif VIDEO_MIME_TYPES.include?(...)
-    VIDEO_STYLES               # 视频处理（可能透传）
-  else
-    AUDIO_STYLES               # 音频转 MP3
-  end
-end
 ```
-
-**可转换 MIME 类型**:
-```ruby
-IMAGE_CONVERTIBLE_MIME_TYPES = %w(image/heic image/heif image/avif).freeze
-VIDEO_CONVERTIBLE_MIME_TYPES = %w(video/webm video/quicktime).freeze
-```
-
-### 元数据提取
-
-**文件位置**: `app/models/media_attachment.rb:384-425`
-
-处理完成后，系统会提取并存储媒体元数据：
-
-```ruby
-def populate_meta
-  meta = (file.instance_read(:meta) || {}).with_indifferent_access.slice(*META_KEYS)
-  
-  file.queued_for_write.each do |style, file|
-    meta[style] = style == :small || image? ? 
-      image_geometry(file) :    # 图片：宽、高、尺寸、比例
-      video_metadata(file)       # 视频：宽、高、帧率、时长、比特率
-  end
-  
-  # 缩略图元数据
-  meta[:small] = image_geometry(thumbnail.queued_for_write[:original]) if thumbnail.queued_for_write.key?(:original)
-  
-  meta
-end
-```
-
-**元数据键**:
-```ruby
-META_KEYS = %i(
-  focus     # 焦点坐标
-  colors    # 提取的颜色
-  original  # 原始尺寸信息
-  small     # 缩略图尺寸信息
-).freeze
+上传文件
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  检测 MIME 类型                                                   │
+│  (before_file_validate: set_type_and_extension)                  │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ├── image/gif ──────────────────────────────────────────────┐
+    │                                                            │
+    │    ▼                                                       │
+    │  ┌─────────────────────┐                                  │
+    │  │ GifReader.animated? │                                  │
+    │  └───────────┬─────────┘                                  │
+    │              │                                            │
+    │     ┌────────┴────────┐                                   │
+    │     │                 │                                   │
+    │     ▼                 ▼                                   │
+    │  静态 GIF          动画 GIF                                │
+    │  type: image       type: (处理后变为 gifv)               │
+    │  不转码             转码为 MP4                             │
+    │                    处理器: gif_transcoder                 │
+    │                                                            │
+    ├── image/* ────────────────────────────────────────────────┤
+    │                                                            │
+    │    ▼                                                       │
+    │  图片 (JPG/PNG/WebP/HEIC/AVIF)                           │
+    │  type: image                                               │
+    │  处理器: lazy_thumbnail → blurhash_transcoder → ...      │
+    │  HEIC/AVIF 转换为 JPEG                                     │
+    │                                                            │
+    ├── video/* ────────────────────────────────────────────────┤
+    │                                                            │
+    │    ▼                                                       │
+    │  视频检测                                                   │
+    │  (check_video_dimensions 验证分辨率、帧率)                  │
+    │                                                            │
+    │  ┌─────────────────────────────────────────────────┐     │
+    │  │ eligible_to_passthrough?                         │     │
+    │  │ (H.264 + AAC + YUV420P)                          │     │
+    │  └───────────────────────┬─────────────────────────┘     │
+    │                          │                               │
+    │            ┌─────────────┴─────────────┐                 │
+    │            │                           │                 │
+    │            ▼                           ▼                 │
+    │        透传模式                      转码模式             │
+    │        c:v copy, c:a copy          FFmpeg 重新编码       │
+    │        极快，低 CPU                 较慢，高 CPU          │
+    │                                                            │
+    │  处理器: transcoder                                        │
+    │                                                            │
+    │  类型检测:                                                  │
+    │  ┌─────────────────────────────────────────────────┐     │
+    │  │ metadata.audio_codec.present?                    │     │
+    │  └───────────────────────┬─────────────────────────┘     │
+    │                          │                               │
+    │            ┌─────────────┴─────────────┐                 │
+    │            │                           │                 │
+    │            ▼                           ▼                 │
+    │        有音频                       无音频                │
+    │        type: video               type: gifv              │
+    │                                                            │
+    └── audio/* ────────────────────────────────────────────────┤
+                                                                 │
+         ▼                                                       │
+      音频文件                                                    │
+      type: audio                                                │
+                                                                 │
+      处理器: image_extractor → transcoder → type_corrector     │
+         │              │              │                         │
+         │              │              └── 修正扩展名           │
+         │              │                                         │
+         │              └── 转码为 MP3 (q:a=2, VBR 高质量)     │
+         │                                                        │
+         └── 提取封面图 → 保存为 thumbnail                       │
+                                                                 │
+                                                                 │
+  延迟处理？                                                       │
+  ┌──────────────────────────────────────────────────────────┐  │
+  │ delay_processing? = @delay_processing && larger_media_format? │
+  │                                                              │  │
+  │ larger_media_format? = video? || gifv? || audio?          │  │
+  │                                                              │  │
+  │ 结果:                                                         │  │
+  │ - 图片/静态 GIF: delay_processing? = false → 同步处理       │  │
+  │ - 视频/音频/动画 GIF:                                        │  │
+  │   - API v1: @delay_processing = nil → delay_processing? = false │
+  │   - API v2: @delay_processing = true → delay_processing? = true │
+  └──────────────────────────────────────────────────────────┘  │
+                                                                 │
+                                                                 │
+  最终类型总结:                                                  │
+  ┌────────────┬──────────────────────────────────────────────┐ │
+  │    type    │                   来源                        │ │
+  ├────────────┼──────────────────────────────────────────────┤ │
+  │   image    │ 静态图片 (JPG/PNG/WebP/HEIC/AVIF) + 静态 GIF │ │
+  │   gifv     │ 动画 GIF + 无音频的视频                       │ │
+  │   video    │ 有音频的视频                                   │ │
+  │   audio    │ 音频文件                                       │ │
+  │  unknown   │ 特殊情况（待处理）                             │ │
+  └────────────┴──────────────────────────────────────────────┘ │
+                                                                 │
+┌────────────────────────────────────────────────────────────────┤
+│                        缩略图处理 (:small)                       │
+│                                                                 │
+│  注意：:small 样式永远不会延迟！                                 │
+│  即使 delay_processing? = true，:small 也会立即处理            │
+│                                                                 │
+│  各类型的 :small 样式处理:                                       │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 图片    │ lazy_thumbnail → 生成缩小版图片                 │ │
+│  │ GIF     │ 同图片                                          │ │
+│  │ 视频    │ transcoder → 提取第 0 帧 → PNG 图片            │ │
+│  │         │ time: 0, format: 'png'                         │ │
+│  │ 音频    │ 依赖 image_extractor 提取的封面图               │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│  这样设计的目的：                                                │
+│  1. UI 需要立即显示缩略图预览                                   │
+│  2. :small 处理很快，不会阻塞请求                               │
+│  3. :original 可能是大文件转码，放到后台处理                   │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 存储系统实现
 
-Mastodon 支持多种存储后端，通过 Paperclip 抽象层统一管理。
+Mastodon 使用 Paperclip（kt-paperclip）作为文件存储抽象层，支持多种存储后端。
 
 ### 支持的存储类型
 
-**文件位置**: `config/initializers/paperclip.rb`
-
-| 存储类型 | 环境变量开关 | 说明 |
-|---------|------------|------|
-| **本地文件系统** | 默认 | 存储在 `public/system` 目录 |
-| **AWS S3** | `S3_ENABLED=true` | 亚马逊 S3 或兼容服务 |
-| **OpenStack Swift** | `SWIFT_ENABLED=true` | OpenStack 对象存储 |
-| **Azure Blob** | `AZURE_ENABLED=true` | 微软 Azure 存储 |
+| 存储类型 | 环境变量开关 | 典型使用场景 |
+|---------|-------------|-------------|
+| **本地文件系统** | 默认 | 开发、小型单用户实例 |
+| **AWS S3** | `S3_ENABLED=true` | 生产环境、大规模部署 |
+| **S3 兼容服务** | `S3_ENABLED=true` + `S3_ENDPOINT` | MinIO, Backblaze B2, 等 |
+| **OpenStack Swift** | `SWIFT_ENABLED=true` | OpenStack 云环境 |
+| **Azure Blob** | `AZURE_ENABLED=true` | 微软 Azure 云 |
 
 ### 路径结构
 
-**文件位置**: `config/initializers/paperclip.rb:6-30`
-
+**核心插值逻辑**:
 ```ruby
+# config/initializers/paperclip.rb:6-30
 PATH = ':prefix_url:class/:attachment/:id_partition/:style/:filename'
 
-# 路径插值：本地媒体 vs 远程缓存
+# 关键：本地 vs 远程的路径区分
 Paperclip.interpolates :prefix_path do |attachment, _style|
   if attachment.storage_schema_version >= 1 && attachment.instance.respond_to?(:local?) && !attachment.instance.local?
     "cache#{File::SEPARATOR}"   # 远程缓存：cache/ 前缀
   else
-    ''                            # 本地上传：无前缀
+    ''                           # 本地上传：无前缀
+  end
+end
+
+Paperclip.interpolates :prefix_url do |attachment, _style|
+  if attachment.storage_schema_version >= 1 && attachment.instance.respond_to?(:local?) && !attachment.instance.local?
+    'cache/'   # URL 中的前缀
+  else
+    ''
   end
 end
 ```
 
 **实际路径示例**:
 
-| 媒体类型 | 路径 |
-|---------|------|
-| 本地上传图片 | `media_attachments/files/000/001/234/original/abc.jpg` |
-| 远程缓存图片 | `cache/media_attachments/files/000/001/567/original/def.jpg` |
+| 媒体类型 | 本地文件系统路径 | URL 路径 |
+|---------|-----------------|---------|
+| **本地上传图片** | `public/system/media_attachments/files/000/123/456/original/abc.jpg` | `/system/media_attachments/files/000/123/456/original/abc.jpg` |
+| **远程缓存图片** | `public/system/cache/media_attachments/files/000/789/012/original/def.jpg` | `/system/cache/media_attachments/files/000/789/012/original/def.jpg` |
 
-**注意**: `id_partition` 是 Paperclip 的分片机制，将 ID `1234` 转换为 `000/001/234`，避免单目录文件过多。
+**`id_partition` 解释**:
+- Paperclip 的分片机制，避免单目录文件过多
+- 将数字 ID `123456` 转换为 `000/123/456`
+- 每层 3 位数字，从右向左分组
 
 ### S3 配置详解
 
-**文件位置**: `config/initializers/paperclip.rb:38-117`
-
 ```ruby
+# config/initializers/paperclip.rb:38-117
 if ENV['S3_ENABLED'] == 'true'
   require 'aws-sdk-s3'
   
+  # 基础配置
   s3_region   = ENV.fetch('S3_REGION')   { 'us-east-1' }
   s3_protocol = ENV.fetch('S3_PROTOCOL') { 'https' }
   s3_hostname = ENV.fetch('S3_HOSTNAME') { "s3-#{s3_region}.amazonaws.com" }
@@ -626,7 +728,7 @@ if ENV['S3_ENABLED'] == 'true'
     }
   )
   
-  # 自定义 Endpoint（用于 MinIO、Backblaze 等 S3 兼容服务）
+  # S3 兼容服务（MinIO 等）
   if ENV.key?('S3_ENDPOINT')
     Paperclip::Attachment.default_options[:s3_options].merge!(
       endpoint: ENV['S3_ENDPOINT'],
@@ -635,7 +737,7 @@ if ENV['S3_ENABLED'] == 'true'
     Paperclip::Attachment.default_options[:url] = ':s3_path_url'
   end
   
-  # CDN 别名（CloudFront 或自定义域名）
+  # CDN / 自定义域名
   if ENV.key?('S3_ALIAS_HOST') || ENV.key?('S3_CLOUDFRONT_HOST')
     Paperclip::Attachment.default_options.merge!(
       url: ':s3_alias_url',
@@ -643,44 +745,52 @@ if ENV['S3_ENABLED'] == 'true'
     )
   end
   
-  # 可选：存储类别（STANDARD, IA, GLACIER 等）
+  # 存储类别
   Paperclip::Attachment.default_options[:s3_headers]['X-Amz-Storage-Class'] = ENV['S3_STORAGE_CLASS'] if ENV.key?('S3_STORAGE_CLASS')
-end
-```
-
-### S3 兼容扩展
-
-**文件位置**: `config/initializers/paperclip.rb:98-117`
-
-为了兼容某些不完全符合 S3 规范的服务，Mastodon 扩展了 S3 存储模块：
-
-```ruby
-module Paperclip
-  module Storage
-    module S3Extensions
-      def copy_to_local_file(style, local_dest_path)
-        options = {}
-        # 强制单请求下载（某些 S3 兼容服务不支持分块）
-        options[:mode] = 'single_request' if ENV['S3_FORCE_SINGLE_REQUEST'] == 'true'
-        # 禁用校验和模式（某些服务不支持）
-        options[:checksum_mode] = 'DISABLED' unless ENV['S3_ENABLE_CHECKSUM_MODE'] == 'true'
-        
-        s3_object(style).download_file(local_dest_path, options)
+  
+  # S3 兼容扩展（解决部分服务的兼容性问题）
+  module Paperclip
+    module Storage
+      module S3Extensions
+        def copy_to_local_file(style, local_dest_path)
+          options = {}
+          options[:mode] = 'single_request' if ENV['S3_FORCE_SINGLE_REQUEST'] == 'true'
+          options[:checksum_mode] = 'DISABLED' unless ENV['S3_ENABLE_CHECKSUM_MODE'] == 'true'
+          s3_object(style).download_file(local_dest_path, options)
+        end
       end
     end
   end
+  
+  Paperclip::Storage::S3.prepend(Paperclip::Storage::S3Extensions)
 end
-
-Paperclip::Storage::S3.prepend(Paperclip::Storage::S3Extensions)
 ```
+
+**S3 环境变量完整列表**:
+
+| 环境变量 | 必需 | 默认值 | 说明 |
+|---------|------|--------|------|
+| `S3_ENABLED` | 是 | - | 设为 `true` 启用 S3 |
+| `S3_BUCKET` | 是 | - | Bucket 名称 |
+| `AWS_ACCESS_KEY_ID` | 是 | - | Access Key |
+| `AWS_SECRET_ACCESS_KEY` | 是 | - | Secret Key |
+| `S3_REGION` | 否 | `us-east-1` | AWS 区域 |
+| `S3_ENDPOINT` | 否 | - | 自定义端点（用于 MinIO 等） |
+| `S3_HOSTNAME` | 否 | `s3-{region}.amazonaws.com` | S3 主机名 |
+| `S3_PROTOCOL` | 否 | `https` | 协议 |
+| `S3_KEY_PREFIX` | 否 | - | 路径前缀 |
+| `S3_ALIAS_HOST` / `S3_CLOUDFRONT_HOST` | 否 | - | CDN 域名 |
+| `S3_PERMISSION` | 否 | `public-read` | 对象权限 |
+| `S3_STORAGE_CLASS` | 否 | - | 存储类别（STANDARD, IA, GLACIER） |
+| `S3_MULTIPART_THRESHOLD` | 否 | `15.megabytes` | 分块上传阈值 |
+| `S3_SIGNATURE_VERSION` | 否 | `v4` | 签名版本 |
+| `S3_FORCE_SINGLE_REQUEST` | 否 | - | 单请求下载（兼容某些服务） |
 
 ### 本地文件系统配置
 
-**文件位置**: `config/initializers/paperclip.rb:162-169`
-
 ```ruby
+# config/initializers/paperclip.rb:162-169
 else
-  # 存储根路径
   Rails.configuration.x.file_storage_root_path = ENV.fetch(
     'PAPERCLIP_ROOT_PATH', 
     File.join(':rails_root', 'public', 'system')
@@ -697,678 +807,705 @@ else
 end
 ```
 
+**本地存储环境变量**:
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `PAPERCLIP_ROOT_PATH` | `:rails_root/public/system` | 存储根路径 |
+| `PAPERCLIP_ROOT_URL` | `/system` | URL 前缀 |
+
 ---
 
-## 远端实例缓存机制
+## 远程媒体缓存完整生命周期
 
-在联邦网络（Fediverse）中，Mastodon 实例需要缓存来自其他实例的媒体，以提升用户体验并减轻源实例压力。
+这是 Mastodon 联邦网络中最复杂也最容易被误解的部分。让我们深度解析。
 
-### 远程媒体识别
+### 核心概念
 
-**文件位置**: `app/models/media_attachment.rb:231-233`
+| 概念 | 定义 | 数据库字段 |
+|------|------|-----------|
+| **本地媒体** | 本实例用户上传的媒体 | `remote_url = ""` |
+| **远程媒体** | 来自其他实例的媒体 | `remote_url = "https://other.instance/..."` |
+| **已缓存** | 远程媒体已下载到本地 | `file_file_name` 非空 |
+| **需重下** | 远程媒体缓存已过期/被清理 | `file_file_name` 为空但 `remote_url` 存在 |
 
+**关键方法**:
 ```ruby
+# app/models/media_attachment.rb:231-241
 def local?
-  remote_url.blank?  # remote_url 非空表示远程媒体
+  remote_url.blank?
 end
-```
 
-**数据库字段**:
-```ruby
-# 来自 Schema Information
-remote_url: string           # default(""), not null
-file_file_name: string       # 本地缓存的文件名
-```
-
-### 远程媒体作用域
-
-**文件位置**: `app/models/media_attachment.rb:212-227`
-
-```ruby
-scope :attached, -> { where.not(status_id: nil).or(where.not(scheduled_status_id: nil)) }
-scope :cached, -> { remote.where.not(file_file_name: nil) }     # 已缓存的远程媒体
-scope :remote, -> { where.not(remote_url: '') }                   # 所有远程媒体
-scope :local, -> { where(remote_url: '') }                         # 本地上传媒体
-scope :unattached, -> { where(status_id: nil, scheduled_status_id: nil) }  # 未关联的媒体
-
-# 关键：无本地交互的远程媒体（用于清理判断）
-scope :without_local_interaction, lambda {
-  where.not(
-    Favourite.joins(:account).merge(Account.local)
-      .where(Favourite.arel_table[:status_id].eq(MediaAttachment.arel_table[:status_id]))
-      .select(1).arel.exists
-  )
-  .where.not(
-    Bookmark.where(Bookmark.arel_table[:status_id].eq(MediaAttachment.arel_table[:status_id]))
-      .select(1).arel.exists
-  )
-  .where.not(
-    Status.local.where(Status.arel_table[:in_reply_to_id].eq(MediaAttachment.arel_table[:status_id]))
-      .select(1).arel.exists
-  )
-  .where.not(
-    Status.local.where(Status.arel_table[:reblog_of_id].eq(MediaAttachment.arel_table[:status_id]))
-      .select(1).arel.exists
-  )
-  .where.not(
-    Quote.joins(:status).merge(Status.local)
-      .where(Quote.arel_table[:quoted_status_id].eq(MediaAttachment.arel_table[:status_id]))
-      .select(1).arel.exists
-  )
-  .where.not(
-    Quote.joins(:quoted_status).merge(Status.local)
-      .where(Quote.arel_table[:status_id].eq(MediaAttachment.arel_table[:status_id]))
-      .select(1).arel.exists
-  )
-}
-```
-
-**`without_local_interaction` 含义**: 排除满足以下任一条件的媒体：
-1. 被本地用户收藏（Favourite）
-2. 被本地用户书签（Bookmark）
-3. 被本地用户回复
-4. 被本地用户转嘟（Reblog）
-5. 被本地用户引用（Quote）
-
-### 远程附件处理机制
-
-**文件位置**: `app/models/concerns/remotable.rb`
-
-`Remotable` 是一个通用的关注点（Concern），为模型添加远程附件下载能力：
-
-```ruby
-module Remotable
-  class_methods do
-    def remotable_attachment(attachment_name, limit, suppress_errors: true, download_on_assign: true, attribute_name: nil)
-      attribute_name ||= :"#{attachment_name}_remote_url"
-      
-      # 定义下载方法：download_file! / download_thumbnail!
-      define_method(:"download_#{attachment_name}!") do |url = nil|
-        url ||= self[attribute_name]
-        return if url.blank?
-        
-        begin
-          parsed_url = Addressable::URI.parse(url).normalize
-        rescue Addressable::URI::InvalidURIError
-          return
-        end
-        
-        return if !%w(http https).include?(parsed_url.scheme) || parsed_url.host.blank?
-        
-        begin
-          Request.new(:get, url).perform do |response|
-            raise Mastodon::UnexpectedResponseError, response unless (200...300).cover?(response.code)
-            
-            # 下载并赋值给 attachment
-            # ResponseWithLimit 限制下载大小，防止 OOM
-            public_send(:"#{attachment_name}=", ResponseWithLimit.new(response, limit))
-          end
-        rescue Mastodon::UnexpectedResponseError, *Mastodon::HTTP_CONNECTION_ERRORS => e
-          public_send(:"#{attachment_name}=", nil) if public_send(:"#{attachment_name}_file_name").present?
-          raise e unless suppress_errors
-        rescue Paperclip::Errors::NotIdentifiedByImageMagickError, ... => e
-          # 格式错误等，静默处理
-          public_send(:"#{attachment_name}=", nil) if ...
-        end
-      end
-      
-      # 当设置 remote_url 时自动下载
-      define_method(:"#{attribute_name}=") do |url|
-        return if self[attribute_name] == url && public_send(:"#{attachment_name}_file_name").present?
-        
-        self[attribute_name] = url if has_attribute?(attribute_name)
-        public_send(:"download_#{attachment_name}!", url) if download_on_assign
-      end
-    end
-  end
-end
-```
-
-### MediaAttachment 中的远程配置
-
-**文件位置**: `app/models/media_attachment.rb:196, 205`
-
-```ruby
-# 主文件：不静默错误，赋值时不自动下载
-remotable_attachment :file, VIDEO_LIMIT, suppress_errors: false, download_on_assign: false, attribute_name: :remote_url
-
-# 缩略图：静默错误，赋值时不自动下载
-remotable_attachment :thumbnail, IMAGE_LIMIT, suppress_errors: true, download_on_assign: false
-```
-
-**注意**: `download_on_assign: false` 意味着设置 `remote_url` 时不会立即下载，需要显式调用 `download_file!`。
-
-### ActivityPub 解析流程
-
-**文件位置**: `app/lib/activitypub/parser/media_attachment_parser.rb`
-
-当从其他实例接收 ActivityPub 消息时，媒体附件被解析为：
-
-```ruby
-class ActivityPub::Parser::MediaAttachmentParser
-  def remote_url
-    url = Addressable::URI.parse(url_to_href(@json['url']))&.normalize&.to_s
-    url unless unsupported_uri_scheme?(url)
-  end
-  
-  def thumbnail_remote_url
-    url = Addressable::URI.parse(@json['icon'].is_a?(Hash) ? @json['icon']['url'] : @json['icon'])&.normalize&.to_s
-    url unless unsupported_uri_scheme?(url)
-  end
-  
-  # 还包括：description, focus, blurhash, file_content_type
-end
-```
-
-### 远程媒体下载触发
-
-**文件位置**: `app/workers/redownload_media_worker.rb`
-
-远程媒体的下载是异步执行的：
-
-```ruby
-class RedownloadMediaWorker
-  include Sidekiq::Worker
-  include ExponentialBackoff
-  
-  sidekiq_options queue: 'pull', retry: 3
-  
-  def perform(id)
-    media_attachment = MediaAttachment.find(id)
-    
-    return if media_attachment.remote_url.blank?
-    
-    # 下载主文件和缩略图
-    media_attachment.download_file!
-    media_attachment.download_thumbnail!
-    media_attachment.save
-  rescue ActiveRecord::RecordNotFound
-    # 记录已删除，忽略
-  rescue Mastodon::UnexpectedResponseError => e
-    response = e.response
-    raise(e) unless response_error_unsalvageable?(response)
-    # 404、410 等错误视为永久失败，不再重试
-  end
-end
-```
-
-**重新下载判断**:
-```ruby
-# app/models/media_attachment.rb:239-241
 def needs_redownload?
-  file.blank? && remote_url.present?  # 有远程 URL 但无本地缓存
+  file.blank? && remote_url.present?
 end
 ```
 
----
+**作用域**:
+```ruby
+# app/models/media_attachment.rb:212-217
+scope :attached, -> { where.not(status_id: nil).or(where.not(scheduled_status_id: nil)) }
+scope :cached, -> { remote.where.not(file_file_name: nil) }   # 已缓存的远程媒体
+scope :remote, -> { where.not(remote_url: '') }                # 所有远程媒体
+scope :local, -> { where(remote_url: '') }                      # 本地上传
+scope :unattached, -> { where(status_id: nil, scheduled_status_id: nil) }  # 孤儿
+```
 
-## 缓存生命周期管理
+### 阶段 1：初始下载
 
-远程媒体缓存不会永久保留，Mastodon 有一套完整的生命周期管理机制。
+#### 触发时机：ActivityPub Create
 
-### 内容保留策略
-
-**文件位置**: `app/models/content_retention_policy.rb`
+当从其他实例接收新帖子时：
 
 ```ruby
-class ContentRetentionPolicy
-  def self.current
-    new
-  end
+# app/lib/activitypub/activity/create.rb:300-325
+def process_attachments
+  # ...
   
-  def media_cache_retention_period
-    retention_period Setting.media_cache_retention_period
-  end
+  # 1. 创建 MediaAttachment 记录
+  media_attachment = MediaAttachment.create(
+    account: @account,
+    remote_url: media_attachment_parser.remote_url,           # 保存远程 URL
+    thumbnail_remote_url: media_attachment_parser.thumbnail_remote_url,
+    description: media_attachment_parser.description,
+    focus: media_attachment_parser.focus,
+    blurhash: media_attachment_parser.blurhash
+  )
   
-  def content_cache_retention_period
-    retention_period Setting.content_cache_retention_period
-  end
+  # 2. 检查是否跳过下载
+  next if unsupported_media_type?(media_attachment_parser.file_content_type) || skip_download?
   
-  def backups_retention_period
-    retention_period Setting.backups_retention_period
-  end
+  # 3. 同步下载！
+  media_attachment.download_file!
+  media_attachment.download_thumbnail!
+  media_attachment.save
   
-  private
-  
-  def retention_period(value)
-    value.days if value.is_a?(Integer) && value.positive?
-    # nil 或 0 表示不限制（永久保留）
-  end
+  # 4. 失败处理
+rescue Mastodon::UnexpectedResponseError, *Mastodon::HTTP_CONNECTION_ERRORS
+  # 网络错误 → 稍后重试
+  RedownloadMediaWorker.perform_in(rand(PROCESSING_DELAY), media_attachment.id)
+rescue Seahorse::Client::NetworkingError => e
+  # S3 存储错误 → 立即重试
+  RedownloadMediaWorker.perform_async(media_attachment.id)
 end
 ```
 
-**管理设置**:
-- `media_cache_retention_period`: 媒体缓存保留天数（默认可能为 7 天或由管理员配置）
-- 设置为 0 或未设置：不清理，永久保留
-
-### 定期清理调度
-
-**文件位置**: `app/workers/scheduler/vacuum_scheduler.rb`
+#### 跳过下载的条件
 
 ```ruby
-class Scheduler::VacuumScheduler
-  include Sidekiq::Worker
+# app/lib/activitypub/activity/create.rb:435-439
+def skip_download?
+  return @skip_download if defined?(@skip_download)
   
-  sidekiq_options retry: 0, lock: :until_executed, lock_ttl: 1.day.to_i
+  # 如果来源域名被配置为"拒绝媒体"，则跳过下载
+  @skip_download ||= DomainBlock.reject_media?(@account.domain)
+end
+```
+
+#### `download_file!` 的实现
+
+通过 `Remotable` 关注点：
+
+```ruby
+# app/models/concerns/remotable.rb:10-49
+def download_file!(url = nil)
+  url ||= self[:remote_url]
+  return if url.blank?
   
-  def perform
-    vacuum_operations.each do |operation|
-      operation.perform
-    rescue => e
-      Rails.logger.error("Error while running #{operation.class.name}: #{e}")
+  # 解析并验证 URL
+  begin
+    parsed_url = Addressable::URI.parse(url).normalize
+  rescue Addressable::URI::InvalidURIError
+    return
+  end
+  
+  return if !%w(http https).include?(parsed_url.scheme) || parsed_url.host.blank?
+  
+  # 发起 HTTP 请求下载
+  begin
+    Request.new(:get, url).perform do |response|
+      raise Mastodon::UnexpectedResponseError, response unless (200...300).cover?(response.code)
+      
+      # ResponseWithLimit 限制下载大小，防止 OOM
+      # limit = VIDEO_LIMIT = 99.megabytes
+      self.file = ResponseWithLimit.new(response, limit)
     end
-  end
-  
-  private
-  
-  def vacuum_operations
-    [
-      statuses_vacuum,
-      media_attachments_vacuum,    # 媒体附件清理
-      preview_cards_vacuum,
-      backups_vacuum,
-      access_tokens_vacuum,
-      feeds_vacuum,
-      imports_vacuum,
-    ]
-  end
-  
-  def media_attachments_vacuum
-    Vacuum::MediaAttachmentsVacuum.new(content_retention_policy.media_cache_retention_period)
-  end
-  
-  def content_retention_policy
-    ContentRetentionPolicy.current
+  rescue Mastodon::UnexpectedResponseError, *Mastodon::HTTP_CONNECTION_ERRORS => e
+    # 下载失败，清除现有文件
+    self.file = nil if file_file_name.present?
+    raise e unless suppress_errors
+  rescue Paperclip::Errors::NotIdentifiedByImageMagickError, ... => e
+    # 格式错误等，静默处理
+    self.file = nil if file_file_name.present?
   end
 end
 ```
 
-### 媒体清理实现
+### 阶段 2：缓存过期与清理
 
-**文件位置**: `app/lib/vacuum/media_attachments_vacuum.rb`
+#### 清理的两个层级
 
+Mastodon 有两个独立的清理机制，用途完全不同：
+
+| 层级 | 触发配置 | 清理对象 | 操作 | 可恢复？ |
+|------|---------|---------|------|---------|
+| **缓存清理** | `media_cache_retention_period` | 媒体文件 | 删除文件，保留记录 | ✅ 可重新下载 |
+| **记录删除** | `content_cache_retention_period` | Status 记录 | 删除记录 + 级联删除媒体 | ❌ 不可恢复 |
+
+#### 层级 1：媒体缓存清理 (`MediaAttachmentsVacuum`)
+
+**触发**:
 ```ruby
-class Vacuum::MediaAttachmentsVacuum
-  TTL = 1.day.freeze  # 孤儿记录的存活时间
-  
-  def initialize(retention_period)
-    @retention_period = retention_period
-  end
-  
-  def perform
-    vacuum_orphaned_records!      # 清理孤儿记录
-    vacuum_cached_files! if retention_period?  # 清理过期缓存（如果配置了保留期）
-  end
-  
-  private
-  
-  # 清理缓存的远程媒体文件
-  def vacuum_cached_files!
-    media_attachments_past_retention_period.find_in_batches do |media_attachments|
-      # 清除文件但保留数据库记录（保留 remote_url，可重新下载）
-      AttachmentBatch.new(MediaAttachment, media_attachments).clear
-    rescue => e
-      Rails.logger.error("Skipping batch while removing cached media attachments due to error: #{e}")
-    end
-  end
-  
-  # 清理孤儿记录（未关联到任何 status，且超过 1 天）
-  def vacuum_orphaned_records!
-    orphaned_media_attachments.find_in_batches do |media_attachments|
-      # 删除文件和数据库记录
-      AttachmentBatch.new(MediaAttachment, media_attachments).delete
-    rescue => e
-      Rails.logger.error("Skipping batch while removing orphaned media attachments due to error: #{e}")
-    end
-  end
-  
-  # 过期缓存查询条件
-  def media_attachments_past_retention_period
-    MediaAttachment
-      .remote                            # 远程媒体
-      .cached                            # 已下载到本地
-      .created_before(@retention_period.ago)    # 创建时间早于保留期前
-      .updated_before(@retention_period.ago)    # 更新时间早于保留期前
-      # 注意：不包含 without_local_interaction！这意味着有本地交互的也会被清理？
-      # 但实际上，有本地交互的 status 通常不会被清理，其 media_attachments 也会保留
-  end
-  
-  # 孤儿记录查询条件
-  def orphaned_media_attachments
-    MediaAttachment
-      .unattached                         # 未关联到 status 或 scheduled_status
-      .created_before(TTL.ago)            # 创建超过 1 天
-  end
-  
-  def retention_period?
-    @retention_period.present?
-  end
+# app/workers/scheduler/vacuum_scheduler.rb:34-36
+def media_attachments_vacuum
+  Vacuum::MediaAttachmentsVacuum.new(content_retention_policy.media_cache_retention_period)
+end
+
+# app/models/content_retention_policy.rb:8-10
+def media_cache_retention_period
+  retention_period Setting.media_cache_retention_period
+end
+
+def retention_period(value)
+  value.days if value.is_a?(Integer) && value.positive?
+  # nil 或 0 表示不清理
 end
 ```
 
-### 批量删除实现
+**清理逻辑**:
+```ruby
+# app/lib/vacuum/media_attachments_vacuum.rb:10-49
+def perform
+  vacuum_orphaned_records!      # 清理孤儿记录
+  vacuum_cached_files! if retention_period?  # 清理过期缓存（如果配置了保留期）
+end
 
-**文件位置**: `app/lib/attachment_batch.rb`
+def vacuum_cached_files!
+  media_attachments_past_retention_period.find_in_batches do |media_attachments|
+    # clear = 删除文件，保留记录
+    AttachmentBatch.new(MediaAttachment, media_attachments).clear
+  end
+end
+
+def media_attachments_past_retention_period
+  MediaAttachment
+    .remote                            # 远程媒体
+    .cached                            # 已缓存（有 file_file_name）
+    .created_before(@retention_period.ago)    # 创建时间早于 N 天前
+    .updated_before(@retention_period.ago)    # 更新时间早于 N 天前
+end
+```
+
+**关键发现**: `without_local_interaction` **没有被使用**！
+
+自动缓存清理只看时间，不考虑是否有本地交互（收藏、书签等）。
+
+#### `AttachmentBatch#clear` 操作
 
 ```ruby
-class AttachmentBatch
-  LIMIT = ENV.fetch('S3_BATCH_DELETE_LIMIT', 1000).to_i  # S3 批量删除限制
-  MAX_RETRY = ENV.fetch('S3_BATCH_DELETE_RETRY', 3).to_i
-  
-  NULLABLE_ATTRIBUTES = %w(
-    file_name content_type file_size fingerprint created_at updated_at
-  ).freeze
-  
-  # 删除文件 + 删除数据库记录
-  def delete
-    remove_files
-    batch.delete_all
-  end
-  
-  # 仅清除文件，保留数据库记录（设置属性为 nil）
-  def clear
-    remove_files
-    batch.update_all(nullified_attributes)
-  end
-  
-  private
-  
-  def remove_files
-    keys = []
+# app/lib/attachment_batch.rb:38-41
+def clear
+  remove_files              # 删除存储中的文件
+  batch.update_all(nullified_attributes)  # 把数据库字段设为 nil
+end
+
+def nullified_attributes
+  # 结果示例: { "file_file_name" => nil, "file_content_type" => nil, ... }
+  @attachment_names.flat_map { |attachment_name| 
+    NULLABLE_ATTRIBUTES.map { |attribute| "#{attachment_name}_#{attribute}" } & klass.column_names 
+  }.index_with(nil)
+end
+```
+
+**清理后的状态**:
+| 字段 | 清理前 | 清理后 |
+|------|--------|--------|
+| `remote_url` | `"https://other.instance/..."` | **不变** |
+| `file_file_name` | `"abc123.jpg"` | `nil` |
+| `file_content_type` | `"image/jpeg"` | `nil` |
+| `created_at` | `[下载时间]` | **不变** |
+| `updated_at` | `[下载时间]` | **不变** |
+
+**关键**：`remote_url` 保留，所以 `needs_redownload?` 变为 `true`，可以重新下载。
+
+#### 层级 2：内容记录删除 (`StatusesVacuum`)
+
+这是**真正的硬删除**，不可恢复。
+
+**触发**:
+```ruby
+# app/workers/scheduler/vacuum_scheduler.rb:30-32
+def statuses_vacuum
+  Vacuum::StatusesVacuum.new(content_retention_policy.content_cache_retention_period)
+end
+```
+
+**清理逻辑**:
+```ruby
+# app/lib/vacuum/statuses_vacuum.rb:16-42
+def vacuum_statuses!
+  statuses_scope.in_batches do |statuses|
+    # 1. 清理关联（会话、搜索索引等）
+    statuses.direct_visibility.includes(mentions: :account).find_each(&:unlink_from_conversations!)
+    if Chewy.enabled?
+      remove_from_index(statuses.ids, 'chewy:queue:StatusesIndex')
+      remove_from_index(statuses.ids, 'chewy:queue:PublicStatusesIndex')
+    end
     
-    records.each do |record|
-      @attachment_names.each do |attachment_name|
-        attachment = record.public_send(attachment_name)
-        styles = BASE_STYLES | attachment.styles.keys  # :original + 自定义样式
-        
-        next if attachment.blank?
-        
-        styles.each do |style|
-          case @storage_mode
-          when :filesystem
-            # 本地文件：直接删除
-            FileUtils.remove_file(path, true)
-            # 尝试删除空目录
-            FileUtils.rmdir(File.dirname(path), parents: true)
-            
-          when :s3
-            # S3：收集 key，批量删除
-            keys << attachment.style_name_as_path(style)
-            
-          when :fog
-            # Swift：逐个删除
-            attachment.send(:directory).files.new(key: path).destroy
-            
-          when :azure
-            # Azure：调用 destroy
-            attachment.destroy
-          end
-        end
-      end
-    end
-    
-    # S3 批量删除
-    return unless storage_mode == :s3
-    
-    keys.each_slice(LIMIT) do |keys_slice|
-      bucket.delete_objects(delete: {
-        objects: keys_slice.map { |key| { key: key } },
-        quiet: true,
-      })
-    end
+    # 2. 删除 status 记录
+    # 注意：外键会自动处理大部分关联记录
+    # 但 media_attachments 会变成"孤儿"（status_id = nil）
+    statuses.delete_all
   end
-  
-  # clear 操作时要置空的属性
-  def nullified_attributes
-    @attachment_names.flat_map { |attachment_name| 
-      NULLABLE_ATTRIBUTES.map { |attribute| "#{attachment_name}_#{attribute}" } & klass.column_names 
-    }.index_with(nil)
-    # 结果示例: { "file_file_name" => nil, "file_content_type" => nil, ... }
-  end
+end
+
+def statuses_scope
+  Status.unscoped.kept
+    .joins(:account).merge(Account.remote)           # 只清理远程账户的 status
+    .where(statuses: { id: ...retention_period_as_id })  # 超过保留期
 end
 ```
 
-### 缓存清除前后的状态对比
+**级联效应**:
 
-| 阶段 | remote_url | file_file_name | 状态 |
-|------|-----------|----------------|------|
-| 刚解析（未下载） | `https://other.instance/media/xxx` | `nil` | 远程，未缓存 |
-| 下载完成后 | `https://other.instance/media/xxx` | `abcdef12345.jpg` | 远程，已缓存 |
-| 缓存清理后 | `https://other.instance/media/xxx` | `nil` | 远程，缓存已过期（可重新下载） |
+当 `status` 被删除后，其 `media_attachments` 的 `status_id` 变为 `nil`，变成"孤儿"。
 
-### 缓存过期后的重新访问
+然后 `MediaAttachmentsVacuum#vacuum_orphaned_records!` 会清理这些孤儿：
+
+```ruby
+# app/lib/vacuum/media_attachments_vacuum.rb:25-31
+def vacuum_orphaned_records!
+  orphaned_media_attachments.find_in_batches do |media_attachments|
+    # delete = 删除文件 + 删除数据库记录
+    AttachmentBatch.new(MediaAttachment, media_attachments).delete
+  end
+end
+
+def orphaned_media_attachments
+  MediaAttachment
+    .unattached           # status_id = nil AND scheduled_status_id = nil
+    .created_before(TTL.ago)  # TTL = 1.day
+end
+```
+
+**`AttachmentBatch#delete` 操作**:
+```ruby
+# app/lib/attachment_batch.rb:33-36
+def delete
+  remove_files          # 删除文件
+  batch.delete_all      # 删除数据库记录！
+end
+```
+
+**结果**：记录完全消失，`remote_url` 也没了，**无法再重新下载**。
+
+#### 设计警告
+
+从 locale 文件可以看到 `content_cache_retention_period` 的强烈警告：
+
+> "All posts from other servers (including boosts and replies) will be deleted after the specified number of days, **regardless of any local user interaction** with those posts. This includes posts where a local user has bookmarked or favorited them. Private mentions between users from different instances will also be lost and cannot be recovered. Use of this setting is intended for special-purpose instances and breaks many user expectations when implemented for general-purpose use."
+
+**翻译**:
+> "来自其他服务器的所有帖子（包括 boosts 和回复）将在指定天数后被删除，**无论本地用户是否与这些帖子有任何交互**。这包括本地用户已添加书签或收藏的帖子。不同实例用户之间的私人提及也将丢失且无法恢复。此设置专为特殊用途实例设计，在通用实例上使用会破坏许多用户预期。"
+
+**关键设计取舍**:
+- `media_cache_retention_period`: 相对安全，只删文件缓存，可重下
+- `content_cache_retention_period`: 危险！删除记录，不可恢复，且忽略本地交互
+
+### 阶段 3：重新下载
+
+#### 触发时机：用户访问
 
 当用户访问已过期缓存的媒体时：
-1. URL 仍然指向本地实例的 cache/ 路径
-2. 如果文件不存在，取决于存储配置：
-   - 本地文件系统：可能返回 404 或触发后端逻辑
-   - CDN/S3：如果 CDN 有缓存，可能仍能访问；否则 404
 
-实际上，Mastodon 的设计是：
-- `clear` 操作仅删除文件，保留 `remote_url`
-- 当 status 被重新获取或用户再次访问时，可能触发 `RedownloadMediaWorker` 重新下载
+```ruby
+# app/controllers/media_proxy_controller.rb:11-44
+before_action :set_media_attachment
+
+def show
+  # 检查是否需要重新下载
+  if @media_attachment.needs_redownload? && !reject_media?
+    # 使用 Redis 锁防止并发下载
+    with_redis_lock("media_download:#{params[:id]}") do
+      # 重新加载（双重检查，避免锁等待期间已被其他进程下载）
+      @media_attachment.reload
+      redownload! if @media_attachment.needs_redownload?
+    end
+  end
+  
+  # 重定向到文件或流式传输
+  if requires_file_streaming?
+    send_file(...)
+  else
+    redirect_to media_attachment_file_path, allow_other_host: true
+  end
+end
+
+def redownload!
+  @media_attachment.download_file!
+  @media_attachment.download_thumbnail!
+  @media_attachment.created_at = Time.now.utc  # 关键！更新 created_at
+  @media_attachment.save!
+end
+
+def set_media_attachment
+  @media_attachment = MediaAttachment.attached.find(params[:id])
+  authorize @media_attachment, :download?
+end
+```
+
+#### 关键点：时间戳重置
+
+```ruby
+@media_attachment.created_at = Time.now.utc
+```
+
+这意味着：
+1. 重新下载后，`created_at` 被更新为当前时间
+2. Rails 的 `save!` 会自动更新 `updated_at`
+3. **下次清理检查时**：
+   - `created_before(@retention_period.ago)` → false（太新）
+   - `updated_before(@retention_period.ago)` → false（太新）
+4. **不会被立即清理**
+
+这实际上实现了一个 **LRU (Least Recently Used) 风格的缓存策略**：
+- 热门媒体（频繁被访问）会不断更新时间戳，永远不会被清理
+- 冷门媒体（长期无人访问）会被清理，节省存储空间
+- 需要时可以重新下载
+
+### 阶段 4：更新时的重新下载
+
+当远程帖子的媒体 URL 变化时：
+
+```ruby
+# app/services/activitypub/process_status_update_service.rb:126-140
+def download_media_files!
+  @next_media_attachments.each do |media_attachment|
+    next if media_attachment.skip_download
+    
+    # 只有当 URL 变化时才重新下载
+    media_attachment.download_file! if media_attachment.remote_url_previously_changed?
+    media_attachment.download_thumbnail! if media_attachment.thumbnail_remote_url_previously_changed?
+    media_attachment.save
+    
+  rescue Mastodon::UnexpectedResponseError, *Mastodon::HTTP_CONNECTION_ERRORS
+    # 失败则调度 worker 稍后重试
+    RedownloadMediaWorker.perform_in(rand(PROCESSING_DELAY), media_attachment.id)
+  end
+end
+```
+
+### 远程缓存生命周期完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                           远程媒体缓存完整生命周期                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                   │
+│  ┌──────────────────┐                                                                             │
+│  │   远程实例        │                                                                             │
+│  │   发布新帖子      │                                                                             │
+│  └────────┬─────────┘                                                                             │
+│           │                                                                                        │
+│           │ ActivityPub: Create / Announce                                                        │
+│           ▼                                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ ActivityPub::Activity::Create#process_attachments                                            ││
+│  │                                                                                                ││
+│  │ 1. 创建 MediaAttachment 记录                                                                   ││
+│  │    - remote_url = "https://other.instance/media/xxx"                                          ││
+│  │    - file_file_name = nil                                                                      ││
+│  │    - created_at = Time.now                                                                     ││
+│  │    - updated_at = Time.now                                                                     ││
+│  │                                                                                                ││
+│  │ 2. 检查是否跳过下载                                                                             ││
+│  │    - if DomainBlock.reject_media?(domain) → skip                                              ││
+│  │    - if unsupported_media_type → skip                                                          ││
+│  │                                                                                                ││
+│  │ 3. 同步下载                                                                                     ││
+│  │    - media_attachment.download_file!                                                           ││
+│  │    - 通过 Remotable 机制发起 HTTP 请求                                                         ││
+│  │    - ResponseWithLimit 限制大小（最大 99MB）                                                   ││
+│  │                                                                                                ││
+│  │ 4. 下载后的状态                                                                                 ││
+│  │    - file_file_name = "abc123.jpg" (已缓存)                                                   ││
+│  │    - scope: .remote.cached                                                                     ││
+│  │    - needs_redownload? = false                                                                 ││
+│  │                                                                                                ││
+│  │ 5. 失败处理                                                                                     ││
+│  │    - 网络错误 → RedownloadMediaWorker.perform_in(rand(delay), id)                            ││
+│  │    - S3 错误 → RedownloadMediaWorker.perform_async(id)                                        ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                   │
+│           │                                                                                        │
+│           ▼                                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ 状态：缓存已就绪                                                                                ││
+│  │ - remote_url: "https://other.instance/media/xxx" (保留)                                       ││
+│  │ - file_file_name: "abc123.jpg"                                                                 ││
+│  │ - created_at: [下载时间]                                                                        ││
+│  │ - updated_at: [下载时间]                                                                        ││
+│  │ - local? = false, needs_redownload? = false                                                    ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                   │
+│           │                                                                                        │
+│           ├──────────────────────────────────────────────────────────────────────────────────────┤│
+│           │                                                                                       ││
+│           ▼                                                                                       ▼│
+│  ┌──────────────────────────┐                                           ┌─────────────────────────┐│
+│  │ 用户访问媒体              │                                           │ 时间流逝，超过保留期     ││
+│  │                          │                                           │ media_cache_retention_period │
+│  │ GET /media_proxy/:id     │                                           │                         ││
+│  │                          │                                           │ VacuumScheduler 定期触发   ││
+│  └────────────┬─────────────┘                                           └───────────┬─────────────┘│
+│               │                                                                       │              │
+│               │                                                                       │              │
+│               │                                                               ┌───────▼──────┐       │
+│               │                                                               │              │       │
+│               │                                                               ▼              │       │
+│               │                                                    ┌──────────────────────┐       │
+│               │                                                    │ MediaAttachmentsVacuum│       │
+│               │                                                    │                      │       │
+│               │                                                    │ 检查条件：            │       │
+│               │                                                    │ .remote               │       │
+│               │                                                    │ .cached               │       │
+│               │                                                    │ .created_before(retention.ago) │
+│               │                                                    │ .updated_before(retention.ago) │
+│               │                                                    │                      │       │
+│               │                                                    │ 操作：AttachmentBatch.clear │
+│               │                                                    │ - 删除文件            │       │
+│               │                                                    │ - 保留记录            │       │
+│               │                                                    │ - remote_url 不变     │       │
+│               │                                                    └───────────┬──────────┘       │
+│               │                                                                │                  │
+│               │                                                                ▼                  │
+│               │                                                    ┌──────────────────────┐       │
+│               │                                                    │ 状态：缓存已清理      │       │
+│               │                                                    │                      │       │
+│               │                                                    │ remote_url: 保留      │       │
+│               │                                                    │ file_file_name: nil   │       │
+│               │                                                    │ created_at: 不变      │       │
+│               │                                                    │ updated_at: 不变      │       │
+│               │                                                    │ needs_redownload? = true │   │
+│               │                                                    └───────────┬──────────┘       │
+│               │                                                                │                  │
+│               └────────────────────────────────────────────────────────────────┘                  │
+│                                               │                                                        │
+│                                               │ 用户再次访问                                            │
+│                                               ▼                                                        │
+│                                    ┌──────────────────────────┐                                          │
+│                                    │ MediaProxyController#show │                                          │
+│                                    │                          │                                          │
+│                                    │ 1. needs_redownload?     │                                          │
+│                                    │    = file.blank? &&      │                                          │
+│                                    │      remote_url.present? │                                          │
+│                                    │    = true                 │                                          │
+│                                    │                          │                                          │
+│                                    │ 2. with_redis_lock       │                                          │
+│                                    │    (防止并发下载)         │                                          │
+│                                    │                          │                                          │
+│                                    │ 3. redownload!           │                                          │
+│                                    │    - download_file!      │                                          │
+│                                    │    - download_thumbnail! │                                          │
+│                                    │    - created_at = now! ◄── 关键！重置时间戳                     │
+│                                    │    - save!               │                                          │
+│                                    │                          │                                          │
+│                                    │ 结果：                    │                                          │
+│                                    │ - file_file_name 恢复    │                                          │
+│                                    │ - created_at 更新        │                                          │
+│                                    │ - 不会被立即清理          │                                          │
+│                                    └──────────────────────────┘                                          │
+│                                                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ 另一条路径：真正的删除（不可恢复）                                                              │  │
+│  │                                                                                                │  │
+│  │ 触发条件：content_cache_retention_period 已配置                                               │  │
+│  │                                                                                                │  │
+│  │ Vacuum::StatusesVacuum                                                                        │  │
+│  │ - 选择远程账户的 status                                                                        │  │
+│  │ - 超过保留期                                                                                   │  │
+│  │ - **忽略本地交互！**（收藏、书签都没用）                                                      │  │
+│  │                                                                                                │  │
+│  │ 操作：statuses.delete_all                                                                      │  │
+│  │ - 删除 status 记录                                                                             │  │
+│  │ - media_attachments.status_id 变为 nil → 变成"孤儿"                                         │  │
+│  │                                                                                                │  │
+│  │ 然后：MediaAttachmentsVacuum#vacuum_orphaned_records!                                        │  │
+│  │ - 选择 unattached (status_id = nil)                                                           │  │
+│  │ - created_before(1.day.ago)                                                                   │  │
+│  │                                                                                                │  │
+│  │ 操作：AttachmentBatch.delete                                                                   │  │
+│  │ - 删除文件                                                                                     │  │
+│  │ - 删除数据库记录！                                                                             │  │
+│  │ - remote_url 也没了                                                                            │  │
+│  │                                                                                                │  │
+│  │ 结果：**完全消失，无法恢复**                                                                   │  │
+│  │                                                                                                │  │
+│  │ ⚠️  警告：这是危险操作！                                                                       │  │
+│  │ - 即使是本地用户收藏的帖子也会被删除                                                          │  │
+│  │ - 不同实例用户之间的私人提及也会丢失                                                          │  │
+│  │ - 专为特殊用途实例设计，通用实例不推荐使用                                                    │  │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                           │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 总结
+## 缓存保留策略的设计取舍
 
-### 完整链路流程图
+### 两个独立的保留策略
+
+Mastodon 有两套完全独立的保留策略，设计目标截然不同：
+
+| 策略 | 配置项 | 清理对象 | 风险等级 | 设计目标 |
+|------|--------|---------|---------|---------|
+| **媒体缓存保留** | `media_cache_retention_period` | 媒体文件 | 🟢 低 | 节省存储空间，保持可恢复性 |
+| **内容缓存保留** | `content_cache_retention_period` | Status 记录 | 🔴 高 | 极端隐私/存储场景，破坏性 |
+
+### 媒体缓存保留策略设计分析
+
+#### 核心设计：LRU 风格的缓存
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           本地媒体上传链路                                              │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                         │
-│  客户端                                                                                 │
-│     │                                                                                   │
-│     │ POST /api/v1/media 或 /api/v2/media                                             │
-│     │  - file: 媒体文件                                                                 │
-│     │  - description: 描述                                                              │
-│     │  - focus: 焦点坐标                                                                │
-│     ▼                                                                                   │
-│  ┌─────────────────────┐                                                                │
-│  │ Api::V1::MediaController │ 或 Api::V2::MediaController                             │
-│  │ - v1: 同步处理，返回 200/206                                                        │
-│  │ - v2: 延迟处理，返回 202 Accepted                                                    │
-│  └───────────┬─────────┘                                                                │
-│              │                                                                           │
-│              ▼                                                                           │
-│  ┌────────────────────────────────────────────────────────────────────┐                │
-│  │ MediaAttachment.create!                                              │                │
-│  │ - 验证文件类型、大小                                                  │                │
-│  │ - 检查视频分辨率、帧率限制                                            │                │
-│  │ - 设置 processing 状态:                                               │                │
-│  │   - v1/图片: :complete (同步处理)                                    │                │
-│  │   - v2/视频: :queued (延迟处理)                                      │                │
-│  └───────────┬────────────────────────────────────────────────────────┘                │
-│              │                                                                           │
-│              ├────────────────── 延迟处理 ──────────────────┐                          │
-│              │                                                 │                          │
-│              ▼                                                 ▼                          │
-│  ┌─────────────────────┐                    ┌───────────────────────────────────────┐ │
-│  │ Paperclip 同步处理   │                    │ PostProcessMediaWorker (Sidekiq)      │ │
-│  │ - LazyThumbnail      │                    │ - processing: :in_progress → :complete │ │
-│  │ - BlurhashTranscoder │                    │ - 调用 file.reprocess!(:original)     │ │
-│  │ - ColorExtractor     │                    └───────────────────┬───────────────────┘ │
-│  │ - TypeCorrector      │                                        │                       │
-│  └───────────┬─────────┘                                        ▼                       │
-│              │                                    ┌─────────────────────────────────┐   │
-│              │                                    │ 根据媒体类型选择处理器链          │   │
-│              │                                    │ - GIF: gif_transcoder + ...    │   │
-│              │                                    │ - 视频: transcoder + ...        │   │
-│              │                                    │ - 音频: image_extractor + ...   │   │
-│              │                                    └───────────────┬─────────────────┘   │
-│              │                                                    │                       │
-│              └──────────────────────────┬───────────────────────┘                       │
-│                                         │                                                       │
-│                                         ▼                                                       │
-│                              ┌─────────────────────┐                                            │
-│                              │ Paperclip 存储       │                                            │
-│                              │ - 路径: :class/:attachment/... │                               │
-│                              │ - 本地: public/system/...        │                               │
-│                              │ - S3: bucket/:prefix_url/...    │                               │
-│                              └───────────┬─────────┘                                            │
-│                                          │                                                          │
-│                                          ▼                                                          │
-│                              ┌──────────────────────────────────────┐                           │
-│                              │ 元数据写入 (after_post_process)       │                           │
-│                              │ - file_meta: 尺寸、颜色、焦点等       │                           │
-│                              │ - blurhash: 模糊哈希字符串            │                           │
-│                              └──────────────────────────────────────┘                           │
-│                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           远程媒体缓存链路                                              │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                         │
-│  远程实例                                                                               │
-│     │                                                                                   │
-│     │ ActivityPub: Create/Announce 活动                                                │
-│     │ 包含 attachment: { type: "Image", url: "https://..." }                         │
-│     ▼                                                                                   │
-│  ┌────────────────────────────────────────────────────────────────────────┐           │
-│  │ ActivityPub::Parser::MediaAttachmentParser                              │           │
-│  │ - 解析 remote_url, thumbnail_remote_url                                  │           │
-│  │ - 解析 description, focus, blurhash                                      │           │
-│  └───────────┬────────────────────────────────────────────────────────────┘           │
-│              │                                                                           │
-│              ▼                                                                           │
-│  ┌────────────────────────────────────────────────────────────────────┐                │
-│  │ MediaAttachment 创建                                                  │                │
-│  │ - remote_url = "https://other.instance/media/xxx"                   │                │
-│  │ - file_file_name = nil (尚未下载)                                     │                │
-│  │ - 标记为 "远程" 媒体                                                  │                │
-│  └───────────┬────────────────────────────────────────────────────────┘                │
-│              │                                                                           │
-│              ▼                                                                           │
-│  ┌────────────────────────────────────────────────────────────────────┐                │
-│  │ RedownloadMediaWorker (Sidekiq, queue: :pull)                       │                │
-│  │ - 调用 download_file!                                                 │                │
-│  │ - 使用 Request.get 获取远程文件                                       │                │
-│  │ - ResponseWithLimit 限制下载大小                                      │                │
-│  │ - 通过 remotable_attachment 机制处理                                  │                │
-│  └───────────┬────────────────────────────────────────────────────────┘                │
-│              │                                                                           │
-│              ▼                                                                           │
-│  ┌────────────────────────────────────────────────────────────────────┐                │
-│  │ 存储到本地缓存                                                        │                │
-│  │ - 路径前缀: cache/ (通过 :prefix_path 插值)                         │                │
-│  │ - 本地: public/system/cache/media_attachments/...                    │                │
-│  │ - S3: bucket/cache/media_attachments/...                             │                │
-│  │ - file_file_name = "abc123.jpg" (已缓存)                             │                │
-│  └────────────────────────────────────────────────────────────────────┘                │
-│                                                                                           │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
-
-
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           缓存生命周期管理                                              │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                         │
-│  Scheduler::VacuumScheduler (定期执行)                                                 │
-│     │                                                                                   │
-│     ▼                                                                                   │
-│  ┌────────────────────────────────────────────────────────────────────┐                │
-│  │ Vacuum::MediaAttachmentsVacuum                                       │                │
-│  │ 配置: ContentRetentionPolicy.current.media_cache_retention_period   │                │
-│  │      (从 Setting.media_cache_retention_period 读取，单位：天)       │                │
-│  └───────────┬────────────────────────────────────────────────────────┘                │
-│              │                                                                           │
-│              ├──────────────────────────────────────────────────────────┐              │
-│              │                                                             │              │
-│              ▼                                                             ▼              │
-│  ┌─────────────────────────┐                         ┌──────────────────────────────┐  │
-│  │ vacuum_orphaned_records!│                         │ vacuum_cached_files!          │  │
-│  │ - 目标: 孤儿媒体附件      │                         │ - 目标: 过期的远程缓存        │  │
-│  │ - 条件: unattached       │                         │ - 条件: remote + cached       │  │
-│  │         created_before(1.day.ago) │                │         created_before(retention.ago) │
-│  │                         │                         │         updated_before(retention.ago) │
-│  │ - 操作: AttachmentBatch.delete │                   │ - 操作: AttachmentBatch.clear │  │
-│  │   → 删除文件 + 删除记录  │                         │   → 仅删除文件，保留记录      │  │
-│  └─────────────────────────┘                         │   → file_file_name 设为 nil   │  │
-│                                                        │   → remote_url 保留（可重下） │  │
-│                                                        └───────────────┬──────────────┘  │
-│                                                                        │                  │
-│                                                                        ▼                  │
-│                                                          ┌──────────────────────────────┐  │
-│                                                          │ AttachmentBatch 批量处理     │  │
-│                                                          │                              │  │
-│                                                          │ 存储模式:                     │  │
-│                                                          │ - :filesystem                │  │
-│                                                          │   FileUtils.remove_file      │  │
-│                                                          │                              │  │
-│                                                          │ - :s3                        │  │
-│                                                          │   bucket.delete_objects      │  │
-│                                                          │   (批量删除，1000 个/批)     │  │
-│                                                          │                              │  │
-│                                                          │ - :fog (Swift)               │  │
-│                                                          │ - :azure                     │  │
-│                                                          └──────────────────────────────┘  │
-│                                                                                             │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    媒体缓存策略的核心洞察                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  传统 LRU (Least Recently Used) 缓存：                                  │
+│  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐                           │
+│  │ A │ B │ C │ D │ E │ F │ G │ H │ I │ J │  ← 缓存满了               │
+│  └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘                           │
+│         │                                                                 │
+│         └── 访问 B → 移到最右端                                          │
+│                                                                         │
+│  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐                           │
+│  │ A │ C │ D │ E │ F │ G │ H │ I │ J │ B │  ← B 现在"最热"           │
+│  └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘                           │
+│                                                                         │
+│  新元素 K 需要插入：                                                      │
+│  - 淘汰最左端（最久未使用）的 A                                          │
+│  - K 插入到最右端                                                         │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Mastodon 的"时间戳 LRU"：                                              │
+│                                                                         │
+│  不用链表，用时间戳：                                                    │
+│  - 每次访问（重新下载）→ created_at = now                               │
+│  - 清理时 → 删除 created_at < retention_period.ago 的                   │
+│                                                                         │
+│  效果等价：                                                              │
+│  ┌──────────────────────────────────────────────────────────────┐     │
+│  │ 时间轴                                                          │     │
+│  │ ───────────────────────────────────────────────────────────▶ │     │
+│  │                                                                  │     │
+│  │ [保留期]                    [现在]                               │     │
+│  │ <───────────────────────────▶                                   │     │
+│  │                                                                  │     │
+│  │ 媒体 A [created: 30天前] ──┐                                    │     │
+│  │ 媒体 B [created: 20天前]   │  超过保留期 → 被清理              │     │
+│  │ 媒体 C [created: 15天前] ──┘                                    │     │
+│  │                                                                  │     │
+│  │ 媒体 D [created: 10天前，3天前被重下 → updated: 3天前]          │     │
+│  │ 媒体 E [created: 5天前]                                          │     │
+│  │ 媒体 F [created: 1天前]   ──┐  在保留期内 → 保留               │     │
+│  │ 媒体 G [created: 今天]    ──┘                                    │     │
+│  └──────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│  关键：媒体 D 虽然创建于 10 天前，但 3 天前被访问过（重下），          │
+│       所以不会被清理。                                                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 不同媒体类型处理差异总结
+#### 策略的优点
 
-| 特性 | 图片 (JPG/PNG/WebP) | 静态 GIF | 动画 GIF | 视频 (MP4/WebM) | 音频 (MP3/Ogg) |
-|------|---------------------|---------|----------|-----------------|----------------|
-| **类型枚举** | `image` | `image` | `gifv` | `video` 或 `gifv` | `audio` |
-| **处理器链** | lazy_thumbnail, blurhash_transcoder, type_corrector | 同图片 | gif_transcoder, blurhash_transcoder | transcoder, blurhash_transcoder, type_corrector | image_extractor, transcoder, type_corrector |
-| **输出格式** | 保持原格式 或 JPEG | GIF | MP4 | MP4 (可能透传) | MP3 |
-| **缩略图** | `:small` 样式 | 同图片 | 从视频提取 | 从视频提取第一帧 | 从音频封面/第一帧提取 |
-| **延迟处理** | 否 (API v2 除外) | 否 | 是 | 是 | 是 |
-| **文件限制** | 16 MB | 16 MB | 99 MB | 99 MB | 99 MB |
+| 优点 | 说明 |
+|------|------|
+| **自动冷热分离** | 热门媒体保持缓存，冷门媒体自动清理 |
+| **可恢复性** | 只删文件，保留 `remote_url`，需要时可重下 |
+| **存储效率** | 只保留实际需要的数据，不浪费空间 |
+| **配置简单** | 只需配置天数，不用复杂的缓存大小计算 |
 
-### 关键设计要点
+#### 策略的权衡
 
-1. **API v1 与 v2 的差异**:
-   - v1: 同步处理，适合小图片
-   - v2: 异步处理（`delay_processing: true`），适合大文件，返回 202 Accepted
+| 权衡 | 说明 |
+|------|------|
+| **清理时间不精确** | 基于定期任务（通常每天一次），不是精确到秒 |
+| **首次访问延迟** | 缓存失效后首次访问需要等待重新下载 |
+| **源实例依赖** | 如果源实例下线或删除了媒体，无法重下 |
+| **无大小限制** | 只看时间，不看缓存总大小。热门媒体多的话可能用很多空间 |
 
-2. **视频透传优化**:
-   - 符合条件的 H.264/AAC/MP4 视频可直接透传，不重新编码
-   - 条件：视频编码 H.264，音频编码 AAC（或无音频），色彩空间 YUV420P
+#### 与 `without_local_interaction` 的关系
 
-3. **远程与本地路径区分**:
-   - 本地媒体：无前缀
-   - 远程缓存：`cache/` 前缀（通过 `:prefix_path` 插值实现）
+之前发现自动清理**不使用** `without_local_interaction`，但 CLI 有 `--keep-interacted` 选项。
 
-4. **缓存清理策略**:
-   - `clear`: 仅删除文件，保留数据库记录（`remote_url` 保留，可重新下载）
-   - `delete`: 删除文件 + 删除数据库记录（用于孤儿记录）
-   - 有本地交互的媒体（收藏、回复、转嘟等）其关联的 status 不会被轻易清理
+**设计意图分析**:
 
-5. **存储抽象**:
-   - 通过 Paperclip 统一支持 S3、Swift、Azure、本地文件系统
-   - S3 支持批量删除（1000 个/批）和 CDN 别名配置
+```ruby
+# lib/mastodon/cli/media.rb:67-87
+def remove
+  attachment_scope = MediaAttachment.cached.remote.where(created_at: ..time_ago)
+  
+  # 只有 --keep-interacted 选项时才过滤
+  attachment_scope = attachment_scope.without_local_interaction if options[:keep_interacted]
+  
+  # ... 清理
+end
+```
 
-6. **安全性考虑**:
-   - `ResponseWithLimit` 限制下载大小，防止超大文件导致 OOM
-   - 本地图片会剥离元数据（`needs_metadata_stripping?`），远程缓存保持原样
-   - 视频尺寸、帧率、帧数限制，防止 DoS 攻击
+**为什么自动清理不考虑交互？**
 
-### 相关文件位置速查
+可能的设计原因：
 
-| 功能 | 文件路径 |
-|------|---------|
-| API 控制器 | `app/controllers/api/v1/media_controller.rb` |
-| | `app/controllers/api/v2/media_controller.rb` |
-| 媒体模型 | `app/models/media_attachment.rb` |
-| 后处理 Worker | `app/workers/post_process_media_worker.rb` |
-| 远程下载 Worker | `app/workers/redownload_media_worker.rb` |
-| 远程附件机制 | `app/models/concerns/remotable.rb` |
-| 视频转码器 | `lib/paperclip/transcoder.rb` |
-| GIF 转码器 | `lib/paperclip/gif_transcoder.rb` |
-| 图片提取器 | `lib/paperclip/image_extractor.rb` |
-| 缩略图处理器 | `lib/paperclip/lazy_thumbnail.rb` |
-| Blurhash 编码器 | `lib/paperclip/blurhash_transcoder.rb` |
-| 颜色提取器 | `lib/paperclip/color_extractor.rb` |
-| 类型修正器 | `lib/paperclip/type_corrector.rb` |
-| 存储配置 | `config/initializers/paperclip.rb` |
-| 定期清理调度 | `app/workers/scheduler/vacuum_scheduler.rb` |
-| 媒体清理逻辑 | `app/lib/vacuum/media_attachments_vacuum.rb` |
-| 批量删除实现 | `app/lib/attachment_batch.rb` |
-| 保留策略 | `app/models/content_retention_policy.rb` |
-| ActivityPub 解析 | `app/lib/activitypub/parser/media_attachment_parser.rb` |
+1. **性能考虑**:
+   ```ruby
+   # without_local_interaction 包含 6 个 EXISTS 子查询！
+   scope :without_local_interaction, lambda {
+     where.not(Favourite...exists)      # 1. 收藏
+       .where.not(Bookmark...exists)     # 2. 书签
+       .where.not(Status.local...exists) # 3. 回复
+       .where.not(Status.local...exists) # 4. 转嘟
+       .where.not(Quote...exists)        # 5. 引用（作为引用者）
+       .where.not(Quote...exists)        # 6. 引用（作为被引用者）
+   }
+   ```
+   
+   这些都是关联子查询，在大数据集上可能很慢。
+
+2. **语义考虑**:
+   - "交互过"只是表示用户曾经感兴趣，不代表永远需要
+   - 如果用户真的想永久保存，可以下载到本地
+   - 重新下载成本很低（源实例在线的话）
+
+3. **CLI 选项的用途**:
+   - `--keep-interacted` 是给管理员手动清理时用的
+   - 让管理员可以选择更保守的清理策略
+   - 例如：`tootctl media remove --days=7 --keep-interacted`
+
+### 内容缓存保留策略设计分析
+
+#### 这是一个"核选项"
+
+从 locale 文件的强烈警告可以看出，这不是给普通实例用的：
+
+> "Use of this setting is intended for **special-purpose instances** and breaks **many user expectations** when implemented for **general-purpose use**."
+
+#### 策略行为
+
+| 特性 | 行为 |
+|------|------|
+| **删除范围** | 所有远程帖子，**无论是否有本地交互** |
+| **包含内容** | 原始帖子、转嘟、回复、私人提及 |
+| **可恢复性** | ❌ 完全不可恢复 |
+| **级联删除** | Status → MediaAttachment（变成孤儿后删除） |
+
+#### 设计目标：极端隐私场景
+
+这个策略可能针对以下特殊场景：
+
+1. **高安全隐私实例**:
+   - 不希望在服务器上永久存储任何来自外部的数据
+   - 即使是用户收藏的内容也只保留有限时间
+   -
