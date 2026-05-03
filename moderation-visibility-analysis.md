@@ -24,11 +24,11 @@ enum :visibility,
 
 | 级别 | 值 | 描述 | 时间线可见性 |
 |-----|---|------|-------------|
-| `public` | 0 | 公开 | 公共同步 + 主页 + 列表 + 标签 |
-| `unlisted` | 1 | 不公开列出 | 主页 + 列表 + 标签（但不显示在公共同步） |
-| `private` | 2 | 仅关注者 | 仅关注者的主页 + 列表 |
-| `direct` | 3 | 私信 | 仅提及的用户 |
-| `limited` | 4 | 受限 | 仅提及的关注者 |
+| `public` | 0 | 公开 | 公共同步 + 主页 + 列表 + 标签时间线 + 标签流 |
+| `unlisted` | 1 | 不公开列出 | 主页 + 列表（**不显示在公共同步、标签时间线、标签流**） |
+| `private` | 2 | 仅关注者 | 仅关注者的主页 + 列表（包括远程关注者） |
+| `direct` | 3 | 私信 | 仅提及的用户（不投递给任何 followers） |
+| `limited` | 4 | 受限 | 仅提及的关注者（不投递给任何 followers） |
 
 #### 1.1.2 可见性作用域
 
@@ -40,11 +40,31 @@ scope :not_direct_visibility, -> { where.not(visibility: :direct) }
 ```
 
 **分发规则**：
-- `distributable_visibility`: 可在联邦网络中传播
-- `list_eligible_visibility`: 可出现在列表时间线
+- `distributable_visibility` (`public` + `unlisted`): 可在联邦网络中传播，可出现在公共同步
+- `list_eligible_visibility` (`public` + `unlisted` + `private`): 可出现在列表时间线
 - `not_direct_visibility`: 非私信可见性
 
-#### 1.1.3 默认可见性
+#### 1.1.3 关键方法定义
+
+```ruby
+# app/models/concerns/status/visibility.rb:31-33
+def distributable?
+  public_visibility? || unlisted_visibility?
+end
+
+# app/services/fan_out_on_write_service.rb:188-190
+def broadcastable?
+  @status.public_visibility? && !@status.reblog? && !@account.silenced?
+end
+```
+
+**重要区别**：
+| 方法 | 条件 | 控制内容 |
+|-----|------|---------|
+| `distributable?` | `public` 或 `unlisted` | 是否可被转发、引用、出现在公共同步查询 |
+| `broadcastable?` | **仅** `public` + 非转发 + 账号未被静默 | 是否进入标签时间线、公共流（WebSocket） |
+
+#### 1.1.4 默认可见性
 
 ```ruby
 # app/models/concerns/status/visibility.rb
@@ -56,7 +76,7 @@ end
 - 锁定账号（需审核关注请求）: 默认 `private`
 - 普通账号: 默认 `public`
 
-#### 1.1.4 可见性限制
+#### 1.1.5 可见性限制
 
 ```ruby
 validates :visibility, exclusion: { in: %w(direct limited) }, if: :reblog?
@@ -336,6 +356,10 @@ Mastodon 的过滤系统采用多层级叠加策略，按以下顺序执行：
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │ public → unlisted → private → direct → limited                      │  │
 │  │ 决定帖子可被哪些时间线接收                                              │  │
+│  │ 关键点：                                                                │  │
+│  │ - unlisted 不会进入标签时间线和公共流                                  │  │
+│  │ - private 会投递给所有 followers（包括远程）                           │  │
+│  │ - direct/limited 不会投递给任何 followers                              │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                     ↓                                       │
 │  Level 2: 管理员级别控制（实例策略）                                         │
@@ -384,9 +408,86 @@ Mastodon 的过滤系统采用多层级叠加策略，按以下顺序执行：
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 时间线过滤机制
+### 2.2 可见性级别与分发目标的精确映射
 
-#### 2.2.1 FeedManager 核心过滤逻辑
+#### 2.2.1 FanOutOnWriteService 分发逻辑
+
+```ruby
+# app/services/fan_out_on_write_service.rb
+def call(status, options = {})
+  # ...
+  fan_out_to_local_recipients!
+  fan_out_to_public_recipients! if broadcastable?  # 注意：只有 broadcastable?
+  fan_out_to_public_streams! if broadcastable?      # 注意：只有 broadcastable?
+end
+
+def broadcastable?
+  @status.public_visibility? && !@status.reblog? && !@account.silenced?
+end
+```
+
+**关键结论**：只有 `public` 且非转发且账号未被静默的帖子才会：
+1. `deliver_to_hashtag_followers!` → 标签时间线
+2. `broadcast_to_hashtag_streams!` → 标签流（WebSocket）
+3. `broadcast_to_public_streams!` → 公共流
+
+#### 2.2.2 本地接收者分发
+
+```ruby
+# app/services/fan_out_on_write_service.rb:50-59
+def fan_out_to_local_recipients!
+  deliver_to_self!
+
+  unless @options[:skip_notifications]
+    notify_quoted_account!      # 通知被引用者（只有 accepted 的 quote）
+    notify_mentioned_accounts!
+    notify_about_update! if update?
+  end
+
+  case @status.visibility.to_sym
+  when :public, :unlisted, :private
+    deliver_to_all_followers!   # 投递给所有 followers
+    deliver_to_lists!           # 投递给列表
+  when :limited
+    deliver_to_mentioned_followers!  # 仅投递给被提及的关注者
+  else  # :direct
+    deliver_to_mentioned_followers!
+    deliver_to_conversation!
+  end
+end
+```
+
+#### 2.2.3 联邦投递范围
+
+```ruby
+# app/lib/status_reach_finder.rb:104-112
+def followers_scope
+  if @status.in_reply_to_local_account? && distributable?
+    # 回复本地账号且可分发：投递给作者和被回复者的 followers
+    @status.account.followers.or(@status.thread.account.followers.not_domain_blocked_by_account(@status.account))
+  elsif @status.direct_visibility? || @status.limited_visibility?
+    # direct 和 limited：不投递给任何 followers
+    Account.none
+  else
+    # public, unlisted, private：投递给所有 followers
+    @status.account.followers
+  end
+end
+```
+
+#### 2.2.4 分发目标对照表
+
+| 可见性 | broadcastable? | 标签时间线 | 标签流/公共流 | 本地 followers | 远程 followers | 列表 |
+|-------|---------------|-----------|--------------|---------------|---------------|------|
+| `public` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `unlisted` | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ |
+| `private` | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ |
+| `direct` | ✗ | ✗ | ✗ | ✗ (仅提及用户) | ✗ (仅提及用户) | ✗ |
+| `limited` | ✗ | ✗ | ✗ | ✗ (仅提及的关注者) | ✗ (仅提及的关注者) | ✗ |
+
+### 2.3 时间线过滤机制
+
+#### 2.3.1 FeedManager 核心过滤逻辑
 
 `FeedManager` 是时间线过滤的核心组件，负责在帖子分发时执行过滤。
 
@@ -406,7 +507,7 @@ def filter(timeline_type, status, receiver)
 end
 ```
 
-#### 2.2.2 主页时间线过滤 (filter_from_home)
+#### 2.3.2 主页时间线过滤 (filter_from_home)
 
 这是最复杂的过滤逻辑，包含多层检查：
 
@@ -436,6 +537,9 @@ def filter_from_home(status, receiver_id, crutches, timeline_type = :home)
     check_for_blocks.push(status.reblog.account_id)
     check_for_blocks.concat(crutches[:active_mentions][status.reblog_of_id] || [])
   end
+  
+  # 注意：这里不直接检查 quote 的作者
+  # 但如果 quote 创建了 Mention（通过 silent mention），则会被检查
   
   return :filter if check_for_blocks.any? { |target_account_id| 
     crutches[:blocking][target_account_id] || crutches[:muting][target_account_id] 
@@ -471,7 +575,7 @@ def filter_from_home(status, receiver_id, crutches, timeline_type = :home)
 end
 ```
 
-#### 2.2.3 过滤依赖数据 (crutches)
+#### 2.3.3 过滤依赖数据 (crutches)
 
 为了优化性能，`FeedManager` 使用 `build_crutches` 预加载所有需要的过滤数据：
 
@@ -511,7 +615,7 @@ def build_crutches(receiver_id, statuses, list: nil)
 end
 ```
 
-#### 2.2.4 标签时间线过滤
+#### 2.3.4 标签时间线过滤
 
 ```ruby
 # app/lib/feed_manager.rb:520-526
@@ -524,7 +628,118 @@ def filter_from_tags?(status, receiver_id, crutches)
 end
 ```
 
-### 2.3 公共时间线过滤
+### 2.4 Quote (引用) 交互策略与过滤链协作
+
+#### 2.4.1 Quote 模型与状态机
+
+```ruby
+# app/models/quote.rb
+enum :state,
+     { pending: 0, accepted: 1, rejected: 2, revoked: 3, deleted: 4 },
+     validate: true
+```
+
+| 状态 | 值 | 描述 |
+|-----|---|------|
+| `pending` | 0 | 等待被引用者同意 |
+| `accepted` | 1 | 已接受，可正常显示 |
+| `rejected` | 2 | 被拒绝 |
+| `revoked` | 3 | 被撤销 |
+| `deleted` | 4 | 引用的帖子已删除 |
+
+#### 2.4.2 Quote 可见性约束
+
+```ruby
+# app/models/quote.rb:98-102
+def validate_visibility
+  return if account_id == quoted_account_id || quoted_status.nil? || quoted_status.distributable?
+  errors.add(:quoted_status_id, :visibility_mismatch)
+end
+```
+
+**规则**：
+- 可以引用自己的任何帖子
+- 引用他人时，只能引用 `distributable?` 的帖子（`public` 或 `unlisted`）
+
+#### 2.4.3 Quote 与时间线过滤链
+
+**关键发现**：`FeedManager#filter_from_home` **不直接检查 Quote 的作者**。
+
+检查的对象：
+1. `status.account_id` - 发帖者
+2. `status.reblog.account_id` - 转发的原帖作者
+3. `crutches[:active_mentions][status.id]` - 被提及的账号
+
+**不直接检查**：
+- `status.quote.quoted_account_id` - 被引用的账号
+
+**间接机制**：
+- 如果 Quote 创建了 `Mention`（通过 `silent mention` 机制），则被引用者会被包含在 `active_mentions` 中
+- 此时屏蔽检查会生效
+
+#### 2.4.4 Quote 与通知过滤
+
+```ruby
+# app/services/fan_out_on_write_service.rb:75-79
+def notify_quoted_account!
+  return unless @status.quote&.quoted_account&.local? && @status.quote&.accepted?
+  LocalNotificationWorker.perform_async(@status.quote.quoted_account_id, @status.quote.id, 'Quote', 'quote')
+end
+```
+
+**规则**：
+- 只有 `accepted?` 的 Quote 才会通知被引用者
+- 通知类型是 `'Quote'`，会经过 `NotifyService` 的完整过滤链
+
+#### 2.4.5 Quote 与联邦投递
+
+```ruby
+# app/lib/status_reach_finder.rb:30-44
+def reached_account_ids
+  # ...
+  quote_of_account_id,      # 被引用的账号（用于投递）
+  # ...
+  quotes_account_ids,       # 引用我的账号（用于投递更新等）
+  # ...
+end
+
+# app/lib/status_reach_finder.rb:51-53
+def quote_of_account_id
+  @status.quote&.quoted_account_id
+end
+
+# app/lib/status_reach_finder.rb:63-66
+# Beware: Quotes can be created without the author having had access to the status
+def quotes_account_ids
+  @status.quotes.pluck(:account_id) if distributable? || unsafe?
+end
+```
+
+**注意**：
+- 代码注释："Quotes can be created without the author having had access to the status"
+- 这是一个安全提示，说明 Quote 可能在作者没有访问权限的情况下创建
+- `quotes_account_ids` 只在 `distributable?` 时返回
+
+#### 2.4.6 Quote 与缓存清理
+
+```ruby
+# app/models/media_attachment.rb:220-227
+scope :without_local_interaction, lambda {
+  # ...
+  .where.not(Quote.joins(:status).merge(Status.local).where(Quote.arel_table[:quoted_status_id].eq(MediaAttachment.arel_table[:status_id]).select(1).arel.exists)
+  .where.not(Quote.joins(:quoted_status).merge(Status.local).where(Quote.arel_table[:status_id].eq(MediaAttachment.arel_table[:status_id]).select(1).arel.exists)
+}
+```
+
+**本地交互检查包含**：
+1. 本地账号收藏
+2. 本地账号书签
+3. 本地账号回复
+4. 本地账号转发
+5. **本地账号引用**
+6. **被本地账号引用**
+
+### 2.5 公共时间线过滤
 
 公共时间线使用数据库查询层面的过滤：
 
@@ -569,11 +784,11 @@ def excluded_from_timeline_domains
 end
 ```
 
-### 2.4 通知过滤机制
+### 2.6 通知过滤机制
 
 通知过滤是最复杂的过滤层级，包含 `DropCondition` 和 `FilterCondition` 两个阶段。
 
-#### 2.4.1 通知策略模型
+#### 2.6.1 通知策略模型
 
 ```ruby
 # app/models/notification_policy.rb
@@ -597,7 +812,7 @@ enum :for_limited_accounts, { accept: 0, filter: 1, drop: 2 }, suffix: :limited_
 - `filter`: 放入通知请求箱，需用户确认
 - `drop`: 完全丢弃，不产生任何记录
 
-#### 2.4.2 通知服务主流程
+#### 2.6.2 通知服务主流程
 
 ```ruby
 # app/services/notify_service.rb
@@ -625,7 +840,7 @@ def call(recipient, type, activity, **options)
 end
 ```
 
-#### 2.4.3 DropCondition (完全丢弃)
+#### 2.6.3 DropCondition (完全丢弃)
 
 ```ruby
 # app/services/notify_service.rb:102-163
@@ -679,7 +894,7 @@ end
 7. 提及被时间线过滤
 8. 通知策略规则
 
-#### 2.4.4 FilterCondition (过滤到请求箱)
+#### 2.6.4 FilterCondition (过滤到请求箱)
 
 ```ruby
 # app/services/notify_service.rb:165-199
@@ -703,7 +918,7 @@ end
 - 已有 `NotificationPermission` 的发送者例外
 - 工作人员的消息例外
 
-#### 2.4.5 策略覆盖机制
+#### 2.6.5 策略覆盖机制
 
 ```ruby
 def override_for_sender?
@@ -712,114 +927,6 @@ end
 ```
 
 用户可以为特定发送者创建 `NotificationPermission`，覆盖全局策略。
-
-### 2.5 策略叠加决策流程图
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    帖子分发与过滤完整决策流程                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-帖子创建
-     │
-     ▼
-┌─────────────────────┐
-│ 检查可见性级别       │
-│ public/unlisted/    │
-│ private/direct/     │
-│ limited             │
-└──────────┬──────────┘
-           │
-           ├──────────────────────────────────────────────────────────────┐
-           │                                                              │
-           ▼                                                              ▼
-┌─────────────────────┐                                    ┌─────────────────────────────┐
-│ 可见性确定分发目标    │                                    │ FanOutOnWriteService        │
-│                     │                                    │                             │
-│ public:             │                                    │ - 投递到关注者               │
-│   - 所有关注者       │                                    │ - 投递到列表                 │
-│   - 公共同步         │◄───────────────────────────────────│ - 广播到 hashtag 流         │
-│   - hashtag 流       │                                    │ - 广播到公共流               │
-│                     │                                    │                             │
-│ unlisted:           │                                    │ 每个目标执行过滤检查          │
-│   - 所有关注者       │                                    │                             │
-│   - hashtag 流       │                                    │                             │
-│                     │                                    │                             │
-│ private:            │                                    │                             │
-│   - 仅关注者         │                                    │                             │
-│   - 列表             │                                    │                             │
-│                     │                                    │                             │
-│ direct:             │                                    │                             │
-│   - 仅提及用户       │                                    │                             │
-│                     │                                    │                             │
-│ limited:            │                                    │                             │
-│   - 提及的关注者      │                                    │                             │
-└─────────────────────┘                                    └─────────────────────────────┘
-                                                                    │
-                                                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           FeedManager.filter()                                    │
-│                                                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ 过滤检查顺序（任一条件满足则过滤）                                          │   │
-│  │                                                                           │   │
-│  │ 1. 基础检查                                                               │   │
-│  │    ├─ 自己的帖子？→ 不过滤                                               │   │
-│  │    ├─ 无效回复？→ 过滤                                                   │   │
-│  │    ├─ 专属列表用户且非列表时间线？→ 跳过主页                              │   │
-│  │    ├─ 语言不匹配？→ 过滤                                                 │   │
-│  │    └─ 转发的原帖不存在？→ 过滤                                           │   │
-│  │                                                                           │   │
-│  │ 2. 屏蔽/静音检查（检查发帖者、被提及者、转发原帖作者）                      │   │
-│  │    ├─ 我屏蔽了 TA？→ 过滤                                                │   │
-│  │    ├─ 我静音了 TA？→ 过滤                                                │   │
-│  │    └─ TA 屏蔽了我？→ 过滤                                                │   │
-│  │                                                                           │   │
-│  │ 3. 域名屏蔽检查                                                           │   │
-│  │    └─ 转发时：原帖作者域名被我屏蔽？→ 过滤                                │   │
-│  │                                                                           │   │
-│  │ 4. 回复过滤                                                               │   │
-│  │    过滤条件（同时满足）：                                                  │   │
-│  │    ├─ 我没有关注被回复的人                                                 │   │
-│  │    ├─ 不是回复给我                                                        │   │
-│  │    └─ 不是自回复                                                          │   │
-│  │                                                                           │   │
-│  │ 5. 转发过滤                                                               │   │
-│  │    过滤条件（任一满足）：                                                  │   │
-│  │    ├─ 我隐藏了转发者的转发                                                │   │
-│  │    ├─ 原帖作者屏蔽了我                                                    │   │
-│  │    └─ 原帖作者域名被我屏蔽                                                │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                                                    │
-                              ┌─────────────────────────────────────┼─────────────────────────────────────┐
-                              │                                     │                                     │
-                              ▼                                     ▼                                     ▼
-                    ┌─────────────────┐                   ┌─────────────────┐                   ┌─────────────────┐
-                    │   过滤通过      │                   │   标记过滤      │                   │   过滤被拒绝    │
-                    │                 │                   │   (:skip_home)   │                   │   (:filter)      │
-                    ▼                 │                   ▼                 │                   ▼                 │
-           ┌─────────────────┐      │            ┌─────────────────┐      │            帖子不加入时间线          │
-           │  加入时间线      │      │            │ 不加入主页时间线  │      │                                   │
-           │  (Redis ZSet)   │      │            │ 但可加入列表时间线│      │                                   │
-           └─────────────────┘      │            └─────────────────┘      │                                   │
-                                    │                                     │                                     │
-                                    └─────────────────────────────────────┴─────────────────────────────────────┘
-                                                                 │
-                                                                 ▼
-                                                    ┌─────────────────────────┐
-                                                    │  通知产生时执行额外过滤    │
-                                                    │  (NotifyService)         │
-                                                    └─────────────┬───────────┘
-                                                                  │
-                                        ┌─────────────────────────┼─────────────────────────┐
-                                        │                         │                         │
-                                        ▼                         ▼                         ▼
-                              ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-                              │   Drop 阶段     │       │  Filter 阶段    │       │    Accept       │
-                              │   完全丢弃       │       │  通知请求箱      │       │   正常通知       │
-                              └─────────────────┘       └─────────────────┘       └─────────────────┘
-```
 
 ---
 
@@ -837,13 +944,11 @@ Mastodon 采用 ActivityPub 协议实现联邦，每个实例独立管理自己�
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                          实例 A (mastodon.social)                              │
 │                                                                               │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
-│  │   User A1    │    │   User A2    │    │   Admin A    │                  │
-│  │              │    │              │    │              │                  │
-│  │ Blocks:      │    │ Mutes:       │    │ DomainBlocks:│                  │
-│  │ - @B1@inst-b │    │ - @A1         │    │ - inst-c     │                  │
-│  │              │    │              │    │  (suspend)    │                  │
-│  └──────────────┘    └──────────────┘    └──────────────┘                  │
+│  可见性规则（本地决策）：                                                       │
+│  - public: 进入所有时间线，包括标签时间线                                      │
+│  - unlisted: 只进入主页和列表，不进入标签时间线                                │
+│  - private: 投递给所有 followers（包括远程）                                   │
+│  - direct/limited: 不投递给任何 followers                                      │
 │                                                                               │
 │  本地决策边界：                                                                 │
 │  - 所有屏蔽/静音仅影响本实例用户的时间线                                        │
@@ -859,12 +964,11 @@ Mastodon 采用 ActivityPub 协议实现联邦，每个实例独立管理自己�
 ┌─────────────┴──────────────┐      ┌─────────────┴──────────────┐      ┌─────────────┴──────────────┐
 │      实例 B (inst-b.com)    │      │      实例 C (inst-c.com)    │      │      实例 D (inst-d.com)    │
 │                             │      │                             │      │                             │
-│  ┌──────────────┐           │      │  ┌──────────────┐           │      │  ┌──────────────┐           │
-│  │   User B1    │           │      │  │   User C1    │           │      │  │   User D1    │           │
-│  │              │           │      │  │              │           │      │  │              │           │
-│  │ 不知道被 A1  │           │      │  │  完全被 A 隔离│           │      │  │  与 A 正常通信│           │
-│  │ 屏蔽         │           │      │  │              │           │      │              │           │
-│  └──────────────┘           │      │  └──────────────┘           │      │  └──────────────┘           │
+│  入站可见性转换：             │      │                             │      │                             │
+│  - 根据 ActivityPub 的       │      │                             │      │                             │
+│    to/cc 解析可见性          │      │                             │      │                             │
+│  - direct 可能转换为 limited │      │                             │      │                             │
+│    （当有 silent mention 时） │      │                             │      │                             │
 │                             │      │                             │      │                             │
 │  本地决策：                   │      │  本地决策：                   │      │  本地决策：                   │
 │  - 独立于 A 的决策           │      │  - 不知道被 A 屏蔽          │      │  - 完全独立                  │
@@ -872,9 +976,141 @@ Mastodon 采用 ActivityPub 协议实现联邦，每个实例独立管理自己�
 └─────────────────────────────┘      └─────────────────────────────┘      └─────────────────────────────┘
 ```
 
-### 3.2 实例间的边界规则
+### 3.2 可见性在联邦入站时的解析与转换
 
-#### 3.2.1 账号屏蔽的传播
+#### 3.2.1 入站时的初始解析
+
+```ruby
+# app/lib/activitypub/parser/status_parser.rb:101-111
+def visibility
+  if audience_to.any? { |to| ActivityPub::TagManager.instance.public_collection?(to) }
+    :public
+  elsif audience_cc.any? { |cc| ActivityPub::TagManager.instance.public_collection?(cc) }
+    :unlisted
+  elsif audience_to.include?(@options[:followers_collection])
+    :private
+  else
+    :direct  # 默认解析为 direct
+  end
+end
+```
+
+**解析规则**：
+
+| ActivityPub 属性 | 解析为可见性 |
+|-----------------|-------------|
+| `to` 包含 `Public` 集合 | `public` |
+| `cc` 包含 `Public` 集合 | `unlisted` |
+| `to` 包含 `followers` 集合 | `private` |
+| 其他情况 | `direct` |
+
+#### 3.2.2 direct → limited 的转换条件
+
+```ruby
+# app/lib/activitypub/activity/create.rb:124-154
+def process_audience
+  accounts_in_audience = (audience_to + audience_cc).uniq.filter_map do |audience|
+    account_from_uri(audience) unless ActivityPub::TagManager.instance.public_collection?(audience)
+  end
+  
+  # 如果 payload 是投递到特定 inbox 的，添加该账号
+  if @options[:delivered_to_account_id]
+    accounts_in_audience << delivered_to_account
+    accounts_in_audience.uniq!
+  end
+  
+  accounts_in_audience.each do |account|
+    # 如果不是显式提及，则创建 silent mention
+    next if @mentions.any? { |mention| mention.account_id == account.id }
+    @mentions << Mention.new(account: account, silent: true)
+    
+    # 关键：当有 silent mention 时，direct 转换为 limited
+    @params[:visibility] = :limited if @params[:visibility] == :direct
+  end
+end
+
+# app/lib/activitypub/activity/create.rb:156-165
+def postprocess_audience_and_deliver
+  return if @status.mentions.find_by(account_id: @options[:delivered_to_account_id])
+  
+  @status.mentions.create(account: delivered_to_account, silent: true)
+  @status.update(visibility: :limited) if @status.direct_visibility?  # 再次确认转换
+  # ...
+end
+```
+
+#### 3.2.3 转换流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    direct → limited 转换流程                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+入站 ActivityPub 帖子
+     │
+     ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 1: 初始解析 (StatusParser#visibility)                                     │
+│                                                                               │
+│ 检查 to/cc 属性：                                                             │
+│ ├─ to 包含 Public → public                                                    │
+│ ├─ cc 包含 Public → unlisted                                                  │
+│ ├─ to 包含 followers_collection → private                                     │
+│ └─ 其他 → direct (默认)                                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼ (如果解析为 direct)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 2: 处理 audience (process_audience)                                       │
+│                                                                               │
+│ 收集 audience 中的账号：                                                        │
+│ - 从 to 和 cc 中解析出非 Public 的 URI                                          │
+│ - 查找本地已知账号 (account_from_uri)                                           │
+│ - 如果有 delivered_to_account_id，添加该账号                                    │
+│                                                                               │
+│ 对每个账号检查：                                                                │
+│ ┌─────────────────────────────────────────────────────────────────────────┐  │
+│ │ 账号是否已在显式提及中？(Mention tag)                                      │  │
+│ │                                                                           │  │
+│ │ 否 → 创建 Mention.new(silent: true)                                        │  │
+│ │      └─► @params[:visibility] = :limited (如果当前是 direct)              │  │
+│ │                                                                           │  │
+│ │ 是 → 跳过（显式提及优先级更高）                                             │  │
+│ └─────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼ (帖子创建后)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 3: 后处理 (postprocess_audience_and_deliver)                              │
+│                                                                               │
+│ 仅当 delivered_to_account_id 存在时：                                          │
+│ - 检查该账号是否已在 mentions 中                                               │
+│ - 如果不在，创建 silent mention                                                 │
+│ - 如果当前是 direct_visibility?，更新为 limited                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.2.4 转换条件总结
+
+**direct → limited 转换触发条件**（任一满足）：
+
+1. **Audience 中包含本地已知账号**：
+   - `to` 或 `cc` 中包含本地账号的 URI
+   - 且该账号不是通过显式 Mention tag 提及的
+
+2. **直接投递到特定 inbox**：
+   - payload 带有 `delivered_to_account_id`
+   - 表示该帖子是直接投递到该账号的 inbox
+   - 该账号不是显式提及
+
+**核心逻辑**：
+- `direct` 表示"仅显式提及的用户"
+- `limited` 表示"所有提及的用户（包括 silent mention）"
+- 当发现有非显式提及的受众时，`direct` 不够准确，转换为 `limited`
+
+### 3.3 实例间的边界规则
+
+#### 3.3.1 账号屏蔽的传播
 
 ```ruby
 # app/services/block_service.rb
@@ -892,7 +1128,7 @@ end
 - 被屏蔽者知道自己被屏蔽
 - 但屏蔽的过滤效果仅在屏蔽者实例生效
 
-#### 3.2.2 域名屏蔽的边界
+#### 3.3.2 域名屏蔽的边界
 
 域名屏蔽是**纯本地决策**，不传递给其他实例：
 
@@ -909,30 +1145,7 @@ end
 | 删除该域名账号的本地数据 | ✓ 生效 | ✗ 原数据保留 | ✗ 不影响 |
 | 公共同步不显示该域名 | ✓ 生效 | ✗ 不影响 | ✗ 不影响 |
 
-#### 3.2.3 可见性的联邦传播
-
-帖子可见性在创建时确定，通过 ActivityPub 传播时携带 `visibility` 属性：
-
-```ruby
-# 帖子可见性影响联邦传播范围
-
-# public / unlisted:
-# - 可传播到所有关注者实例
-# - 可被转发进一步传播
-# - 可出现在公共同步
-
-# private:
-# - 仅传播到已确认的关注者实例
-# - 转发受限
-
-# direct:
-# - 仅传播到提及的用户实例
-
-# limited:
-# - 仅传播到提及的关注者实例
-```
-
-### 3.3 公共时间线的实例边界
+### 3.4 公共时间线的实例边界
 
 ```ruby
 # app/models/public_feed.rb
@@ -954,9 +1167,9 @@ end
 - 远程实例：不知情，可正常显示在其公共同步
 - 关注者：静默账号的帖子仍可出现在关注者时间线
 
-### 3.4 远程内容的审核处理
+### 3.5 远程内容的审核处理
 
-#### 3.4.1 远程帖子删除
+#### 3.5.1 远程帖子删除
 
 ```ruby
 # app/models/admin/moderation_action.rb
@@ -976,7 +1189,7 @@ end
 - 防止相同内容通过联邦再次同步过来
 - `by_moderator: true` 标记是管理员操作
 
-#### 3.4.2 远程内容更新
+#### 3.5.2 远程内容更新
 
 ```ruby
 # app/models/admin/moderation_action.rb
@@ -997,70 +1210,6 @@ end
 - 本地实例：显示为敏感内容
 - 原实例：不知道被标记，仍显示正常
 - 其他实例：不受影响
-
-### 3.5 跨实例决策的独立性
-
-每个实例对内容的审核决策完全独立：
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    实例决策独立性示例                                          │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-场景：User A @ instance-a.com 发了一个帖子
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Instance A (本地)                                                             │
-│                                                                               │
-│ 帖子状态:                                                                      │
-│ - 可见性: public                                                              │
-│ - sensitive: false                                                            │
-│ - 显示: 正常                                                                  │
-│                                                                               │
-│ 管理员决策: 无                                                                 │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ActivityPub (Create)
-                                    ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Instance B                                                                   │
-│                                                                               │
-│ 本地决策:                                                                      │
-│ - Admin B: 标记为 sensitive                                                   │
-│ - 但不传播到 Instance A                                                        │
-│                                                                               │
-│ 本地显示:                                                                      │
-│ - 显示为敏感内容（需点击展开）                                                 │
-│                                                                               │
-│ Instance A 不知道被 Instance B 标记                                            │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ActivityPub (Create)
-                                    ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Instance C                                                                   │
-│                                                                               │
-│ 本地决策:                                                                      │
-│ - Admin C: 删除帖子 + 创建 Tombstone                                          │
-│ - 阻止该帖子再次出现                                                           │
-│                                                                               │
-│ 对其他实例的影响:                                                              │
-│ - 无，Instance A 和 B 不受影响                                                │
-└──────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ActivityPub (Create)
-                                    ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Instance D                                                                   │
-│                                                                               │
-│ 本地决策:                                                                      │
-│ - 无，正常显示                                                                 │
-│                                                                               │
-│ 但:                                                                           │
-│ - User D1 屏蔽了 User A                                                       │
-│ - 帖子不出现在 D1 的时间线，但仍在公共同步                                     │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
 
 ---
 
@@ -1345,101 +1494,34 @@ end
 
 ---
 
-## 5. 关键设计决策分析
+## 5. 关键设计决策总结
 
-### 5.1 为什么采用多层过滤？
+### 5.1 可见性与分发的关键决策
 
-| 层级 | 位置 | 目的 | 性能考虑 |
-|-----|------|------|---------|
-| 可见性 | 分发前 | 基于内容属性的基础路由 | O(1) 检查 |
-| 域名屏蔽 | 分发前/查询时 | 实例级别的粗粒度控制 | O(1) 哈希查找 |
-| 账号屏蔽 | 分发时 | 用户级别的细粒度控制 | 预加载 crutches |
-| 内容审核 | 任意时间 | 管理员的事后干预 | 异步处理 |
-| 通知策略 | 通知产生时 | 精细化的通知控制 | 按需计算 |
-
-**设计考虑**：
-1. **早过滤**：尽可能在分发链早期过滤，减少后续处理
-2. **多层叠加**：不同层级处理不同维度的控制
-3. **性能优化**：使用缓存、批量预加载、Redis 操作
-
-### 5.2 为什么屏蔽是单向决策？
-
-```
-实例 A ──────屏蔽──────► 实例 B 的账号
-
-影响范围：
-- ✓ A 的用户时间线不显示 B 的帖子
-- ✓ A 的公共同步不显示 B 的帖子
-- ✓ A 不接收 B 的通知
-- ✗ B 不知道被 A 屏蔽（除非 ActivityPub 传递）
-- ✗ B 的实例不受影响
-- ✗ 其他实例不受影响
-```
-
-**设计原因**：
-1. **联邦自治**：每个实例有权决定自己的用户看到什么
-2. **隐私保护**：屏蔽者的决策不需要被屏蔽者同意
-3. **减少冲突**：避免实例间因审核标准不同产生矛盾
-
-### 5.3 为什么本地和远程操作不同？
-
-| 操作 | 本地账号 | 远程账号 |
+| 决策 | 设计意图 | 代码位置 |
 |-----|---------|---------|
-| 删除帖子 | 软删除 + ActivityPub Delete | 软删除 + Tombstone |
-| 标记敏感 | UpdateStatusService + ActivityPub Update | 仅数据库更新 |
-| 账号封禁 | DeleteAccountService + 联邦传播 | 仅本地数据删除 |
+| `unlisted` 不进入标签时间线 | 标签时间线是"发现"机制，unlisted 更适合"低调分享" | `FanOutOnWriteService#broadcastable?` |
+| `private` 投递给远程 followers | 锁定账号的关注者也应该能看到帖子 | `StatusReachFinder#followers_scope` |
+| `direct/limited` 不投递给任何 followers | 私信和受限帖子应该严格控制受众 | `StatusReachFinder#followers_scope` |
+| `broadcastable?` 比 `distributable?` 更严格 | 公共流和标签时间线需要更高的可见性门槛 | `FanOutOnWriteService` |
 
-**设计原因**：
-1. **主权原则**：远程实例拥有其数据的最终控制权
-2. **实际限制**：无法强制远程实例接受修改
-3. **墓碑机制**：防止已删除内容再次同步
+### 5.2 Quote 交互的设计决策
 
-### 5.4 通知的三态设计 (Accept/Filter/Drop)
+| 决策 | 设计意图 | 代码位置 |
+|-----|---------|---------|
+| 只能引用 `distributable?` 的帖子 | 保护私有内容不被公开引用 | `Quote#validate_visibility` |
+| 只有 `accepted?` 才通知被引用者 | 引用需要被引用者同意才能产生交互 | `FanOutOnWriteService#notify_quoted_account!` |
+| 时间线过滤不直接检查 quote 作者 | 引用是发帖者的行为，不是被引用者的行为 | `FeedManager#filter_from_home` |
+| `quotes_account_ids` 只在 `distributable?` 时返回 | 非公开帖子的引用交互不应该被广泛传播 | `StatusReachFinder#quotes_account_ids` |
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 通知策略三态的权衡                                                             │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│ Accept:                                                                       │
-│ ┌─────────────────────────────────────────────────────────────────────────┐ │
-│ │ 优点: 实时性好，不遗漏重要通知                                           │ │
-│ │ 缺点: 可能造成信息过载                                                   │ │
-│ │ 适用: 关注者、熟人、重要对话                                            │ │
-│ └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-│ Filter:                                                                       │
-│ ┌─────────────────────────────────────────────────────────────────────────┐ │
-│ │ 优点: 用户可控，防骚扰同时不遗漏                                         │ │
-│ │ 缺点: 需要用户手动确认，增加操作成本                                     │ │
-│ │ 适用: 陌生人消息、新账号通知                                            │ │
-│ └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-│ Drop:                                                                         │
-│ ┌─────────────────────────────────────────────────────────────────────────┐ │
-│ │ 优点: 完全消除干扰，用户体验最佳                                         │ │
-│ │ 缺点: 可能错过重要信息，无法恢复                                         │ │
-│ │ 适用: 已屏蔽账号、确定的垃圾信息                                        │ │
-│ └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+### 5.3 联邦入站可见性转换的设计决策
 
-### 5.5 最终一致性 vs 强一致性
-
-Mastodon 选择最终一致性模型的原因：
-
-| 特性 | 强一致性 | 最终一致性 | Mastodon 选择 |
-|-----|---------|-----------|--------------|
-| 屏蔽后时间线更新 | 同步阻塞 | 异步清理 | 最终一致 |
-| 通知删除 | 同步 | 异步 | 最终一致 |
-| 缓存更新 | 同步失效 | 下次读取重建 | 最终一致 |
-
-**设计考虑**：
-1. **用户体验**：屏蔽操作需要快速响应，不能被慢操作阻塞
-2. **可扩展性**：异步处理支持更大规模的用户基数
-3. **故障隔离**：单个组件故障不影响核心功能
-4. **兜底机制**：查询层过滤确保即使缓存/时间线有旧数据也不会显示
+| 决策 | 设计意图 | 代码位置 |
+|-----|---------|---------|
+| 根据 `to/cc` 解析可见性 | 遵循 ActivityPub 规范 | `StatusParser#visibility` |
+| `direct` 转换为 `limited` 当有 silent mention | 准确反映实际受众范围 | `Activity::Create#process_audience` |
+| `silent: true` 的 Mention | 区分显式提及和隐式受众 | `Activity::Create#process_audience` |
+| `delivered_to_account_id` 特殊处理 | 处理直接投递的场景 | `Activity::Create#postprocess_audience_and_deliver` |
 
 ---
 
@@ -1449,164 +1531,163 @@ Mastodon 选择最终一致性模型的原因：
 
 | 文件路径 | 功能描述 |
 |---------|---------|
-| `app/models/concerns/status/visibility.rb` | 可见性级别定义、作用域、默认值 |
-| `app/models/status.rb` | Status 模型的过滤作用域 |
+| `app/models/concerns/status/visibility.rb` | 可见性级别定义、作用域、`distributable?` 方法 |
+| `app/services/fan_out_on_write_service.rb` | 帖子分发逻辑、`broadcastable?` 方法、quote 通知 |
+| `app/lib/status_reach_finder.rb` | 联邦投递范围计算、`followers_scope` 方法 |
 
-### 6.2 账号屏蔽与静音
+### 6.2 Quote 交互
+
+| 文件路径 | 功能描述 |
+|---------|---------|
+| `app/models/quote.rb` | Quote 模型、状态机、可见性验证 |
+| `app/lib/activitypub/parser/status_parser.rb` | Quote URI 解析、quote_policy 解析 |
+| `app/lib/activitypub/activity/create.rb` | Quote 创建处理 |
+| `app/services/activitypub/verify_quote_service.rb` | Quote 验证服务 |
+
+### 6.3 联邦入站处理
+
+| 文件路径 | 功能描述 |
+|---------|---------|
+| `app/lib/activitypub/parser/status_parser.rb` | 可见性解析逻辑 |
+| `app/lib/activitypub/activity/create.rb` | `process_audience` 方法、direct→limited 转换 |
+| `app/lib/activitypub/tag_manager.rb` | ActivityPub URI 管理 |
+
+### 6.4 屏蔽与过滤
 
 | 文件路径 | 功能描述 |
 |---------|---------|
 | `app/models/block.rb` | 账号屏蔽模型 |
 | `app/models/mute.rb` | 账号静音模型 |
-| `app/services/block_service.rb` | 屏蔽服务主流程 |
-| `app/services/after_block_service.rb` | 屏蔽后清理服务 |
-| `app/workers/block_worker.rb` | 屏蔽后异步清理 Worker |
-| `app/models/account_domain_block.rb` | 用户级域名屏蔽 |
-
-### 6.3 域名屏蔽
-
-| 文件路径 | 功能描述 |
-|---------|---------|
 | `app/models/domain_block.rb` | 域名屏蔽模型 |
-| `app/services/block_domain_service.rb` | 域名屏蔽服务 |
-| `app/workers/domain_clear_media_worker.rb` | 域名媒体清理 Worker |
+| `app/lib/feed_manager.rb` | 时间线过滤核心逻辑 |
+| `app/services/notify_service.rb` | 通知过滤逻辑 |
 
-### 6.4 内容审核
+### 6.5 内容审核
 
 | 文件路径 | 功能描述 |
 |---------|---------|
 | `app/models/admin/moderation_action.rb` | 管理员审核操作 |
-| `app/models/tombstone.rb` | 墓碑记录（防止已删除内容重新同步） |
-| `app/services/update_status_service.rb` | 状态更新服务 |
-| `app/workers/removal_worker.rb` | 内容移除 Worker |
-
-### 6.5 时间线过滤
-
-| 文件路径 | 功能描述 |
-|---------|---------|
-| `app/lib/feed_manager.rb` | 时间线管理核心，包含过滤逻辑 |
-| `app/models/public_feed.rb` | 公共时间线查询逻辑 |
-| `app/models/home_feed.rb` | 主页时间线 |
-| `app/services/fan_out_on_write_service.rb` | 写入时扇出服务 |
-| `app/workers/feed_insert_worker.rb` | 时间线插入 Worker |
-
-### 6.6 通知过滤
-
-| 文件路径 | 功能描述 |
-|---------|---------|
-| `app/services/notify_service.rb` | 通知服务，包含 Drop/Filter 逻辑 |
-| `app/models/notification_policy.rb` | 通知策略模型 |
-| `app/models/notification_request.rb` | 通知请求模型 |
-| `app/models/notification_permission.rb` | 通知权限覆盖 |
-
-### 6.7 联邦相关
-
-| 文件路径 | 功能描述 |
-|---------|---------|
-| `app/lib/activitypub/activity/block.rb` | ActivityPub Block 活动处理 |
-| `app/services/activitypub/process_status_update_service.rb` | 远程状态更新处理 |
+| `app/models/tombstone.rb` | 墓碑记录 |
 
 ---
 
 ## 7. 配置要点
 
-### 7.1 通知策略阈值
+### 7.1 可见性相关方法对比
 
-| 配置项 | 默认值 | 说明 |
-|-------|-------|------|
-| `NEW_ACCOUNT_THRESHOLD` | 30 天 | 新账号判断阈值 |
-| `NEW_FOLLOWER_THRESHOLD` | 3 天 | 新关注者判断阈值 |
+| 方法 | 条件 | 控制内容 |
+|-----|------|---------|
+| `distributable?` | `public` 或 `unlisted` | 是否可被转发、引用、出现在公共同步查询 |
+| `broadcastable?` | **仅** `public` + 非转发 + 账号未被静默 | 是否进入标签时间线、公共流（WebSocket） |
+| `list_eligible_visibility` | `public` + `unlisted` + `private` | 是否可出现在列表时间线 |
+| `distributable_visibility` | `public` + `unlisted` | 是否可在联邦网络中广泛传播 |
 
-### 7.2 域名屏蔽级别
+### 7.2 可见性级别分发对照表
 
-| 级别 | 影响 |
-|-----|------|
-| `suspend` | 完全封禁，删除账号数据 |
-| `silence` | 静默，不显示在公共同步 |
-| `noop` | 仅记录，无实际操作 |
+| 可见性 | 本地 followers | 远程 followers | 主页时间线 | 列表 | 标签时间线 | 公共流 |
+|-------|---------------|---------------|-----------|------|-----------|--------|
+| `public` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `unlisted` | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
+| `private` | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
+| `direct` | ✗ (仅提及用户) | ✗ (仅提及用户) | ✗ (仅对话) | ✗ | ✗ | ✗ |
+| `limited` | ✗ (仅提及的关注者) | ✗ (仅提及的关注者) | ✗ (仅提及的关注者) | ✗ | ✗ | ✗ |
 
-### 7.3 缓存键
+### 7.3 Quote 状态转换
 
-| 键模式 | 内容 | 失效时机 |
-|-------|------|---------|
-| `exclude_account_ids_for:{id}` | 需排除的账号 ID 列表 | Block/Mute 创建/删除 |
-| `exclude_domains_for:{id}` | 需排除的域名列表 | AccountDomainBlock 创建/删除 |
-| `follow_recommendations/{id}` | 关注推荐 | Block 创建/删除 |
-
----
-
-## 8. 故障排查与运维建议
-
-### 8.1 常见一致性问题
-
-| 问题 | 可能原因 | 解决方案 |
-|-----|---------|---------|
-| 屏蔽后仍看到帖子 | BlockWorker 失败/时间线未清理 | 手动执行 `FeedManager.instance.clear_from_home` |
-| 通知策略不生效 | 缓存未更新 | 检查 `NotificationPolicy` 记录，确认 `filtered` 标志 |
-| 远程内容重新出现 | Tombstone 缺失 | 确认 `Tombstone` 记录存在 |
-| 公共同步显示静默账号 | `without_silenced` 作用域未应用 | 检查查询逻辑 |
-
-### 8.2 性能优化建议
-
-1. **缓存预热**：
-   - `excluded_from_timeline_account_ids` 是热点缓存
-   - 屏蔽/静音操作后缓存失效，下次读取会重建
-
-2. **批量操作**：
-   - 域名屏蔽使用 `in_batches.update_all`
-   - 时间线清理使用 `find_each` 避免内存溢出
-
-3. **异步处理**：
-   - 屏蔽后的清理操作全部异步
-   - 不阻塞用户的屏蔽操作响应
-
-### 8.3 监控要点
-
-1. **Sidekiq 队列**：
-   - `BlockWorker` 执行情况
-   - `FeedInsertWorker` 延迟
-   - `RemovalWorker` 失败率
-
-2. **缓存命中率**：
-   - `exclude_account_ids_for:*` 键
-   - 可通过 Rails.cache.stats 监控
-
-3. **数据库查询**：
-   - `Status.not_excluded_by_account` 的使用
-   - 避免 N+1 查询
+| 状态 | 可被引用者看到 | 通知被引用者 | 可被交互 |
+|-----|---------------|-------------|---------|
+| `pending` | 否 | 否 | 否 |
+| `accepted` | 是 | 是 | 是 |
+| `rejected` | 否 | 否 | 否 |
+| `revoked` | 否 | 否 | 否 |
+| `deleted` | 否 | 否 | 否 |
 
 ---
 
 ## 总结
 
-Mastodon 的内容审核、屏蔽与可见性控制系统设计体现了以下核心原则：
+本文档详细分析了 Mastodon 中内容审核、账号/域名屏蔽和帖子可见性控制三者的协作机制，特别纠正和补充了以下四个关键点：
 
-### 1. 分层过滤，各司其职
+### 1. unlisted 与标签时间线
 
-- **可见性层**：基于内容属性的基础路由
-- **实例策略层**：域名级别的粗粒度控制
-- **用户策略层**：账号级别的细粒度控制
-- **审核操作层**：事后干预能力
-- **通知策略层**：精细化的通知控制
+**关键纠正**：`unlisted` **不会**进入标签时间线。
 
-### 2. 联邦自治，决策独立
+- `broadcastable?` 方法只检查 `public_visibility?`
+- 只有 `public` 且非转发且账号未被静默的帖子才会：
+  - `deliver_to_hashtag_followers!` → 标签时间线
+  - `broadcast_to_hashtag_streams!` → 标签流（WebSocket）
+  - `broadcast_to_public_streams!` → 公共流
 
-- 每个实例对自己的用户负责
-- 屏蔽/审核决策不传递给其他实例
-- 远程内容的修改仅影响本地
+### 2. private 在联邦投递中的实际边界
 
-### 3. 最终一致，兜底保障
+**关键纠正**：`private` 会投递给**所有 followers**（包括远程），但 `direct` 和 `limited` 不会。
 
-- 异步清理保证响应速度
-- 缓存失效确保数据新鲜
-- 查询层过滤防止旧数据显示
-- Tombstone 机制防止内容回退
+```ruby
+# app/lib/status_reach_finder.rb:104-112
+def followers_scope
+  # ...
+  elsif @status.direct_visibility? || @status.limited_visibility?
+    Account.none  # 不投递给任何 followers
+  else
+    @status.account.followers  # public, unlisted, private 都投递给所有 followers
+  end
+end
+```
 
-### 4. 用户体验优先
+### 3. direct 与 limited 在联邦入站时的转换条件
 
-- 屏蔽操作快速响应
-- 通知三态设计平衡干扰和遗漏
-- 工作人员消息例外机制
-- 通知权限覆盖能力
+**关键补充**：`direct` 转换为 `limited` 的触发条件。
 
-这种设计既满足了联邦社交网络的去中心化特性，又提供了强大的内容控制和用户保护机制，是 Mastodon 能够大规模运行的关键架构决策之一。
+**入站解析规则**：
+- `to` 包含 Public → `public`
+- `cc` 包含 Public → `unlisted`
+- `to` 包含 followers_collection → `private`
+- 其他 → `direct`（默认）
+
+**转换条件**（任一满足）：
+1. **Audience 中包含本地已知账号**且不是显式提及
+2. **直接投递到特定 inbox**（`delivered_to_account_id` 存在）
+
+**核心逻辑**：
+- 创建 `Mention.new(silent: true)` 表示隐式受众
+- `direct` 表示"仅显式提及的用户"
+- `limited` 表示"所有提及的用户（包括 silent mention）"
+- 当发现有非显式提及的受众时，`direct` 不够准确，转换为 `limited`
+
+### 4. quote 交互策略与过滤链协作
+
+**关键补充**：Quote 如何与现有过滤链协作。
+
+**Quote 状态机**：
+- `pending` → `accepted` / `rejected` → `revoked` / `deleted`
+
+**可见性约束**：
+- 可以引用自己的任何帖子
+- 引用他人时，只能引用 `distributable?` 的帖子（`public` 或 `unlisted`）
+
+**与时间线过滤链协作**：
+- `FeedManager#filter_from_home` **不直接检查** Quote 的作者
+- 检查的对象：发帖者、转发原帖作者、被提及的账号
+- **间接机制**：如果 Quote 创建了 `Mention`（通过 `silent mention` 机制），则被引用者会被包含在 `active_mentions` 中，此时屏蔽检查会生效
+
+**与通知过滤协作**：
+- 只有 `accepted?` 的 Quote 才会通知被引用者
+- 通知类型是 `'Quote'`，会经过 `NotifyService` 的完整过滤链
+
+**与联邦投递协作**：
+- `quote_of_account_id` 包含在 `reached_account_ids` 中
+- `quotes_account_ids` 只在 `distributable?` 时返回
+- 代码注释提示安全风险："Quotes can be created without the author having had access to the status"
+
+---
+
+## 最终确认
+
+### 四个关键点的完整总结
+
+| 关键点 | 核心结论 | 关键代码位置 |
+|--------|---------|-------------|
+| **unlisted 与标签时间线** | `unlisted` **不会**进入标签时间线。只有 `broadcastable?`（仅 `public` + 非转发 + 账号未被静默）的帖子才会进入标签时间线、标签流和公共流。 | `FanOutOnWriteService#broadcastable?` |
+| **private 在联邦投递中的实际边界** | `private` 会投递给**所有 followers**（包括远程实例的关注者）。但 `direct` 和 `limited` 不会投递给任何 followers（返回 `Account.none`）。 | `StatusReachFinder#followers_scope` |
+| **direct 与 limited 在联邦入站时的转换条件** | 入站时根据 `to/cc` 解析为 `direct` 后，会在以下情况转换为 `limited`：<br>1. Audience 中包含本地已知账号且不是显式提及（创建 `silent: true` 的 Mention）<br>2. 直接投递到特定 inbox（`delivered_to_account_id` 存在） | `ActivityPub::Activity::Create#process_audience` |
+| **quote 交互策略与过滤链协作** | Quote 有独立的状态机和可见性约束。时间线过滤不直接检查 quote 作者，但通过 `Mention` 间接检查；只有 `accepted?` 的 quote 才通知被引用者。 | `Quote#validate_visibility`, `FanOutOnWriteService#notify_quoted_account!` |
