@@ -6,8 +6,10 @@
 2. [时间线写入路径](#时间线写入路径)
 3. [通知生成路径](#通知生成路径)
 4. [本地账号 vs 远端联邦账号处理差异](#本地账号-vs-远端联邦账号处理差异)
-5. [静音和屏蔽的影响层次](#静音和屏蔽的影响层次)
-6. [远端账号数据延迟/不一致的处理手段](#远端账号数据延迟不一致的处理手段)
+5. [远端账号"陈旧"判定与刷新触发机制](#远端账号陈旧判定与刷新触发机制)
+6. [取关链路与通知分析](#取关链路与通知分析)
+7. [静音和屏蔽的影响层次](#静音和屏蔽的影响层次)
+8. [远端账号数据延迟/不一致的处理手段](#远端账号数据延迟不一致的处理手段)
 
 ---
 
@@ -76,43 +78,6 @@ end
 1. 创建 FollowRequest 记录
 2. 如果是本地锁定账号：发送 `follow_request` 通知
 3. 如果是远端 ActivityPub 账号：通过 `ActivityPub::DeliveryWorker` 投递 Follow 活动到对方 inbox
-
-### 取关流程 (UnfollowService)
-
-文件位置：`app/services/unfollow_service.rb`
-
-```ruby
-# app/services/unfollow_service.rb:25-49
-def unfollow!
-  follow = Follow.find_by(account: @follower, target_account: @followee)
-  return unless follow
-
-  list_ids = @follower.owned_lists.with_list_account(@followee).pluck(:list_id) unless @options[:skip_unmerge]
-
-  follow.destroy!
-
-  if @followee.local? && @follower.remote? && @follower.activitypub?
-    send_reject_follow(follow)
-  elsif @followee.remote? && @followee.activitypub?
-    send_undo_follow(follow)
-  end
-
-  unless @options[:skip_unmerge]
-    UnmergeWorker.perform_async(@followee.id, @follower.id, 'home')
-    UnmergeWorker.push_bulk(list_ids) do |list_id|
-      [@followee.id, list_id, 'list']
-    end
-  end
-
-  follow
-end
-```
-
-**步骤分解：**
-1. 查找并销毁 Follow 记录
-2. 如果远端关注者取关本地账号：发送 Reject 活动
-3. 如果本地关注者取关远端账号：发送 Undo 活动
-4. 从时间线中移除被取关者的状态 (`UnmergeWorker`)
 
 ---
 
@@ -355,34 +320,31 @@ def drop?
 end
 ```
 
-### 状态发布时的通知
+### Notification 支持的类型
 
-从 `FanOutOnWriteService` 可以看到：
+从 `app/models/notification.rb:37-106` 可以看到，Mastodon 支持以下通知类型：
 
-```ruby
-# app/services/fan_out_on_write_service.rb:44-48
-unless @options[:skip_notifications]
-  notify_quoted_account!
-  notify_mentioned_accounts!
-  notify_about_update! if update?
-end
-```
+| 类型 | 说明 | filterable |
+|------|------|-----------|
+| `mention` | 提及 | ✅ |
+| `status` | 新状态 (关注时设置了 notify) | ❌ |
+| `reblog` | 转发 | ✅ |
+| `follow` | 关注 | ✅ |
+| `follow_request` | 关注请求 | ✅ |
+| `favourite` | 收藏 | ✅ |
+| `poll` | 投票结束 | ❌ |
+| `update` | 状态编辑 | ❌ |
+| `severed_relationships` | 关系切断 (域名封禁等) | ❌ |
+| `moderation_warning` |  moderation 警告 | ❌ |
+| `annual_report` | 年度报告 | ❌ |
+| `admin.sign_up` | 管理员新用户注册 | ❌ |
+| `admin.report` | 管理员举报 | ❌ |
+| `quote` | 引用 | ✅ |
+| `quoted_update` | 引用更新 | ❌ |
+| `added_to_collection` | 添加到合集 | ✅ |
+| `collection_update` | 合集更新 | ❌ |
 
-#### 提及通知
-
-```ruby
-# app/services/fan_out_on_write_service.rb:81-98
-def notify_mentioned_accounts!
-  @status.active_mentions.joins(:account).merge(Account.local).select(:id, :account_id).reorder(nil).find_in_batches do |mentions|
-    LocalNotificationWorker.push_bulk(mentions) do |mention|
-      options = { 'silenced' => true } if @options[:silenced_account_ids]&.include?(mention.account_id)
-
-      [mention.account_id, mention.id, 'Mention', 'mention', options].compact
-    end
-    # ...
-  end
-end
-```
+**重要发现：没有 `unfollow` 类型！**
 
 ---
 
@@ -503,6 +465,511 @@ end
 - `.local` 只选择本地账号
 - `.joins(:user)` 确保有用户记录
 - `.merge(User.signed_in_recently)` 只选择近期登录的用户 (性能优化)
+
+---
+
+## 远端账号"陈旧"判定与刷新触发机制
+
+### 核心阈值定义
+
+文件位置：`app/models/account.rb:76-78`
+
+```ruby
+BACKGROUND_REFRESH_INTERVAL = 1.week.freeze  # 7天 - 后台刷新间隔
+REFRESH_DEADLINE = 6.hours                     # 刷新延迟 0-6 小时
+STALE_THRESHOLD = 1.day                        # 1天 - 判定为"陈旧"的阈值
+```
+
+### 两个关键方法的区别
+
+#### 1. `possibly_stale?` - "可能陈旧"判定
+
+文件位置：`app/models/account.rb:264-266`
+
+```ruby
+def possibly_stale?
+  last_webfingered_at.nil? || last_webfingered_at <= STALE_THRESHOLD.ago
+end
+```
+
+**阈值：1天** (`STALE_THRESHOLD`)
+
+**判定条件：**
+- `last_webfingered_at` 为空（从未进行过 webfinger 查询）
+- 或 `last_webfingered_at` 超过 1 天前
+
+**用途：** 用于决定是否需要**完整刷新**账号信息
+
+---
+
+#### 2. `schedule_refresh_if_stale!` - 安排刷新任务
+
+文件位置：`app/models/account.rb:268-272`
+
+```ruby
+def schedule_refresh_if_stale!
+  return unless last_webfingered_at.present? && last_webfingered_at <= BACKGROUND_REFRESH_INTERVAL.ago
+
+  AccountRefreshWorker.perform_in(rand(REFRESH_DEADLINE), id)
+end
+```
+
+**阈值：1周** (`BACKGROUND_REFRESH_INTERVAL`)
+
+**触发条件：**
+- `last_webfingered_at` 存在
+- 且 `last_webfingered_at` 超过 1 周前
+
+**动作：** 安排 `AccountRefreshWorker` 在 0-6 小时随机延迟后执行
+
+---
+
+### 不同路径的触发场景
+
+#### 路径 1: 处理 ActivityPub 活动时
+
+**触发位置：**
+- `app/lib/activitypub/activity/create.rb:8`
+- `app/lib/activitypub/activity/update.rb:8`
+
+```ruby
+# app/lib/activitypub/activity/create.rb:7-13
+def perform
+  @account.schedule_refresh_if_stale!  # ← 检查并安排刷新
+
+  dereference_object!
+
+  create_status
+end
+```
+
+**触发条件：**
+- `last_webfingered_at <= 1.week.ago`
+
+**执行动作：**
+- 安排 `AccountRefreshWorker` 在 0-6 小时随机延迟后执行
+- **不会立即刷新**
+
+---
+
+#### 路径 2: 签名验证失败时
+
+**触发位置：** `app/controllers/concerns/signature_verification.rb:135-157`
+
+```ruby
+def keypair_refresh_key!(keypair)
+  return if keypair.actor.local? || !keypair.actor.activitypub?
+
+  actor = if keypair.actor.possibly_stale?  # ← 检查是否超过 1 天
+            # Doing a full profile refresh
+            keypair.actor.refresh!           # ← 完整刷新
+          else
+            # Only refreshing keys, skipping potentially more expensive requests
+            ActivityPub::FetchRemoteActorService.new.call(keypair.actor.uri, only_key: true, suppress_errors: false)
+          end
+  # ...
+end
+```
+
+**触发条件：**
+- HTTP 签名验证失败
+- 需要重新获取远端账号的公钥
+
+**分支逻辑：**
+| 条件 | 动作 |
+|------|------|
+| `possibly_stale?` 为 true (超过 1 天) | 调用 `refresh!` 进行**完整刷新** |
+| `possibly_stale?` 为 false (1 天内) | 只调用 `FetchRemoteActorService` 刷新**密钥** |
+
+---
+
+#### 路径 3: 定期后台刷新 (AccountRefreshWorker)
+
+**触发位置：** `app/workers/account_refresh_worker.rb`
+
+```ruby
+class AccountRefreshWorker
+  include Sidekiq::Worker
+
+  sidekiq_options queue: 'pull', retry: 3, dead: false, lock: :until_executed, lock_ttl: 1.day.to_i
+
+  def perform(account_id)
+    account = Account.find_by(id: account_id)
+    return if account.nil? || account.last_webfingered_at > Account::BACKGROUND_REFRESH_INTERVAL.ago
+
+    ResolveAccountService.new.call(account)  # ← 完整刷新
+  end
+end
+```
+
+**触发条件：**
+- 被 `schedule_refresh_if_stale!` 安排
+- 或被其他定时任务触发
+- 且 `last_webfingered_at > 1.week.ago` 时会跳过
+
+**执行动作：**
+- 调用 `ResolveAccountService` 进行完整刷新
+
+---
+
+### 刷新机制总结表
+
+| 触发路径 | 检查方法 | 阈值条件 | 刷新动作 | 立即/延迟 |
+|---------|---------|---------|---------|----------|
+| 处理 Create/Update 活动 | `schedule_refresh_if_stale!` | > 1 周 | 安排 `AccountRefreshWorker` | 延迟 0-6 小时 |
+| 签名验证失败 | `possibly_stale?` | > 1 天 | `refresh!` 完整刷新 | 立即执行 |
+| 签名验证失败 | `possibly_stale?` | ≤ 1 天 | 只刷新密钥 | 立即执行 |
+| AccountRefreshWorker | 直接检查 `last_webfingered_at` | > 1 周 | `ResolveAccountService` | 立即执行 |
+
+### 刷新触发流程图
+
+```
+                    远端账号活动到达
+                           ↓
+              ┌────────────────────────┐
+              │ 处理 Create/Update 等   │
+              │ ActivityPub 活动        │
+              └────────────────────────┘
+                           ↓
+              ┌────────────────────────┐
+              │ schedule_refresh_if_   │
+              │ stale!                  │
+              └────────────────────────┘
+                           ↓
+              last_webfingered_at > 1 周?
+                    /          \
+                  否            是
+                  /              \
+            (不操作)      安排 AccountRefreshWorker
+                                    ↓
+                            延迟 0-6 小时后执行
+                                    ↓
+                          ResolveAccountService
+                           (完整刷新账号)
+
+
+                    另一场景: 签名验证失败
+                           ↓
+              ┌────────────────────────┐
+              │ keypair_refresh_key!   │
+              └────────────────────────┘
+                           ↓
+              possibly_stale? (> 1 天?)
+                    /          \
+                  是            否
+                  /              \
+            refresh!         只刷新密钥
+         (完整刷新)      (FetchRemoteActorService)
+```
+
+---
+
+## 取关链路与通知分析
+
+### 核心发现：普通取关不产生通知
+
+从 `app/models/notification.rb` 的 `PROPERTIES` 定义可以看到，**没有 `unfollow` 通知类型**。
+
+### 取关流程 (UnfollowService)
+
+文件位置：`app/services/unfollow_service.rb`
+
+```ruby
+# app/services/unfollow_service.rb:8-21
+def call(follower, followee, options = {})
+  @follower = follower
+  @followee = followee
+  @options  = options
+
+  with_redis_lock("relationship:#{[follower.id, followee.id].sort.join(':')}") do
+    unfollow! || undo_follow_request!
+  end
+end
+```
+
+```ruby
+# app/services/unfollow_service.rb:25-49
+def unfollow!
+  follow = Follow.find_by(account: @follower, target_account: @followee)
+  return unless follow
+
+  list_ids = @follower.owned_lists.with_list_account(@followee).pluck(:list_id) unless @options[:skip_unmerge]
+
+  follow.destroy!
+
+  if @followee.local? && @follower.remote? && @follower.activitypub?
+    send_reject_follow(follow)
+  elsif @followee.remote? && @followee.activitypub?
+    send_undo_follow(follow)
+  end
+
+  unless @options[:skip_unmerge]
+    UnmergeWorker.perform_async(@followee.id, @follower.id, 'home')
+    UnmergeWorker.push_bulk(list_ids) do |list_id|
+      [@followee.id, list_id, 'list']
+    end
+  end
+
+  follow
+end
+```
+
+### 取关链路的四个分支
+
+#### 分支 A: 本地账号取关本地账号
+
+**条件：**
+- `@follower.local?` (关注者是本地)
+- `@followee.local?` (被关注者是本地)
+
+**执行流程：**
+1. 查找并销毁 `Follow` 记录
+2. 无 ActivityPub 活动发送（都是本地）
+3. 安排 `UnmergeWorker` 从时间线移除
+4. **不产生通知**
+
+**代码分支：**
+```ruby
+# 两个条件都不满足，走 else (无)
+if @followee.local? && @follower.remote? && @follower.activitypub?
+  send_reject_follow(follow)   # 不满足
+elsif @followee.remote? && @followee.activitypub?
+  send_undo_follow(follow)      # 不满足
+end
+# 结果：不发送任何 ActivityPub 活动
+```
+
+---
+
+#### 分支 B: 本地账号取关远端账号
+
+**条件：**
+- `@follower.local?` (关注者是本地)
+- `@followee.remote? && @followee.activitypub?` (被关注者是远端 ActivityPub 账号)
+
+**执行流程：**
+1. 查找并销毁 `Follow` 记录
+2. 发送 `Undo Follow` 活动到远端 inbox：
+   ```ruby
+   def send_undo_follow(follow)
+     ActivityPub::DeliveryWorker.perform_async(build_json(follow), follow.account_id, follow.target_account.inbox_url)
+   end
+   ```
+3. 安排 `UnmergeWorker` 从时间线移除
+4. **不产生本地通知**
+
+**日志/追踪：**
+- `ActivityPub::DeliveryWorker` 的执行被 Sidekiq 记录
+- 如果投递失败，会有重试机制
+- `DeliveryFailureTracker` 追踪失败的投递
+
+---
+
+#### 分支 C: 远端账号取关本地账号（通过 ActivityPub Undo Follow）
+
+**触发：** 本地实例收到远端发来的 `Undo Follow` 活动
+
+**处理位置：** `app/lib/activitypub/activity/undo.rb:89-101`
+
+```ruby
+def undo_follow
+  target_account = account_from_uri(target_uri)
+
+  return if target_account.nil? || !target_account.local?
+
+  if @account.following?(target_account)
+    @account.unfollow!(target_account)  # 调用 Account#unfollow!
+  elsif @account.requested?(target_account)
+    FollowRequest.find_by(account: @account, target_account: target_account)&.destroy
+  else
+    delete_later!(object_uri)
+  end
+end
+```
+
+**执行流程：**
+1. 解析目标账号 URI，确认是本地账号
+2. 如果远端账号正在关注本地：调用 `@account.unfollow!(target_account)`
+3. 如果是关注请求：销毁 `FollowRequest`
+4. **不产生通知**
+5. **不发送额外 ActivityPub 活动**（作为接收方）
+
+**Account#unfollow! 实现：**
+```ruby
+# app/models/concerns/account/interactions.rb:97-100
+def unfollow!(other_account)
+  follow = active_relationships.find_by(target_account: other_account)
+  follow&.destroy
+end
+```
+
+这只是销毁 `Follow` 记录，通过 `Follow` 模型的 `before_destroy`/`after_destroy` 回调触发后续清理。
+
+---
+
+#### 分支 D: 远端账号取关本地账号（本地视角 - 发送 Reject）
+
+**条件：**
+- `@followee.local?` (被关注者是本地)
+- `@follower.remote? && @follower.activitypub?` (关注者是远端 ActivityPub 账号)
+
+**代码位置：** `app/services/unfollow_service.rb:35-36`
+
+```ruby
+if @followee.local? && @follower.remote? && @follower.activitypub?
+  send_reject_follow(follow)
+```
+
+```ruby
+def send_reject_follow(follow)
+  ActivityPub::DeliveryWorker.perform_async(build_reject_json(follow), follow.target_account_id, follow.account.inbox_url)
+end
+```
+
+**场景说明：** 这是当本地系统处理"远端账号取关本地账号"时，**主动向远端发送 `Reject Follow` 活动**的情况。
+
+**执行流程：**
+1. 销毁 `Follow` 记录
+2. 安排 `UnmergeWorker` 从时间线移除
+3. 发送 `Reject Follow` 活动到远端 inbox
+4. **不产生本地通知**
+
+---
+
+### 远端处理 Undo Follow 的视角
+
+当远端实例收到本地发来的 `Undo Follow` 时，会执行类似的 `undo_follow` 逻辑。
+
+**关键点：** 远端实例也**不会产生通知**，因为 Notification 类型中没有 `unfollow`。
+
+---
+
+### 唯一会产生"关系切断"通知的场景
+
+只有 `severed_relationships` 类型通知，触发于**域名封禁**场景。
+
+#### 场景 A: 管理员域名封禁 (domain_block)
+
+**触发位置：** `app/services/block_domain_service.rb:52-64`
+
+```ruby
+def notify_of_severed_relationships!
+  return if @domain_block_event.nil?
+
+  @domain_block_event.affected_local_accounts.reorder(nil).find_in_batches do |accounts|
+    notification_jobs_args = accounts.map do |account|
+      event = AccountRelationshipSeveranceEvent.create!(account:, relationship_severance_event: @domain_block_event)
+      [account.id, event.id, 'AccountRelationshipSeveranceEvent', 'severed_relationships']
+    end
+
+    LocalNotificationWorker.perform_bulk(notification_jobs_args)
+  end
+end
+```
+
+**触发条件：**
+- 管理员执行域名封禁 (`DomainBlock`)
+- 封禁类型为 `suspend` 或涉及大量关注关系切断
+
+**通知内容：**
+- 类型：`severed_relationships`
+- 关联：`AccountRelationshipSeveranceEvent`
+- 包含被切断的关系数量统计
+
+---
+
+#### 场景 B: 用户自行域名封禁 (user_domain_block)
+
+**触发位置：** `app/services/after_block_domain_from_account_service.rb:60-65`
+
+```ruby
+def notify_of_severed_relationships!
+  return if @domain_block_event.nil?
+
+  event = AccountRelationshipSeveranceEvent.create!(account: @account, relationship_severance_event: @domain_block_event)
+  LocalNotificationWorker.perform_async(@account.id, event.id, 'AccountRelationshipSeveranceEvent', 'severed_relationships')
+end
+```
+
+**触发条件：**
+- 用户自行封禁某个域名
+- 导致该域名下的所有关注/被关注关系被切断
+
+**通知接收者：** 只通知执行封禁操作的用户
+
+---
+
+### 取关链路完整总结表
+
+| 场景 | Follow 记录 | 时间线清理 | ActivityPub 活动 | 本地通知 | 日志/追踪 |
+|------|------------|-----------|-----------------|---------|-----------|
+| **本地→本地 取关** | ✅ 销毁 | ✅ UnmergeWorker | ❌ 无 | ❌ 无 | Rails destroy 回调 |
+| **本地→远端 取关** | ✅ 销毁 | ✅ UnmergeWorker | ✅ Undo Follow | ❌ 无 | Sidekiq + DeliveryFailureTracker |
+| **远端→本地 取关 (接收 Undo)** | ✅ 销毁 | ✅ (通过 unfollow! 回调) | ❌ 无（接收方） | ❌ 无 | ActivityPub 入站日志 |
+| **远端→本地 取关 (发送 Reject)** | ✅ 销毁 | ✅ UnmergeWorker | ✅ Reject Follow | ❌ 无 | Sidekiq + DeliveryFailureTracker |
+| **管理员域名封禁** | ✅ 批量销毁 | ✅ 批量清理 | ❌ 无 | ✅ severed_relationships | 管理日志 + 通知 |
+| **用户域名封禁** | ✅ 批量销毁 | ✅ 批量清理 | ❌ 无 | ✅ severed_relationships | 通知 |
+
+### 取关流程图
+
+```
+                    用户触发取关操作
+                           ↓
+              ┌────────────────────────┐
+              │    UnfollowService     │
+              │  with_redis_lock 保护   │
+              └────────────────────────┘
+                           ↓
+                    查找 Follow 记录
+                           ↓
+              ┌────────────────────────┐
+              │     follow.destroy!     │
+              │  触发 after_destroy 回调 │
+              │  - 缓存计数器递减       │
+              │  - 缓存失效             │
+              └────────────────────────┘
+                           ↓
+              判断关注者/被关注者类型
+                           ↓
+         ┌─────────────────┼─────────────────┐
+         ↓                 ↓                 ↓
+   本地→本地         本地→远端         远端→本地
+         ↓                 ↓                 ↓
+   无 ActivityPub   发送 Undo Follow    发送 Reject Follow
+   活动            到远端 inbox         到远端 inbox
+         ↓                 ↓                 ↓
+   仅销毁 Follow    同时销毁 Follow      同时销毁 Follow
+   记录             记录                  记录
+         ↓                 ↓                 ↓
+   ┌─────────────────────────────────────────────┐
+   │      所有分支都执行:                          │
+   │      UnmergeWorker.perform_async            │
+   │      - 从 home timeline 移除状态             │
+   │      - 从 list timelines 移除状态            │
+   │                                               │
+   │      ❌ 所有分支都不产生通知                  │
+   │         (Notification 无 unfollow 类型)      │
+   └─────────────────────────────────────────────┘
+
+
+           唯一产生通知的例外场景: 域名封禁
+                           ↓
+              ┌────────────────────────┐
+              │   管理员/用户封禁域名   │
+              └────────────────────────┘
+                           ↓
+              ┌────────────────────────┐
+              │  RelationshipSeverance │
+              │      Event 创建        │
+              └────────────────────────┘
+                           ↓
+              ┌────────────────────────┐
+              │ LocalNotificationWorker │
+              │   'severed_relationships'│
+              └────────────────────────┘
+                           ↓
+                    ✅ 产生通知
+```
 
 ---
 
@@ -726,61 +1193,7 @@ end
 
 ### 1. 账号刷新机制
 
-#### AccountRefreshWorker
-
-文件位置：`app/workers/account_refresh_worker.rb`
-
-```ruby
-# app/workers/account_refresh_worker.rb:3-14
-class AccountRefreshWorker
-  include Sidekiq::Worker
-
-  sidekiq_options queue: 'pull', retry: 3, dead: false, lock: :until_executed, lock_ttl: 1.day.to_i
-
-  def perform(account_id)
-    account = Account.find_by(id: account_id)
-    return if account.nil? || account.last_webfingered_at > Account::BACKGROUND_REFRESH_INTERVAL.ago
-
-    ResolveAccountService.new.call(account)
-  end
-end
-```
-
-#### ResolveAccountService
-
-文件位置：`app/services/resolve_account_service.rb`
-
-```ruby
-# app/services/resolve_account_service.rb:115-120
-def webfinger_update_due?
-  return false if @options[:check_delivery_availability] && !DeliveryFailureTracker.available?(@domain)
-  return false if @options[:skip_webfinger]
-
-  @options[:skip_cache] || @account.nil? || @account.possibly_stale?
-end
-```
-
-#### possibly_stale? 方法
-
-```ruby
-# app/models/account.rb (推测位置)
-def possibly_stale?
-  last_webfingered_at.nil? || last_webfingered_at < 3.days.ago
-end
-```
-
-#### 活动处理时的刷新
-
-```ruby
-# app/lib/activitypub/activity/create.rb:7-13
-def perform
-  @account.schedule_refresh_if_stale!
-
-  dereference_object!
-
-  create_status
-end
-```
+详见前文 **[远端账号"陈旧"判定与刷新触发机制](#远端账号陈旧判定与刷新触发机制)** 章节。
 
 ### 2. 关注者同步机制
 
@@ -949,7 +1362,7 @@ end
 ```ruby
 # app/services/resolve_account_service.rb:107-113
 def fetch_account!
-  with_redis_lock("resolve:#{@username}@#{@domain}") do
+  with_redis_lock("resolve:#{@username}@#{domain}") do
     @account = ActivityPub::FetchRemoteAccountService.new.call(actor_url, suppress_errors: @options[:suppress_errors])
   end
 
@@ -987,8 +1400,9 @@ end
 
 | 策略 | 实现方式 | 用途 |
 |------|---------|------|
-| **定期刷新** | `AccountRefreshWorker` + `possibly_stale?` | 远端账号信息定期更新 |
-| **主动刷新** | `schedule_refresh_if_stale!` | 处理活动时检查并刷新 |
+| **定期刷新** | `AccountRefreshWorker` + 1 周阈值 | 远端账号信息定期更新 |
+| **主动刷新** | `schedule_refresh_if_stale!` + 1 周阈值 | 处理活动时检查并安排刷新 |
+| **签名验证失败时刷新** | `possibly_stale?` + 1 天阈值 | 超过 1 天则完整刷新，否则只刷新密钥 |
 | **关注者同步** | `SynchronizeFollowersService` + 哈希比对 | 检测并修复不一致的关注关系 |
 | **幂等处理** | `find_existing_status` + URI 检查 | 防止重复创建状态 |
 | **Tombstone** | `Tombstone` 模型 | 标记已删除资源 |
@@ -1019,6 +1433,17 @@ end
 - `app/services/notify_service.rb` - 通知服务核心
 - `app/workers/local_notification_worker.rb` - 本地通知 Worker
 - `app/models/notification.rb` - 通知模型
+- `app/models/relationship_severance_event.rb` - 关系切断事件
+- `app/services/block_domain_service.rb` - 域名封禁服务 (产生 severed_relationships 通知)
+- `app/services/after_block_domain_from_account_service.rb` - 用户域名封禁后处理
+
+### 账号刷新相关
+- `app/models/account.rb:76-78` - 阈值常量定义
+- `app/models/account.rb:264-266` - `possibly_stale?` 方法
+- `app/models/account.rb:268-272` - `schedule_refresh_if_stale!` 方法
+- `app/workers/account_refresh_worker.rb` - 账号刷新 Worker
+- `app/services/resolve_account_service.rb` - 解析账号服务
+- `app/controllers/concerns/signature_verification.rb` - 签名验证 (密钥刷新触发)
 
 ### 静音/屏蔽相关
 - `app/services/mute_service.rb` - 静音服务
@@ -1031,10 +1456,10 @@ end
 
 ### ActivityPub 联邦相关
 - `app/lib/activitypub/activity/follow.rb` - 处理 Follow 活动
+- `app/lib/activitypub/activity/undo.rb` - 处理 Undo 活动 (包含 Undo Follow)
 - `app/lib/activitypub/activity/create.rb` - 处理 Create 活动
+- `app/lib/activitypub/activity/update.rb` - 处理 Update 活动
 - `app/workers/activitypub/delivery_worker.rb` - ActivityPub 投递
 - `app/workers/activitypub/distribution_worker.rb` - 状态分发
-- `app/workers/account_refresh_worker.rb` - 账号刷新
-- `app/services/resolve_account_service.rb` - 解析账号
 - `app/services/activitypub/process_account_service.rb` - 处理远端账号信息
 - `app/services/activitypub/synchronize_followers_service.rb` - 关注者同步
