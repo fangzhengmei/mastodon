@@ -742,113 +742,309 @@ end
 
 ---
 
-#### 6.2.3 路径三：媒体权限/状态属性切换（权限切换）
+#### 6.2.3 路径三：媒体 ACL 变更 (UpdateMediaAttachmentsPermissionsService)
 
-**重要说明**：根据代码分析和前端文案 `"Visibility can't be changed after a post is published"`，**状态的可见性（public/unlisted/private/direct/limited）在发布后是不能改变的**。
+**重要说明**：这是**真正的媒体访问权限控制变更链路**，通过修改 S3/文件系统的 ACL 来控制媒体文件的可访问性。
 
-"媒体权限切换"实际上指的是以下场景：
+**核心概念**：
+- **ACL (Access Control List)**: 访问控制列表，用于控制 S3 对象或文件系统文件的访问权限
+- **Private**: 私有访问，仅授权用户可访问
+- **Public**: 公开访问，任何人可访问
 
-| 场景类型 | 触发条件 | 影响的权限 |
-|----------|----------|-----------|
-| 媒体描述更新 | `description` 变化 | 无障碍访问权限 |
-| 媒体焦点更新 | `focus` 变化 | 裁剪/显示权限 |
-| 状态敏感标记 | `sensitive` 变化 | 媒体显示权限（是否需要点击展开） |
-| 引用批准策略 | `quote_approval_policy` 变化 | 引用权限 |
-| 引用状态变更 | `Quote.state` 变化 | 引用显示权限 |
-| 投票结果更新 | `Poll` 变化 | 投票显示权限 |
+---
 
-**核心触发服务**：
+##### 入口一：封禁账号 (SuspendAccount)
 
-1. **本地状态更新**: `UpdateStatusService` (`app/services/update_status_service.rb`)
-2. **联邦状态更新**: `ActivityPub::ProcessStatusUpdateService` (`app/services/activitypub/process_status_update_service.rb`)
+**触发场景**：管理员封禁违规账号
 
-**完整调用链 - 本地状态更新**：
-
-```
-1. UpdateStatusService.call(status, account_id, options)
-   │
-   ▼
-2. Status.transaction 内执行
-   ├── update_media_attachments! (如有 media_ids)
-   │   ├── 媒体附件属性更新 (thumbnail, description, focus)
-   │   └── @media_attachments_changed ||= media.significantly_changed?
-   ├── update_poll! (如有 poll)
-   └── update_immediate_attributes!
-       ├── text, spoiler_text, sensitive, language
-       └── quote_approval_policy
-   │
-   ▼
-3. 事务外执行
-   ├── queue_poll_notifications!
-   ├── reset_preview_card!
-   ├── update_metadata! (hashtags, mentions, links)
-   └── broadcast_updates!
-       │
-       ▼
-4. broadcast_updates!
-   ├── DistributionWorker.perform_async(@status.id, { 'update' => true })
-   └── ActivityPub::StatusUpdateDistributionWorker.perform_async(@status.id)
-       │
-       ▼
-5. DistributionWorker#perform
-   └── FanOutOnWriteService.new.call(status, update: true)
-       │
-       ▼
-6. FanOutOnWriteService#call
-   ├── check_race_condition!
-   ├── warm_payload_cache!  ← 关键：更新时间线缓存
-   │   └── Rails.cache.write("fan-out/#{@status.id}", rendered_status)
-   ├── fan_out_to_local_recipients!
-   │   ├── deliver_to_self!
-   │   ├── notify_quoted_account!
-   │   ├── notify_mentioned_accounts!
-   │   ├── notify_about_update! (if update?)
-   │   └── 根据 visibility 分发到不同时间线
-   ├── fan_out_to_public_recipients! (如果可广播)
-   └── fan_out_to_public_streams! (如果可广播)
-```
-
-**引用状态变更的缓存失效**（`app/models/quote.rb`）：
+**触发点定义**（`app/services/suspend_account_service.rb`）：
 
 ```ruby
-def accept!(approval_uri: nil)
-  if approval_uri.present?
-    update!(state: :accepted, approval_uri:)
-  else
-    update!(state: :accepted)
-  end
+def call(account)
+  return unless account.suspended?
 
-  reset_parent_cache! if attribute_previously_changed?(:state)
+  @account = account
+
+  reject_remote_follows!
+  distribute_update_actor!
+  unmerge_from_home_timelines!
+  unmerge_from_list_timelines!
+  privatize_media_attachments!  ← 关键：私有化所有媒体
+  remove_from_trends!
 end
 
 private
 
-def reset_parent_cache!
-  return if status_id.nil?
-
-  Rails.cache.delete("v3:statuses/#{status_id}")
-  
-  # 额外清除 ActivityPub 表示的 Web 缓存
-  Rails.cache.delete("statuses/show:v3:statuses/#{status_id}")
+def privatize_media_attachments!
+  UpdateMediaAttachmentsPermissionsService.new.call(@account.media_attachments, :private)
 end
 ```
 
-**投票更新的缓存失效**（`app/models/poll.rb`）：
+**完整调用链**：
+
+```
+1. 管理员封禁账号
+   │
+   ▼
+2. Admin::SuspensionWorker#perform(account_id)
+   └── SuspendAccountService.new.call(Account.find(account_id))
+       │
+       ▼
+3. SuspendAccountService#call
+   ├── reject_remote_follows!
+   ├── distribute_update_actor!
+   ├── unmerge_from_home_timelines!
+   ├── unmerge_from_list_timelines!
+   ├── privatize_media_attachments! ← 关键调用
+   │   └── UpdateMediaAttachmentsPermissionsService.new.call(
+   │           @account.media_attachments,  # 账号下所有媒体
+   │           :private                      # 设为私有
+   │       )
+   └── remove_from_trends!
+       │
+       ▼
+4. UpdateMediaAttachmentsPermissionsService#call (见下文详细流程)
+```
+
+---
+
+##### 入口二：解封账号 (UnsuspendAccount)
+
+**触发场景**：管理员解封已封禁的账号
+
+**触发点定义**（`app/services/unsuspend_account_service.rb`）：
 
 ```ruby
-after_commit :reset_parent_cache, on: :update
+def call(account)
+  @account = account
 
-def reset_parent_cache
-  return if status_id.nil?
-  Rails.cache.delete("v3:statuses/#{status_id}")
+  refresh_remote_account!
+
+  return if @account.nil? || @account.suspended?
+
+  merge_into_home_timelines!
+  merge_into_list_timelines!
+  publish_media_attachments!  ← 关键：公开化所有媒体
+  distribute_update_actor!
 end
+
+private
+
+def publish_media_attachments!
+  UpdateMediaAttachmentsPermissionsService.new.call(@account.media_attachments, :public)
+end
+```
+
+**完整调用链**：
+
+```
+1. 管理员解封账号
+   │
+   ▼
+2. Admin::UnsuspensionWorker#perform(account_id)
+   └── UnsuspendAccountService.new.call(Account.find(account_id))
+       │
+       ▼
+3. UnsuspendAccountService#call
+   ├── refresh_remote_account!
+   ├── merge_into_home_timelines!
+   ├── merge_into_list_timelines!
+   ├── publish_media_attachments! ← 关键调用
+   │   └── UpdateMediaAttachmentsPermissionsService.new.call(
+   │           @account.media_attachments,  # 账号下所有媒体
+   │           :public                       # 设为公开
+   │       )
+   └── distribute_update_actor!
+       │
+       ▼
+4. UpdateMediaAttachmentsPermissionsService#call (见下文详细流程)
+```
+
+---
+
+##### 入口三：删除状态 (RemoveStatus - 非永久删除)
+
+**触发场景**：用户/管理员删除状态，但满足以下条件时**不永久删除**：
+- `preserve: true` (保留模式)
+- `status.reported?` (状态被举报，保留证据)
+
+**触发点定义**（`app/services/remove_status_service.rb`）：
+
+```ruby
+def remove_media
+  return if @options[:redraft]
+
+  if permanently?
+    @status.media_attachments.destroy_all  # 永久删除 → 触发路径一
+  else
+    UpdateMediaAttachmentsPermissionsService.new.call(@status.media_attachments, :private)  # 软删除 → 私有化
+  end
+end
+
+def permanently?
+  @options[:immediate] || !(@options[:preserve] || @status.reported?)
+end
+```
+
+**完整调用链**：
+
+```
+1. 用户/管理员删除状态
+   │
+   ▼
+2. RemovalWorker#perform(status_id, options)
+   └── RemoveStatusService.new.call(Status.with_discarded.find(status_id), **options.symbolize_keys)
+       │
+       ▼
+3. RemoveStatusService#call (with_redis_lock)
+   ├── @status.discard_with_reblogs
+   ├── StatusPin.find_by(status: @status)&.destroy
+   ├── remove_from_self
+   ├── remove_from_followers
+   ├── remove_from_lists
+   ├── remove_from_remote_reach
+   ├── remove_from_mentions
+   ├── remove_reblogs
+   ├── remove_from_hashtags
+   ├── remove_from_public
+   ├── remove_from_media (if @status.with_media?)
+   ├── remove_media ← 关键调用
+   │   │
+   │   ▼
+   │   └── if permanently?
+   │           # 永久删除 → 触发路径一
+   │           @status.media_attachments.destroy_all
+   │       else
+   │           # 软删除 → 私有化媒体
+   │           UpdateMediaAttachmentsPermissionsService.new.call(
+   │               @status.media_attachments,  # 状态下所有媒体
+   │               :private                      # 设为私有
+   │           )
+   │       end
+   ├── RevokeQuoteService (if @status.quote)
+   └── @status.destroy! (if permanently?)
+       │
+       ▼
+4. UpdateMediaAttachmentsPermissionsService#call (仅软删除路径)
+```
+
+---
+
+##### 核心服务：UpdateMediaAttachmentsPermissionsService
+
+**文件**: `app/services/update_media_attachments_permissions_service.rb`
+
+**前置条件检查**：
+
+```ruby
+def call(media_attachments_scope, direction)
+  # 仅支持 S3 和 filesystem 存储系统
+  return unless %i(s3 filesystem).include?(Paperclip::Attachment.default_options[:storage])
+
+  # 如果禁用 S3 ACL，跳过
+  return if Paperclip::Attachment.default_options[:storage] == :s3 && ENV['S3_PERMISSION'] == ''
+
+  # ... 核心逻辑
+end
+```
+
+**ACL 变更逻辑**：
+
+```ruby
+media_attachments_scope.find_each do |media_attachment|
+  attachment_names.each do |attachment_name|  # file, thumbnail
+    attachment = media_attachment.public_send(attachment_name)
+    styles = MediaAttachment::DEFAULT_STYLES | attachment.styles.keys  # original, small
+
+    next if attachment.blank?
+
+    styles.each do |style|
+      case Paperclip::Attachment.default_options[:storage]
+      when :s3
+        # S3 ACL 设置
+        acl = direction == :public ? Paperclip::Attachment.default_options[:s3_permissions] : 'private'
+
+        begin
+          attachment.s3_object(style).acl.put(acl: acl)
+        rescue Aws::S3::Errors::NoSuchKey
+          Rails.logger.warn "Tried to change acl on non-existent key #{attachment.s3_object(style).key}"
+        rescue Aws::S3::Errors::NotImplemented => e
+          Rails.logger.error "Error trying to change ACL on #{attachment.s3_object(style).key}: #{e.message}"
+        end
+
+      when :filesystem
+        # 文件系统权限设置
+        mask = direction == :public ? 0o666 : 0o600
+
+        begin
+          FileUtils.chmod(mask & ~File.umask, attachment.path(style)) unless attachment.path(style).nil?
+        rescue Errno::ENOENT
+          Rails.logger.warn "Tried to change permission on non-existent file #{attachment.path(style)}"
+        end
+      end
+
+      # 关键：触发 CDN 缓存失效！
+      CacheBusterWorker.perform_async(attachment.url(style)) if Rails.configuration.x.cache_buster.enabled
+    end
+  end
+end
+```
+
+**完整调用链 - 核心流程**：
+
+```
+1. UpdateMediaAttachmentsPermissionsService#call(media_scope, direction)
+   │
+   ▼
+2. 前置条件检查
+   ├── 存储类型必须是 :s3 或 :filesystem
+   └── S3 存储时 S3_PERMISSION 不能为空
+   │
+   ▼
+3. 遍历媒体附件 (media_attachments_scope.find_each)
+   │
+   ▼
+4. 遍历附件名 (file, thumbnail)
+   │
+   ▼
+5. 遍历样式 (original, small)
+   │
+   ▼
+6. 根据存储类型修改 ACL
+   │
+   ├── S3 存储:
+   │   └── attachment.s3_object(style).acl.put(acl: acl)
+   │       ├── :public → 配置的 s3_permissions (如 'public-read')
+   │       └── :private → 'private'
+   │
+   └── Filesystem 存储:
+       └── FileUtils.chmod(mask, attachment.path(style))
+           ├── :public → 0o666 (读写权限)
+           └── :private → 0o600 (仅所有者可读)
+   │
+   ▼
+7. 触发 CDN 缓存失效
+   └── CacheBusterWorker.perform_async(attachment.url(style))
+       │
+       ▼
+8. CacheBusterWorker#perform
+   └── CacheBuster#bust(full_asset_url(path))
+       │
+       ▼
+9. CacheBuster#bust
+   ├── 解析 URL 获取目标站点
+   ├── RequestPool 复用 HTTP 连接
+   ├── 构建请求 (可配置 HTTP 方法和认证头)
+   └── 发送请求通知 CDN/缓存服务器失效
 ```
 
 **影响的缓存**：
-- ❌ CDN 缓存（不触发，除非媒体文件本身变化）
-- ✅ 状态序列化缓存 (`v3:statuses/#{status_id}`) - 通过关联模型回调
-- ✅ 时间线分发缓存 (`fan-out/#{status_id}`) - 通过 `warm_payload_cache!` **更新**
-- ✅ ActivityPub 缓存 (`statuses/show:v3:statuses/#{status_id}`) - 仅 Quote 变更时
+- ✅ **CDN 缓存**（媒体文件 URL）- 直接触发 `CacheBusterWorker`
+- ❌ 状态序列化缓存 (`v3:statuses/#{status_id}`) - 不触发
+- ❌ 时间线分发缓存 (`fan-out/#{status_id}`) - 不触发
+- ❌ ActivityPub 缓存 - 不触发
+
+**注意**：此路径**仅修改媒体文件的访问权限并失效 CDN 缓存**，不影响应用层缓存。
 
 ### 6.2 缓存键预收集
 
@@ -1053,18 +1249,20 @@ config.x.cache_buster = config_for(:cache_buster)
 │                           缓存失效处理流程                                     │
 └─────────────────────────────────────────────────────────────────────────────┘
 
-场景 A: 媒体删除
+═══════════════════════════════════════════════════════════════════════════════
+场景 A: 路径一 - 媒体删除
+═══════════════════════════════════════════════════════════════════════════════
 
 1. before_destroy :prepare_cache_bust!
-   ├── 检查 cache_buster.enabled
+   ├── 检查 cache_buster.enabled 配置
    ├── 遍历所有附件 (file, thumbnail)
    ├── 收集所有样式的 URL
    │   ├── DEFAULT_STYLES = [:original]
    │   └── 合并 attachment.styles.keys
-   └── 保存到 @paths_to_cache_bust
+   └── 保存到 @paths_to_cache_bust 实例变量
    │
    ▼
-2. Paperclip 删除文件
+2. Paperclip 删除实际文件
    │
    ▼
 3. after_destroy :bust_cache!
@@ -1076,15 +1274,61 @@ config.x.cache_buster = config_for(:cache_buster)
        │
        ▼
 5. CacheBuster#bust
-   ├── 解析 URL 获取 site
-   ├── RequestPool 复用连接
+   ├── 解析 URL 获取目标站点
+   ├── RequestPool 复用 HTTP 连接
    ├── 构建请求 (可配置 HTTP 方法和认证头)
-   └── 发送请求通知 CDN/缓存服务器
+   └── 发送请求通知 CDN/缓存服务器失效
 
-场景 B: 媒体更新
+═══════════════════════════════════════════════════════════════════════════════
+场景 B: 路径二 - 媒体更新
+═══════════════════════════════════════════════════════════════════════════════
 
-1. after_commit :reset_parent_cache, on: :update
+1. MediaAttachment.update!(attributes)
+   │
+   ▼
+2. ActiveRecord 回调链执行
+   │
+   ▼
+3. after_commit :reset_parent_cache, on: :update
    └── Rails.cache.delete("v3:statuses/#{status_id}")
+
+═══════════════════════════════════════════════════════════════════════════════
+场景 C: 路径三 - 权限/属性切换
+═══════════════════════════════════════════════════════════════════════════════
+
+1. UpdateStatusService.call(status, account_id, options)
+   │
+   ▼
+2. Status.transaction 内执行
+   ├── 媒体附件属性更新 (description, thumbnail, focus)
+   ├── 状态属性更新 (sensitive, quote_approval_policy)
+   └── 投票/引用状态变更
+   │
+   ▼
+3. 各关联模型回调触发
+   ├── MediaAttachment#reset_parent_cache (如果媒体变更)
+   │   └── Rails.cache.delete("v3:statuses/#{status_id}")
+   ├── Poll#reset_parent_cache (如果投票变更)
+   │   └── Rails.cache.delete("v3:statuses/#{status_id}")
+   └── Quote#reset_parent_cache! (如果引用状态变更)
+       ├── Rails.cache.delete("v3:statuses/#{status_id}")
+       └── Rails.cache.delete("statuses/show:v3:statuses/#{status_id}")
+   │
+   ▼
+4. broadcast_updates! (事务外)
+   ├── DistributionWorker.perform_async(status.id, { 'update' => true })
+   └── ActivityPub::StatusUpdateDistributionWorker.perform_async(status.id)
+       │
+       ▼
+5. DistributionWorker#perform
+   └── FanOutOnWriteService.new.call(status, update: true)
+       │
+       ▼
+6. FanOutOnWriteService#call
+   ├── warm_payload_cache!  ← 关键：更新而非失效
+   │   └── Rails.cache.write("fan-out/#{status.id}", rendered_status)
+   ├── fan_out_to_local_recipients! (推送到本地时间线)
+   └── fan_out_to_public_streams! (如果可广播)
 ```
 
 ## 8. 关键数据结构
