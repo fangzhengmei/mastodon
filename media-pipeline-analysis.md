@@ -632,18 +632,72 @@ scope :without_local_interaction, lambda {
 
 ## 6. 缓存失效处理策略
 
-### 6.1 缓存失效触发点
+### 6.1 缓存类型与层级
 
-#### 6.1.1 媒体删除时的缓存失效
+Mastodon 存在多层缓存系统，不同触发点影响不同层级的缓存：
 
-在 `MediaAttachment` 模型中定义：
+| 缓存类型 | 缓存键格式 | 用途 | 影响范围 |
+|----------|-----------|------|----------|
+| CDN 缓存 | 媒体 URL (如 `/system/media_attachments/...`) | 媒体文件的边缘缓存 | 全球 CDN 节点 |
+| 状态序列化缓存 | `v3:statuses/#{status_id}` | API 响应的序列化状态 | 单条状态 |
+| 时间线分发缓存 | `fan-out/#{status_id}` | 实时推送的渲染 payload | 单条状态 |
+| ActivityPub 缓存 | `statuses/show:v3:statuses/#{status_id}` | ActivityPub 表示的 Web 缓存 | 单条状态 |
+
+### 6.2 缓存失效触发点 - 三条路径对比
+
+#### 6.2.1 路径一：媒体删除 (MediaAttachment#destroy)
+
+**触发场景**：媒体附件被删除（如状态删除、媒体移除）
+
+**触发点定义**（`app/models/media_attachment.rb`）：
 
 ```ruby
 before_destroy :prepare_cache_bust!, prepend: true
 after_destroy :bust_cache!
 ```
 
-#### 6.1.2 媒体更新时的父缓存重置
+**完整调用链**：
+
+```
+1. MediaAttachment.destroy
+   │
+   ▼
+2. before_destroy :prepare_cache_bust!
+   ├── 检查 cache_buster.enabled 配置
+   ├── 遍历所有附件 (file, thumbnail)
+   ├── 收集所有样式的 URL (original, small 等)
+   └── 保存到 @paths_to_cache_bust 实例变量
+   │
+   ▼
+3. Paperclip 删除实际文件
+   │
+   ▼
+4. after_destroy :bust_cache!
+   └── CacheBusterWorker.push_bulk(@paths_to_cache_bust)
+       │
+       ▼
+5. CacheBusterWorker#perform
+   └── CacheBuster#bust(full_asset_url(path))
+       │
+       ▼
+6. CacheBuster#bust
+   ├── 解析 URL 获取目标站点
+   ├── RequestPool 复用 HTTP 连接
+   ├── 构建请求 (可配置 HTTP 方法和认证头)
+   └── 发送请求通知 CDN/缓存服务器失效
+```
+
+**影响的缓存**：
+- ✅ CDN 缓存（媒体文件 URL）
+- ✅ 状态序列化缓存 (`v3:statuses/#{status_id}`) - 通过 `dependent: nullify` 关联
+
+---
+
+#### 6.2.2 路径二：媒体更新 (MediaAttachment#update)
+
+**触发场景**：媒体附件属性被修改（如描述、缩略图、元数据更新）
+
+**触发点定义**（`app/models/media_attachment.rb`）：
 
 ```ruby
 after_commit :reset_parent_cache, on: :update
@@ -652,6 +706,149 @@ def reset_parent_cache
   Rails.cache.delete("v3:statuses/#{status_id}") if status_id.present?
 end
 ```
+
+**显著变化判断**：
+
+```ruby
+def significantly_changed?
+  description_previously_changed? || 
+  thumbnail_updated_at_previously_changed? || 
+  file_meta_previously_changed?
+end
+```
+
+**触发条件**：
+- `description` 变化
+- `thumbnail_updated_at` 变化（缩略图更新）
+- `file_meta` 变化（文件元数据，如尺寸、焦点等）
+
+**完整调用链**：
+
+```
+1. MediaAttachment.update!(attributes)
+   │
+   ▼
+2. ActiveRecord 回调链执行
+   │
+   ▼
+3. after_commit :reset_parent_cache, on: :update
+   └── Rails.cache.delete("v3:statuses/#{status_id}")
+```
+
+**影响的缓存**：
+- ❌ CDN 缓存（不触发）
+- ✅ 状态序列化缓存 (`v3:statuses/#{status_id}`)
+- ❌ 时间线分发缓存 (`fan-out/#{status_id}`) - 不主动更新
+
+---
+
+#### 6.2.3 路径三：媒体权限/状态属性切换（权限切换）
+
+**重要说明**：根据代码分析和前端文案 `"Visibility can't be changed after a post is published"`，**状态的可见性（public/unlisted/private/direct/limited）在发布后是不能改变的**。
+
+"媒体权限切换"实际上指的是以下场景：
+
+| 场景类型 | 触发条件 | 影响的权限 |
+|----------|----------|-----------|
+| 媒体描述更新 | `description` 变化 | 无障碍访问权限 |
+| 媒体焦点更新 | `focus` 变化 | 裁剪/显示权限 |
+| 状态敏感标记 | `sensitive` 变化 | 媒体显示权限（是否需要点击展开） |
+| 引用批准策略 | `quote_approval_policy` 变化 | 引用权限 |
+| 引用状态变更 | `Quote.state` 变化 | 引用显示权限 |
+| 投票结果更新 | `Poll` 变化 | 投票显示权限 |
+
+**核心触发服务**：
+
+1. **本地状态更新**: `UpdateStatusService` (`app/services/update_status_service.rb`)
+2. **联邦状态更新**: `ActivityPub::ProcessStatusUpdateService` (`app/services/activitypub/process_status_update_service.rb`)
+
+**完整调用链 - 本地状态更新**：
+
+```
+1. UpdateStatusService.call(status, account_id, options)
+   │
+   ▼
+2. Status.transaction 内执行
+   ├── update_media_attachments! (如有 media_ids)
+   │   ├── 媒体附件属性更新 (thumbnail, description, focus)
+   │   └── @media_attachments_changed ||= media.significantly_changed?
+   ├── update_poll! (如有 poll)
+   └── update_immediate_attributes!
+       ├── text, spoiler_text, sensitive, language
+       └── quote_approval_policy
+   │
+   ▼
+3. 事务外执行
+   ├── queue_poll_notifications!
+   ├── reset_preview_card!
+   ├── update_metadata! (hashtags, mentions, links)
+   └── broadcast_updates!
+       │
+       ▼
+4. broadcast_updates!
+   ├── DistributionWorker.perform_async(@status.id, { 'update' => true })
+   └── ActivityPub::StatusUpdateDistributionWorker.perform_async(@status.id)
+       │
+       ▼
+5. DistributionWorker#perform
+   └── FanOutOnWriteService.new.call(status, update: true)
+       │
+       ▼
+6. FanOutOnWriteService#call
+   ├── check_race_condition!
+   ├── warm_payload_cache!  ← 关键：更新时间线缓存
+   │   └── Rails.cache.write("fan-out/#{@status.id}", rendered_status)
+   ├── fan_out_to_local_recipients!
+   │   ├── deliver_to_self!
+   │   ├── notify_quoted_account!
+   │   ├── notify_mentioned_accounts!
+   │   ├── notify_about_update! (if update?)
+   │   └── 根据 visibility 分发到不同时间线
+   ├── fan_out_to_public_recipients! (如果可广播)
+   └── fan_out_to_public_streams! (如果可广播)
+```
+
+**引用状态变更的缓存失效**（`app/models/quote.rb`）：
+
+```ruby
+def accept!(approval_uri: nil)
+  if approval_uri.present?
+    update!(state: :accepted, approval_uri:)
+  else
+    update!(state: :accepted)
+  end
+
+  reset_parent_cache! if attribute_previously_changed?(:state)
+end
+
+private
+
+def reset_parent_cache!
+  return if status_id.nil?
+
+  Rails.cache.delete("v3:statuses/#{status_id}")
+  
+  # 额外清除 ActivityPub 表示的 Web 缓存
+  Rails.cache.delete("statuses/show:v3:statuses/#{status_id}")
+end
+```
+
+**投票更新的缓存失效**（`app/models/poll.rb`）：
+
+```ruby
+after_commit :reset_parent_cache, on: :update
+
+def reset_parent_cache
+  return if status_id.nil?
+  Rails.cache.delete("v3:statuses/#{status_id}")
+end
+```
+
+**影响的缓存**：
+- ❌ CDN 缓存（不触发，除非媒体文件本身变化）
+- ✅ 状态序列化缓存 (`v3:statuses/#{status_id}`) - 通过关联模型回调
+- ✅ 时间线分发缓存 (`fan-out/#{status_id}`) - 通过 `warm_payload_cache!` **更新**
+- ✅ ActivityPub 缓存 (`statuses/show:v3:statuses/#{status_id}`) - 仅 Quote 变更时
 
 ### 6.2 缓存键预收集
 
