@@ -7,9 +7,10 @@
 3. [通知生成路径](#通知生成路径)
 4. [本地账号 vs 远端联邦账号处理差异](#本地账号-vs-远端联邦账号处理差异)
 5. [远端账号"陈旧"判定与刷新触发机制](#远端账号陈旧判定与刷新触发机制)
-6. [取关链路与通知分析](#取关链路与通知分析)
-7. [静音和屏蔽的影响层次](#静音和屏蔽的影响层次)
-8. [远端账号数据延迟/不一致的处理手段](#远端账号数据延迟不一致的处理手段)
+6. [关注建立后的远端账号刷新路径](#关注建立后的远端账号刷新路径)
+7. [取关链路与通知分析](#取关链路与通知分析)
+8. [静音和屏蔽的影响层次](#静音和屏蔽的影响层次)
+9. [远端账号数据延迟/不一致的处理手段](#远端账号数据延迟不一致的处理手段)
 
 ---
 
@@ -335,7 +336,7 @@ end
 | `poll` | 投票结束 | ❌ |
 | `update` | 状态编辑 | ❌ |
 | `severed_relationships` | 关系切断 (域名封禁等) | ❌ |
-| `moderation_warning` |  moderation 警告 | ❌ |
+| `moderation_warning` | moderation 警告 | ❌ |
 | `annual_report` | 年度报告 | ❌ |
 | `admin.sign_up` | 管理员新用户注册 | ❌ |
 | `admin.report` | 管理员举报 | ❌ |
@@ -621,54 +622,469 @@ end
 | 签名验证失败 | `possibly_stale?` | ≤ 1 天 | 只刷新密钥 | 立即执行 |
 | AccountRefreshWorker | 直接检查 `last_webfingered_at` | > 1 周 | `ResolveAccountService` | 立即执行 |
 
+---
+
+## 关注建立后的远端账号刷新路径
+
+### 核心发现：关注建立时没有主动刷新远端账号的逻辑
+
+从代码分析来看，**关注建立时**（无论是 `FollowService` 还是 `AuthorizeFollowService`）**不会主动触发**远端账号的刷新。
+
+### 刷新依赖的被动机制
+
+远端账号的刷新依赖于以下**被动触发**机制：
+
+#### 机制 1: 处理远端活动时检查
+
+当远端账号发布新状态、更新资料等活动时：
+
+```ruby
+# app/lib/activitypub/activity/create.rb:8
+def perform
+  @account.schedule_refresh_if_stale!  # 检查是否超过 1 周
+  # ...
+end
+```
+
+```ruby
+# app/lib/activitypub/activity/update.rb:8
+def perform
+  @account.schedule_refresh_if_stale!  # 检查是否超过 1 周
+  # ...
+end
+```
+
+**触发条件：**
+- 远端账号有活动推送到本地实例
+- 且 `last_webfingered_at <= 1.week.ago`
+
+**行为：**
+- 安排 `AccountRefreshWorker` 在 0-6 小时随机延迟后执行
+
+---
+
+#### 机制 2: 后台定期刷新 (AccountRefreshWorker)
+
+当 `schedule_refresh_if_stale!` 安排任务后：
+
+```ruby
+# app/workers/account_refresh_worker.rb
+def perform(account_id)
+  account = Account.find_by(id: account_id)
+  return if account.nil? || account.last_webfingered_at > Account::BACKGROUND_REFRESH_INTERVAL.ago
+
+  ResolveAccountService.new.call(account)  # 完整刷新
+end
+```
+
+**行为：**
+- 调用 `ResolveAccountService` 进行完整刷新
+- 包括 Webfinger 查询、ActivityPub actor 信息获取等
+
+---
+
+#### 机制 3: 签名验证失败时刷新
+
+当远端活动的 HTTP 签名验证失败时：
+
+```ruby
+# app/controllers/concerns/signature_verification.rb:135-157
+def keypair_refresh_key!(keypair)
+  actor = if keypair.actor.possibly_stale?  # 超过 1 天?
+            keypair.actor.refresh!           # 完整刷新
+          else
+            ActivityPub::FetchRemoteActorService.new.call(keypair.actor.uri, only_key: true, suppress_errors: false)  # 只刷新密钥
+          end
+end
+```
+
+**分支逻辑：**
+| 条件 | 动作 |
+|------|------|
+| `last_webfingered_at <= 1.day.ago` | 完整刷新 (Webfinger + ActivityPub) |
+| `last_webfingered_at > 1.day.ago` | 只刷新密钥 (ActivityPub) |
+
+---
+
+### 特殊场景：首次关注新远端账号
+
+当用户通过 `@user@domain` 格式关注一个**新的远端账号**时：
+
+#### 流程：
+
+1. **账号解析阶段**（关注之前）：
+   - 用户输入 `@user@domain`
+   - 前端或 API 层调用 `ResolveAccountService`
+   - 通过 Webfinger 查找账号
+   - 通过 ActivityPub 获取 actor 信息
+   - 创建或更新 `Account` 记录
+   - 设置 `last_webfingered_at = Time.current`
+
+2. **关注建立阶段**：
+   - 调用 `FollowService` 或 `AuthorizeFollowService`
+   - 创建 `Follow` 或 `FollowRequest` 记录
+   - **没有刷新逻辑**
+
+#### 代码参考：
+
+从 `ResolveAccountService`：
+```ruby
+# app/services/resolve_account_service.rb
+def call(uri, options = {})
+  # ... Webfinger 查询
+  # ... ActivityPub 获取
+  # ... 创建/更新 Account 记录
+end
+```
+
+从 `FollowService`：
+```ruby
+# app/services/follow_service.rb:39-43
+# 没有刷新远端账号的逻辑
+```
+
+---
+
 ### 刷新触发流程图
 
 ```
-                    远端账号活动到达
+                    关注建立完成
+                    (Follow/AuthorizeFollow)
                            ↓
               ┌────────────────────────┐
-              │ 处理 Create/Update 等   │
-              │ ActivityPub 活动        │
+              │    ❌ 无主动刷新逻辑    │
               └────────────────────────┘
                            ↓
               ┌────────────────────────┐
-              │ schedule_refresh_if_   │
-              │ stale!                  │
+              │  刷新依赖被动触发机制   │
               └────────────────────────┘
                            ↓
-              last_webfingered_at > 1 周?
-                    /          \
-                  否            是
-                  /              \
-            (不操作)      安排 AccountRefreshWorker
-                                    ↓
-                            延迟 0-6 小时后执行
-                                    ↓
-                          ResolveAccountService
-                           (完整刷新账号)
+         ┌─────────────────┼─────────────────┐
+         ↓                 ↓                 ↓
+   远端发布新状态    签名验证失败      后台任务触发
+   (Create/Update)                        (AccountRefreshWorker)
+         ↓                 ↓                 ↓
+schedule_refresh_   keypair_refresh_   last_webfingered_at
+   if_stale!           key!              > 1.week.ago?
+         ↓                 ↓                 ↓
+   last_webfingered_   last_webfingered_      ↓
+   at > 1.week.ago?     at > 1.day.ago?      ↓
+         ↓                 ↓                 ↓
+         ↓            ┌────┴────┐            ↓
+         ↓            ↓         ↓            ↓
+        否           是         否            是
+         ↓            ↓         ↓            ↓
+      (不操作)   refresh!   只刷新密钥   ResolveAccountService
+         ↓       (完整)    (只密钥)      (完整刷新)
+         ↓
+         └──→ 安排 AccountRefreshWorker
+               延迟 0-6 小时执行
 
 
-                    另一场景: 签名验证失败
+           特殊场景: 首次关注 @user@domain
                            ↓
               ┌────────────────────────┐
-              │ keypair_refresh_key!   │
+              │  关注前先解析账号        │
+              │  ResolveAccountService  │
               └────────────────────────┘
                            ↓
-              possibly_stale? (> 1 天?)
-                    /          \
-                  是            否
-                  /              \
-            refresh!         只刷新密钥
-         (完整刷新)      (FetchRemoteActorService)
+              ┌────────────────────────┐
+              │  Webfinger + ActivityPub │
+              │  创建/更新 Account       │
+              │  last_webfingered_at =  │
+              │  Time.current           │
+              └────────────────────────┘
+                           ↓
+                    账号已"新鲜"
+              (last_webfingered_at 刚刚更新)
+                           ↓
+                    后续关注建立
+                           ↓
+              短期内不会触发刷新
 ```
+
+---
+
+### 刷新场景总结表
+
+| 场景 | 刷新时机 | 触发条件 | 刷新方式 |
+|------|---------|---------|---------|
+| 远端发布新状态 | 状态处理时 | `last_webfingered_at <= 1.week.ago` | 安排 `AccountRefreshWorker` |
+| 签名验证失败 | 验证失败时 | `last_webfingered_at <= 1.day.ago` | 完整刷新 `refresh!` |
+| 签名验证失败 | 验证失败时 | `last_webfingered_at > 1.day.ago` | 只刷新密钥 |
+| 后台任务 | 延迟执行时 | `last_webfingered_at <= 1.week.ago` | `ResolveAccountService` |
+| 首次关注新账号 | **关注之前** | 账号不存在或需要更新 | `ResolveAccountService` |
+| 关注建立时 | ❌ 无 | - | ❌ 无刷新 |
 
 ---
 
 ## 取关链路与通知分析
 
-### 核心发现：普通取关不产生通知
+### 核心发现 1: 普通取关不产生通知
 
 从 `app/models/notification.rb` 的 `PROPERTIES` 定义可以看到，**没有 `unfollow` 通知类型**。
+
+### 核心发现 2: 两种不同的"取关"方法
+
+Mastodon 有两种不同的"取关"方法，行为差异很大：
+
+| 方法 | 定义位置 | 时间线清理 | ActivityPub 活动 | 典型调用场景 |
+|------|---------|-----------|-----------------|-------------|
+| `Account#unfollow!` | `app/models/concerns/account/interactions.rb:97-100` | ❌ **无** | ❌ 无 | 接收 Undo Follow 活动、RefollowWorker |
+| `UnfollowService#unfollow!` | `app/services/unfollow_service.rb:25-49` | ✅ **UnmergeWorker** | ✅ 有 | 用户主动取关、屏蔽时取关 |
+
+### 两种方法的代码对比
+
+#### Account#unfollow! (仅销毁记录)
+
+```ruby
+# app/models/concerns/account/interactions.rb:97-100
+def unfollow!(other_account)
+  follow = active_relationships.find_by(target_account: other_account)
+  follow&.destroy  # 仅销毁 Follow 记录
+end
+```
+
+**行为：**
+- 销毁 `Follow` 记录
+- 触发 `Follow` 模型的 `after_destroy` 回调
+  - `decrement_cache_counters` - 递减缓存计数器
+  - `remove_endorsements` - 移除背书
+  - `invalidate_hash_cache` - 使缓存失效
+  - `invalidate_follow_recommendations_cache` - 使关注推荐缓存失效
+- **不会触发 UnmergeWorker 清理时间线** ⚠️
+- **不会发送 ActivityPub 活动**
+
+#### UnfollowService#unfollow! (完整处理)
+
+```ruby
+# app/services/unfollow_service.rb:25-49
+def unfollow!
+  follow = Follow.find_by(account: @follower, target_account: @followee)
+  return unless follow
+
+  list_ids = @follower.owned_lists.with_list_account(@followee).pluck(:list_id) unless @options[:skip_unmerge]
+
+  follow.destroy!
+
+  # 发送 ActivityPub 活动
+  if @followee.local? && @follower.remote? && @follower.activitypub?
+    send_reject_follow(follow)
+  elsif @followee.remote? && @followee.activitypub?
+    send_undo_follow(follow)
+  end
+
+  # 清理时间线
+  unless @options[:skip_unmerge]
+    UnmergeWorker.perform_async(@followee.id, @follower.id, 'home')
+    UnmergeWorker.push_bulk(list_ids) do |list_id|
+      [@followee.id, list_id, 'list']
+    end
+  end
+
+  follow
+end
+```
+
+**行为：**
+- 销毁 `Follow` 记录
+- **发送 ActivityPub 活动**（根据情况发送 Undo 或 Reject）
+- **触发 UnmergeWorker 清理时间线** ✅
+- 清理列表时间线
+
+---
+
+### 取关链路的完整分析
+
+#### 关键问题 1: 远端发来 Undo Follow 是否触发本地时间线清理？
+
+**答案：❌ 不会！**
+
+**代码分析：**
+
+```ruby
+# app/lib/activitypub/activity/undo.rb:89-101
+def undo_follow
+  target_account = account_from_uri(target_uri)
+
+  return if target_account.nil? || !target_account.local?
+
+  if @account.following?(target_account)
+    @account.unfollow!(target_account)  # ← 调用 Account#unfollow!
+  elsif @account.requested?(target_account)
+    FollowRequest.find_by(account: @account, target_account: target_account)&.destroy
+  else
+    delete_later!(object_uri)
+  end
+end
+```
+
+**调用链：**
+- `undo_follow` → `@account.unfollow!(target_account)` → **Account#unfollow!**
+- 不是 `UnfollowService`
+
+**实际影响：**
+| 项目 | 状态 |
+|------|------|
+| Follow 记录销毁 | ✅ |
+| 缓存计数器递减 | ✅ |
+| 时间线清理 (UnmergeWorker) | ❌ **不会触发** |
+| 通知 | ❌ 无 |
+| ActivityPub 活动 | ❌ 无（接收方） |
+
+**这意味着：** 当远端账号取关本地账号时，本地账号的时间线**不会立即清理**远端账号的历史状态。
+
+---
+
+### 关键问题 2: Reject Follow 在哪些场景会发送？
+
+**有两种完全不同的"Reject Follow"场景：**
+
+#### 场景 A: RejectFollowService - 拒绝关注请求
+
+**对象：** `FollowRequest`（关注请求，针对锁定账号）
+
+**代码位置：** `app/services/reject_follow_service.rb`
+
+```ruby
+class RejectFollowService < BaseService
+  include Payloadable
+
+  def call(source_account, target_account)
+    follow_request = FollowRequest.find_by!(account: source_account, target_account: target_account)
+    follow_request.reject!
+    create_notification(follow_request) if !source_account.local? && source_account.activitypub?
+    follow_request
+  end
+
+  private
+
+  def create_notification(follow_request)
+    ActivityPub::DeliveryWorker.perform_async(build_json(follow_request), follow_request.target_account_id, follow_request.account.inbox_url)
+  end
+
+  def build_json(follow_request)
+    serialize_payload(follow_request, ActivityPub::RejectFollowSerializer).to_json
+  end
+end
+```
+
+**触发位置：**
+
+| 调用位置 | 场景 |
+|---------|------|
+| `app/controllers/api/v1/follow_requests_controller.rb:21` | 用户拒绝关注请求 |
+| `app/services/block_service.rb:29` | 屏蔽时拒绝待处理的关注请求 |
+| `app/lib/activitypub/activity/block.rb:16` | 收到 Block 活动时拒绝待处理的关注请求 |
+
+**条件：**
+- 存在 `FollowRequest` 记录（目标账号是锁定的）
+- 源账号是远端 ActivityPub 账号（需要发送活动）
+
+---
+
+#### 场景 B: UnfollowService#send_reject_follow - 拒绝已建立的关注关系
+
+**对象：** `Follow`（已建立的关注关系）
+
+**代码位置：** `app/services/unfollow_service.rb:35-36`
+
+```ruby
+if @followee.local? && @follower.remote? && @follower.activitypub?
+  send_reject_follow(follow)
+elsif @followee.remote? && @followee.activitypub?
+  send_undo_follow(follow)
+end
+```
+
+```ruby
+def send_reject_follow(follow)
+  ActivityPub::DeliveryWorker.perform_async(build_reject_json(follow), follow.target_account_id, follow.account.inbox_url)
+end
+
+def send_undo_follow(follow)
+  ActivityPub::DeliveryWorker.perform_async(build_json(follow), follow.account_id, follow.target_account.inbox_url)
+end
+```
+
+**条件分析：**
+
+| 条件表达式 | 含义 |
+|-----------|------|
+| `@followee.local?` | 被关注者是**本地**账号 |
+| `@follower.remote?` | 关注者是**远端**账号 |
+| `@follower.activitypub?` | 关注者是 ActivityPub 协议 |
+
+**含义：** 当**远端账号**关注**本地账号**，而本地系统要解除这个关系时，发送 `Reject Follow`。
+
+**实际触发场景：**
+
+从 `BlockService#handle_following_relationships`：
+```ruby
+# app/services/block_service.rb:26-30
+def handle_following_relationships
+  UnfollowService.new.call(@account, @target_account) if @account.following?(@target_account)
+  UnfollowService.new.call(@target_account, @account) if @target_account.following?(@account)
+  RejectFollowService.new.call(@target_account, @account) if @target_account.requested?(@account)
+end
+```
+
+当本地账号 `@account` 屏蔽远端账号 `@target_account` 时：
+
+| 调用 | 参数 | 含义 | ActivityPub 活动 |
+|------|------|------|-----------------|
+| 第一行 | `UnfollowService.new(@account, @target)` | 本地取关远端 | **Undo Follow** |
+| 第二行 | `UnfollowService.new(@target, @account)` | 远端取关本地 | **Reject Follow** |
+
+**第二行的参数分析：**
+- `@follower = @target_account` (远端账号)
+- `@followee = @account` (本地账号)
+
+条件满足：
+- `@followee.local?` → `@account.local?` → true
+- `@follower.remote?` → `@target_account.remote?` → true
+- `@follower.activitypub?` → `@target_account.activitypub?` → true
+
+所以走 `send_reject_follow` 分支！
+
+---
+
+### 关键问题 3: 与普通取关、接收 Undo 的边界区分
+
+#### 三种取关场景的完整对比
+
+| 场景 | 调用方法 | ActivityPub 活动 | 时间线清理 | 通知 | 日志/追踪 |
+|------|---------|-----------------|-----------|------|-----------|
+| **本地主动取关本地** | `UnfollowService` | ❌ 无 | ✅ UnmergeWorker | ❌ 无 | Rails 回调 |
+| **本地主动取关远端** | `UnfollowService` | ✅ **Undo Follow** | ✅ UnmergeWorker | ❌ 无 | Sidekiq |
+| **远端发来 Undo Follow** | `Account#unfollow!` | ❌ 无（接收方） | ❌ **无** | ❌ 无 | ActivityPub 入站 |
+| **本地屏蔽远端（本地取关远端）** | `UnfollowService` | ✅ **Undo Follow** | ✅ UnmergeWorker | ❌ 无 | Sidekiq |
+| **本地屏蔽远端（远端取关本地）** | `UnfollowService` | ✅ **Reject Follow** | ✅ UnmergeWorker | ❌ 无 | Sidekiq |
+| **用户拒绝关注请求** | `RejectFollowService` | ✅ Reject Follow | ❌ 无 Follow 记录 | ❌ 无 | Sidekiq |
+| **RefollowWorker 刷新密钥** | `Account#unfollow!` | ❌ 无 | ❌ **无** | ❌ 无 | Sidekiq |
+
+#### 边界条件总结
+
+| 边界条件 | Undo Follow | Reject Follow |
+|---------|-------------|---------------|
+| **发起方** | 关注者 (follower) | 被关注者 (followee) |
+| **协议含义** | 关注者撤销自己的关注 | 被关注者拒绝关注 |
+| **本地视角** | 本地取关远端 → 发送 Undo | 远端取关本地 → 发送 Reject |
+| **时间线清理** | `UnfollowService` 会触发 | `UnfollowService` 会触发 |
+| **入站处理** | 调用 `Account#unfollow!`，**不清理时间线** | 入站 Reject 会调用 `UnfollowService` |
+
+#### 入站 Reject Follow 的处理
+
+```ruby
+# app/lib/activitypub/activity/reject.rb:7
+return UnfollowService.new.call(follow_from_object.account, @account) unless follow_from_object.nil?
+```
+
+当收到远端发来的 `Reject Follow` 时，**会调用 `UnfollowService`**，因此会触发 `UnmergeWorker` 清理时间线。
+
+这与收到 `Undo Follow` 时的行为**不同**！
+
+---
 
 ### 取关流程 (UnfollowService)
 
@@ -687,34 +1103,7 @@ def call(follower, followee, options = {})
 end
 ```
 
-```ruby
-# app/services/unfollow_service.rb:25-49
-def unfollow!
-  follow = Follow.find_by(account: @follower, target_account: @followee)
-  return unless follow
-
-  list_ids = @follower.owned_lists.with_list_account(@followee).pluck(:list_id) unless @options[:skip_unmerge]
-
-  follow.destroy!
-
-  if @followee.local? && @follower.remote? && @follower.activitypub?
-    send_reject_follow(follow)
-  elsif @followee.remote? && @followee.activitypub?
-    send_undo_follow(follow)
-  end
-
-  unless @options[:skip_unmerge]
-    UnmergeWorker.perform_async(@followee.id, @follower.id, 'home')
-    UnmergeWorker.push_bulk(list_ids) do |list_id|
-      [@followee.id, list_id, 'list']
-    end
-  end
-
-  follow
-end
-```
-
-### 取关链路的四个分支
+### 取关链路的四个分支（UnfollowService）
 
 #### 分支 A: 本地账号取关本地账号
 
@@ -728,17 +1117,6 @@ end
 3. 安排 `UnmergeWorker` 从时间线移除
 4. **不产生通知**
 
-**代码分支：**
-```ruby
-# 两个条件都不满足，走 else (无)
-if @followee.local? && @follower.remote? && @follower.activitypub?
-  send_reject_follow(follow)   # 不满足
-elsif @followee.remote? && @followee.activitypub?
-  send_undo_follow(follow)      # 不满足
-end
-# 结果：不发送任何 ActivityPub 活动
-```
-
 ---
 
 #### 分支 B: 本地账号取关远端账号
@@ -749,84 +1127,19 @@ end
 
 **执行流程：**
 1. 查找并销毁 `Follow` 记录
-2. 发送 `Undo Follow` 活动到远端 inbox：
-   ```ruby
-   def send_undo_follow(follow)
-     ActivityPub::DeliveryWorker.perform_async(build_json(follow), follow.account_id, follow.target_account.inbox_url)
-   end
-   ```
+2. 发送 `Undo Follow` 活动到远端 inbox
 3. 安排 `UnmergeWorker` 从时间线移除
 4. **不产生本地通知**
 
-**日志/追踪：**
-- `ActivityPub::DeliveryWorker` 的执行被 Sidekiq 记录
-- 如果投递失败，会有重试机制
-- `DeliveryFailureTracker` 追踪失败的投递
-
 ---
 
-#### 分支 C: 远端账号取关本地账号（通过 ActivityPub Undo Follow）
-
-**触发：** 本地实例收到远端发来的 `Undo Follow` 活动
-
-**处理位置：** `app/lib/activitypub/activity/undo.rb:89-101`
-
-```ruby
-def undo_follow
-  target_account = account_from_uri(target_uri)
-
-  return if target_account.nil? || !target_account.local?
-
-  if @account.following?(target_account)
-    @account.unfollow!(target_account)  # 调用 Account#unfollow!
-  elsif @account.requested?(target_account)
-    FollowRequest.find_by(account: @account, target_account: target_account)&.destroy
-  else
-    delete_later!(object_uri)
-  end
-end
-```
-
-**执行流程：**
-1. 解析目标账号 URI，确认是本地账号
-2. 如果远端账号正在关注本地：调用 `@account.unfollow!(target_account)`
-3. 如果是关注请求：销毁 `FollowRequest`
-4. **不产生通知**
-5. **不发送额外 ActivityPub 活动**（作为接收方）
-
-**Account#unfollow! 实现：**
-```ruby
-# app/models/concerns/account/interactions.rb:97-100
-def unfollow!(other_account)
-  follow = active_relationships.find_by(target_account: other_account)
-  follow&.destroy
-end
-```
-
-这只是销毁 `Follow` 记录，通过 `Follow` 模型的 `before_destroy`/`after_destroy` 回调触发后续清理。
-
----
-
-#### 分支 D: 远端账号取关本地账号（本地视角 - 发送 Reject）
+#### 分支 C: 远端账号取关本地账号（本地发送 Reject）
 
 **条件：**
 - `@followee.local?` (被关注者是本地)
 - `@follower.remote? && @follower.activitypub?` (关注者是远端 ActivityPub 账号)
 
-**代码位置：** `app/services/unfollow_service.rb:35-36`
-
-```ruby
-if @followee.local? && @follower.remote? && @follower.activitypub?
-  send_reject_follow(follow)
-```
-
-```ruby
-def send_reject_follow(follow)
-  ActivityPub::DeliveryWorker.perform_async(build_reject_json(follow), follow.target_account_id, follow.account.inbox_url)
-end
-```
-
-**场景说明：** 这是当本地系统处理"远端账号取关本地账号"时，**主动向远端发送 `Reject Follow` 活动**的情况。
+**典型场景：** 本地账号屏蔽远端账号时
 
 **执行流程：**
 1. 销毁 `Follow` 记录
@@ -836,11 +1149,21 @@ end
 
 ---
 
-### 远端处理 Undo Follow 的视角
+#### 分支 D: 远端发来 Undo Follow（入站处理）
 
-当远端实例收到本地发来的 `Undo Follow` 时，会执行类似的 `undo_follow` 逻辑。
+**触发：** 本地实例收到远端发来的 `Undo Follow` 活动
 
-**关键点：** 远端实例也**不会产生通知**，因为 Notification 类型中没有 `unfollow`。
+**处理位置：** `app/lib/activitypub/activity/undo.rb:89-101`
+
+**调用方法：** `Account#unfollow!` (⚠️ 不是 UnfollowService)
+
+**执行流程：**
+1. 解析目标账号 URI，确认是本地账号
+2. 如果远端账号正在关注本地：调用 `@account.unfollow!(target_account)`
+3. 销毁 `Follow` 记录
+4. **不会触发 UnmergeWorker 清理时间线** ⚠️
+5. **不产生通知**
+6. **不发送额外 ActivityPub 活动**
 
 ---
 
@@ -851,25 +1174,6 @@ end
 #### 场景 A: 管理员域名封禁 (domain_block)
 
 **触发位置：** `app/services/block_domain_service.rb:52-64`
-
-```ruby
-def notify_of_severed_relationships!
-  return if @domain_block_event.nil?
-
-  @domain_block_event.affected_local_accounts.reorder(nil).find_in_batches do |accounts|
-    notification_jobs_args = accounts.map do |account|
-      event = AccountRelationshipSeveranceEvent.create!(account:, relationship_severance_event: @domain_block_event)
-      [account.id, event.id, 'AccountRelationshipSeveranceEvent', 'severed_relationships']
-    end
-
-    LocalNotificationWorker.perform_bulk(notification_jobs_args)
-  end
-end
-```
-
-**触发条件：**
-- 管理员执行域名封禁 (`DomainBlock`)
-- 封禁类型为 `suspend` 或涉及大量关注关系切断
 
 **通知内容：**
 - 类型：`severed_relationships`
@@ -882,93 +1186,57 @@ end
 
 **触发位置：** `app/services/after_block_domain_from_account_service.rb:60-65`
 
-```ruby
-def notify_of_severed_relationships!
-  return if @domain_block_event.nil?
-
-  event = AccountRelationshipSeveranceEvent.create!(account: @account, relationship_severance_event: @domain_block_event)
-  LocalNotificationWorker.perform_async(@account.id, event.id, 'AccountRelationshipSeveranceEvent', 'severed_relationships')
-end
-```
-
-**触发条件：**
-- 用户自行封禁某个域名
-- 导致该域名下的所有关注/被关注关系被切断
-
 **通知接收者：** 只通知执行封禁操作的用户
 
 ---
 
 ### 取关链路完整总结表
 
-| 场景 | Follow 记录 | 时间线清理 | ActivityPub 活动 | 本地通知 | 日志/追踪 |
-|------|------------|-----------|-----------------|---------|-----------|
-| **本地→本地 取关** | ✅ 销毁 | ✅ UnmergeWorker | ❌ 无 | ❌ 无 | Rails destroy 回调 |
-| **本地→远端 取关** | ✅ 销毁 | ✅ UnmergeWorker | ✅ Undo Follow | ❌ 无 | Sidekiq + DeliveryFailureTracker |
-| **远端→本地 取关 (接收 Undo)** | ✅ 销毁 | ✅ (通过 unfollow! 回调) | ❌ 无（接收方） | ❌ 无 | ActivityPub 入站日志 |
-| **远端→本地 取关 (发送 Reject)** | ✅ 销毁 | ✅ UnmergeWorker | ✅ Reject Follow | ❌ 无 | Sidekiq + DeliveryFailureTracker |
-| **管理员域名封禁** | ✅ 批量销毁 | ✅ 批量清理 | ❌ 无 | ✅ severed_relationships | 管理日志 + 通知 |
-| **用户域名封禁** | ✅ 批量销毁 | ✅ 批量清理 | ❌ 无 | ✅ severed_relationships | 通知 |
+| 场景 | 调用方法 | Follow 记录 | 时间线清理 | ActivityPub 活动 | 本地通知 |
+|------|---------|------------|-----------|-----------------|---------|
+| **本地→本地 取关** | `UnfollowService` | ✅ 销毁 | ✅ UnmergeWorker | ❌ 无 | ❌ 无 |
+| **本地→远端 取关** | `UnfollowService` | ✅ 销毁 | ✅ UnmergeWorker | ✅ Undo Follow | ❌ 无 |
+| **远端发来 Undo Follow** | `Account#unfollow!` | ✅ 销毁 | ❌ **无** | ❌ 无（接收方） | ❌ 无 |
+| **远端发来 Reject Follow** | `UnfollowService` | ✅ 销毁 | ✅ UnmergeWorker | ❌ 无（接收方） | ❌ 无 |
+| **本地屏蔽远端（本地取关远端）** | `UnfollowService` | ✅ 销毁 | ✅ UnmergeWorker | ✅ Undo Follow | ❌ 无 |
+| **本地屏蔽远端（远端取关本地）** | `UnfollowService` | ✅ 销毁 | ✅ UnmergeWorker | ✅ Reject Follow | ❌ 无 |
+| **管理员域名封禁** | 批量处理 | ✅ 批量销毁 | ✅ 批量清理 | ❌ 无 | ✅ severed_relationships |
+| **用户域名封禁** | 批量处理 | ✅ 批量销毁 | ✅ 批量清理 | ❌ 无 | ✅ severed_relationships |
+| **RefollowWorker 刷新密钥** | `Account#unfollow!` | ✅ 销毁 | ❌ **无** | ❌ 无 | ❌ 无 |
+
+---
 
 ### 取关流程图
 
 ```
-                    用户触发取关操作
-                           ↓
-              ┌────────────────────────┐
-              │    UnfollowService     │
-              │  with_redis_lock 保护   │
-              └────────────────────────┘
-                           ↓
-                    查找 Follow 记录
-                           ↓
-              ┌────────────────────────┐
-              │     follow.destroy!     │
-              │  触发 after_destroy 回调 │
-              │  - 缓存计数器递减       │
-              │  - 缓存失效             │
-              └────────────────────────┘
-                           ↓
-              判断关注者/被关注者类型
+                    取关操作触发
                            ↓
          ┌─────────────────┼─────────────────┐
          ↓                 ↓                 ↓
-   本地→本地         本地→远端         远端→本地
+   用户主动取关      远端发来 Undo      远端发来 Reject
          ↓                 ↓                 ↓
-   无 ActivityPub   发送 Undo Follow    发送 Reject Follow
-   活动            到远端 inbox         到远端 inbox
+   UnfollowService    Account#unfollow!  UnfollowService
          ↓                 ↓                 ↓
-   仅销毁 Follow    同时销毁 Follow      同时销毁 Follow
-   记录             记录                  记录
-         ↓                 ↓                 ↓
-   ┌─────────────────────────────────────────────┐
-   │      所有分支都执行:                          │
-   │      UnmergeWorker.perform_async            │
-   │      - 从 home timeline 移除状态             │
-   │      - 从 list timelines 移除状态            │
-   │                                               │
-   │      ❌ 所有分支都不产生通知                  │
-   │         (Notification 无 unfollow 类型)      │
-   └─────────────────────────────────────────────┘
-
-
-           唯一产生通知的例外场景: 域名封禁
-                           ↓
-              ┌────────────────────────┐
-              │   管理员/用户封禁域名   │
-              └────────────────────────┘
-                           ↓
-              ┌────────────────────────┐
-              │  RelationshipSeverance │
-              │      Event 创建        │
-              └────────────────────────┘
-                           ↓
-              ┌────────────────────────┐
-              │ LocalNotificationWorker │
-              │   'severed_relationships'│
-              └────────────────────────┘
-                           ↓
-                    ✅ 产生通知
+         ↓           ┌─────────────┐        ↓
+         ↓           │ 销毁 Follow │        ↓
+         ↓           │ 递减缓存     │        ↓
+         ↓           │ ❌ 无时间线  │        ↓
+         ↓           │   清理       │        ↓
+         ↓           └─────────────┘        ↓
+         ↓                                  ↓
+   ┌─────────────┐                    ┌─────────────┐
+   │ 销毁 Follow  │                    │ 销毁 Follow  │
+   │ 递减缓存     │                    │ 递减缓存     │
+   │ ✅ Unmerge-  │                    │ ✅ Unmerge-  │
+   │   Worker     │                    │   Worker     │
+   │ 发送活动     │                    │ (接收方无)   │
+   └─────────────┘                    └─────────────┘
+         ↓
+         ├───────────────┬───────────────┐
+         ↓               ↓               ↓
+   本地→本地       本地→远端       远端→本地
+         ↓               ↓               ↓
+      无活动        Undo Follow    Reject Follow
 ```
 
 ---
@@ -1193,7 +1461,7 @@ end
 
 ### 1. 账号刷新机制
 
-详见前文 **[远端账号"陈旧"判定与刷新触发机制](#远端账号陈旧判定与刷新触发机制)** 章节。
+详见前文 **[远端账号"陈旧"判定与刷新触发机制](#远端账号陈旧判定与刷新触发机制)** 和 **[关注建立后的远端账号刷新路径](#关注建立后的远端账号刷新路径)** 章节。
 
 ### 2. 关注者同步机制
 
@@ -1282,6 +1550,20 @@ end
 ```
 
 当远端账号的所有密钥都变更时，会触发 `RefollowWorker` 重新建立关注关系。
+
+**RefollowWorker 行为：**
+
+```ruby
+# app/workers/refollow_worker.rb:19
+follower.unfollow!(target_account)  # 调用 Account#unfollow!，不会清理时间线
+```
+
+```ruby
+# app/workers/refollow_worker.rb:23
+FollowService.new.call(follower, target_account, reblogs: reblogs, notify: notify, languages: languages, bypass_limit: true)
+```
+
+---
 
 ### 4. 重复检测和幂等性
 
@@ -1403,6 +1685,7 @@ end
 | **定期刷新** | `AccountRefreshWorker` + 1 周阈值 | 远端账号信息定期更新 |
 | **主动刷新** | `schedule_refresh_if_stale!` + 1 周阈值 | 处理活动时检查并安排刷新 |
 | **签名验证失败时刷新** | `possibly_stale?` + 1 天阈值 | 超过 1 天则完整刷新，否则只刷新密钥 |
+| **关注建立后** | ❌ 无主动刷新 | 依赖被动机制 |
 | **关注者同步** | `SynchronizeFollowersService` + 哈希比对 | 检测并修复不一致的关注关系 |
 | **幂等处理** | `find_existing_status` + URI 检查 | 防止重复创建状态 |
 | **Tombstone** | `Tombstone` 模型 | 标记已删除资源 |
@@ -1416,11 +1699,12 @@ end
 
 ### 关注/取关相关
 - `app/services/follow_service.rb` - 关注服务
-- `app/services/unfollow_service.rb` - 取关服务
+- `app/services/unfollow_service.rb` - 取关服务（完整处理，会清理时间线）
 - `app/services/authorize_follow_service.rb` - 批准关注请求
-- `app/services/reject_follow_service.rb` - 拒绝关注请求
+- `app/services/reject_follow_service.rb` - 拒绝关注请求（FollowRequest）
 - `app/models/follow.rb` - 关注关系模型
 - `app/models/follow_request.rb` - 关注请求模型
+- `app/models/concerns/account/interactions.rb:97-100` - `Account#unfollow!`（仅销毁记录，不会清理时间线）
 
 ### 时间线相关
 - `app/lib/feed_manager.rb` - 时间线管理核心
@@ -1444,6 +1728,7 @@ end
 - `app/workers/account_refresh_worker.rb` - 账号刷新 Worker
 - `app/services/resolve_account_service.rb` - 解析账号服务
 - `app/controllers/concerns/signature_verification.rb` - 签名验证 (密钥刷新触发)
+- `app/workers/refollow_worker.rb` - 密钥变更后重新关注
 
 ### 静音/屏蔽相关
 - `app/services/mute_service.rb` - 静音服务
@@ -1456,10 +1741,9 @@ end
 
 ### ActivityPub 联邦相关
 - `app/lib/activitypub/activity/follow.rb` - 处理 Follow 活动
-- `app/lib/activitypub/activity/undo.rb` - 处理 Undo 活动 (包含 Undo Follow)
+- `app/lib/activitypub/activity/undo.rb` - 处理 Undo 活动（包含 Undo Follow，调用 Account#unfollow!）
+- `app/lib/activitypub/activity/reject.rb` - 处理 Reject 活动
 - `app/lib/activitypub/activity/create.rb` - 处理 Create 活动
 - `app/lib/activitypub/activity/update.rb` - 处理 Update 活动
 - `app/workers/activitypub/delivery_worker.rb` - ActivityPub 投递
-- `app/workers/activitypub/distribution_worker.rb` - 状态分发
-- `app/services/activitypub/process_account_service.rb` - 处理远端账号信息
-- `app/services/activitypub/synchronize_followers_service.rb` - 关注者同步
+- `
