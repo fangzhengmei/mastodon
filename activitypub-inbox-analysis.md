@@ -1376,3 +1376,592 @@ end
 3. **多层去重**：URI 查找 + Tombstone + Delete Upon Arrival + 分布式锁，确保幂等性
 4. **宽容处理**：解析失败和部分去重场景静默处理，不抛出异常，避免 Worker 无限重试
 5. **部分更新**：某些去重场景（如 Create 更新受众、Follow 更新 URI）允许部分副作用，保证数据最终一致性
+
+---
+
+## 八、重试行为分析
+
+本章详细分析异常链路中的重试行为：哪些分支会触发 Sidekiq 自动重试、哪些只会静默结束，以及各自依赖的异常触发条件。
+
+### 8.1 Sidekiq 重试机制概述
+
+#### 8.1.1 基础配置
+
+```ruby
+# 位于 app/workers/activitypub/processing_worker.rb:6
+
+sidekiq_options queue: 'ingress', backtrace: true, retry: 8
+```
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| `queue` | `'ingress'` | 使用 ingress 队列，优先级 4 |
+| `backtrace` | `true` | 记录异常回溯日志 |
+| `retry` | `8` | 最多重试 8 次 |
+
+#### 8.1.2 重试触发的核心规则
+
+**Sidekiq 只有在以下情况才会触发自动重试：**
+
+1. **异常未被捕获**：异常向上冒泡到 Sidekiq 框架
+2. **异常被重新抛出**：使用 `raise` 或 `raise e` 重新抛出捕获的异常
+
+**不会触发重试的情况：**
+
+1. **异常被捕获且不重新抛出**：`rescue` 块中没有 `raise`
+2. **条件 `return`**：正常控制流，不是异常
+3. **`retry: 0` 或 `retry: false`**：显式禁用重试
+
+#### 8.1.3 指数退避策略
+
+Sidekiq 使用指数退避算法计算重试延迟：
+
+```
+重试次数 n 的延迟 ≈ 15^n 秒
+```
+
+| 重试次数 | 延迟（约） |
+|----------|------------|
+| 第 1 次 | 15 秒 |
+| 第 2 次 | 4 分钟 |
+| 第 3 次 | 56 分钟 |
+| 第 4 次 | 14 小时 |
+| ... | ... |
+| 第 8 次 | 约 3 天 |
+
+重试 8 次后，如果仍失败，任务会被移到 **Dead Job**（死信）队列。
+
+---
+
+### 8.2 会触发 Sidekiq 自动重试的分支
+
+#### 8.2.1 ProcessingWorker 中未被捕获的异常
+
+```ruby
+# 位于 app/workers/activitypub/processing_worker.rb:8-19
+
+def perform(actor_id, body, delivered_to_account_id = nil, actor_type = 'Account')
+  case actor_type
+  when 'Account'
+    actor = Account.find_by(id: actor_id)
+  end
+
+  return if actor.nil?
+
+  ActivityPub::ProcessCollectionService.new.call(body, actor, override_timestamps: true, delivered_to_account_id: delivered_to_account_id, delivery: true)
+rescue ActiveRecord::RecordInvalid => e  # ⚠️ 只捕获 RecordInvalid
+  Rails.logger.debug { "Error processing incoming ActivityPub object: #{e}" }
+end
+```
+
+**关键点**：只捕获了 `ActiveRecord::RecordInvalid`，其他所有异常都会向上冒泡，触发 Sidekiq 重试。
+
+#### 8.2.2 触发重试的异常类型
+
+| 异常类型 | 触发条件 | 代码位置 |
+|----------|----------|----------|
+| **数据库连接异常** | 数据库暂时不可用 | `ActiveRecord::StatementInvalid` 等 |
+| **乐观锁冲突** | 并发更新同一记录 | `ActiveRecord::StaleObjectError`（部分场景） |
+| **Redis 异常** | Redis 连接/命令错误 | `Redis::BaseError` 子类 |
+| **网络异常（部分场景）** | 远程请求失败且未被捕获 | `HTTP::Error` 等 |
+| **其他未捕获的 StandardError** | 任何未被 rescue 的异常 | 多处 |
+
+#### 8.2.3 Activity::Move 的特殊处理（捕获后重新抛出）
+
+```ruby
+# 位于 app/lib/activitypub/activity/move.rb:6-25
+
+def perform
+  return if origin_account.uri != object_uri
+  return unless mark_as_processing!
+
+  target_account = ActivityPub::FetchRemoteAccountService.new.call(target_uri)
+
+  if target_account.nil? || target_account.unavailable? || !target_account.also_known_as.include?(origin_account.uri)
+    unmark_as_processing!
+    return
+  end
+
+  origin_account.update(moved_to_account: target_account)
+  MoveWorker.perform_async(origin_account.id, target_account.id)
+rescue                    # ⚠️ 捕获所有异常
+  unmark_as_processing!   # 先清理 Redis 状态标记
+  raise                   # ⚠️ 重新抛出，触发 Sidekiq 重试！
+end
+```
+
+**设计意图**：
+1. **状态清理**：确保 Redis 中的 `move_in_progress` 标记被清除
+2. **允许重试**：重新抛出异常，让 Sidekiq 可以重试
+3. **幂等性保障**：`mark_as_processing!` 使用 `nx: true`，确保并发安全
+
+#### 8.2.4 重试决策树
+
+```
+异常发生
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 异常是否被捕获？                                               │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ├── 否 ─────────────────────────────────────────────────┐
+    │                                                        │
+    │    ▼ 触发 Sidekiq 重试                                │
+    │                                                        │
+    └────────────────────────────────────────────────────────┘
+    │
+    └── 是 ─────────────────────────────────────────────────┐
+         │                                                   │
+         ▼                                                   │
+    ┌─────────────────────────────────────────────────┐     │
+    │ rescue 块中是否有 raise？                        │     │
+    └─────────────────────────────────────────────────┘     │
+         │                                                   │
+         ├── 是 ──────────────────────────────────────────┐ │
+         │                                                │ │
+         │    ▼ 触发 Sidekiq 重试（Activity::Move 模式）│ │
+         │                                                │ │
+         └────────────────────────────────────────────────┘ │
+         │                                                   │
+         └── 否 ──────────────────────────────────────────┐ │
+              │                                            │ │
+              ▼                                            │ │
+         ┌─────────────────────────────────────────────┐   │ │
+         │ 静默结束，不触发重试                          │   │ │
+         │ - 记录日志（部分情况）                        │   │ │
+         │ - 可能执行部分副作用（如加入延迟队列）         │   │ │
+         └─────────────────────────────────────────────┘   │ │
+              │                                            │ │
+              └────────────────────────────────────────────┘ │
+                   │                                          │
+                   └──────────────────────────────────────────┘
+```
+
+---
+
+### 8.3 只会静默结束的分支（不触发重试）
+
+#### 8.3.1 被捕获且不重新抛出的异常
+
+##### 8.3.1.1 ProcessingWorker 中的 RecordInvalid
+
+```ruby
+# 位于 app/workers/activitypub/processing_worker.rb:17-19
+
+rescue ActiveRecord::RecordInvalid => e
+  Rails.logger.debug { "Error processing incoming ActivityPub object: #{e}" }
+  # ⚠️ 没有 raise，静默结束
+end
+```
+
+**设计意图**：
+- `RecordInvalid` 通常是数据验证错误（如必填字段缺失、格式错误）
+- 这类错误重试也无法解决，所以直接静默结束
+
+##### 8.3.1.2 ProcessCollectionService 中的解析错误
+
+```ruby
+# 位于 app/services/activitypub/process_collection_service.rb:41-43
+
+rescue JSON::ParserError
+  nil  # ⚠️ 静默返回 nil
+end
+
+# 位于 app/services/activitypub/process_collection_service.rb:14-19
+
+begin
+  @json = compact(@json) if @json['signature'].is_a?(Hash)
+rescue JSON::LD::JsonLdError => e
+  Rails.logger.debug { "Error when compacting JSON-LD document for #{value_or_id(@json['actor'])}: #{e.message}" }
+  @json = original_json.without('signature')  # ⚠️ 移除 signature 后继续，不重试
+end
+```
+
+##### 8.3.1.3 Activity::Create 中的局部异常捕获
+
+| 方法 | 捕获的异常 | 处理方式 | 代码位置 |
+|------|------------|----------|----------|
+| `process_hashtag` | `ActiveRecord::RecordInvalid` | 静默 return | `create.rb:247-248` |
+| `process_mention` | `Mastodon::UnexpectedResponseError`, `HTTP_CONNECTION_ERRORS` | 加入 `@unresolved_mentions`，后续由 `MentionResolveWorker` 处理 | `create.rb:260-261` |
+| `process_emoji` | `Seahorse::Client::NetworkingError` | 记录 warn 日志 | `create.rb:279-280` |
+| `process_attachments` | `Mastodon::UnexpectedResponseError`, `HTTP_CONNECTION_ERRORS` | 入队 `RedownloadMediaWorker` 延迟处理 | `create.rb:320-321` |
+| `process_attachments` | `Seahorse::Client::NetworkingError` | 记录 warn 日志，入队 `RedownloadMediaWorker` | `create.rb:322-324` |
+| `process_attachments` | `Addressable::URI::InvalidURIError` | 记录 debug 日志 | `create.rb:329-331` |
+| `fetch_replies` | 所有异常 | 记录 warn 日志 | `create.rb:390-391` |
+| `fetch_and_verify_quote` | `Mastodon::RecursionLimitExceededError`, `UnexpectedResponseError`, `HTTP_CONNECTION_ERRORS` | 入队 `RefetchAndVerifyQuoteWorker` | `create.rb:399-400` |
+| `conversation_from_uri` | `ActiveRecord::RecordInvalid`, `RecordNotUnique` | `retry`（局部重试，非 Sidekiq 重试） | `create.rb:410-412` |
+| `increment_voters_count!` | `ActiveRecord::StaleObjectError` | `reload` + `retry`（局部重试） | `create.rb:477-479` |
+
+**关键设计模式**：
+
+1. **延迟重试而非立即重试**：
+   ```ruby
+   # 不是触发 Sidekiq 重试，而是使用专用的延迟 Worker
+   RedownloadMediaWorker.perform_in(rand(PROCESSING_DELAY), media_attachment.id)
+   MentionResolveWorker.perform_in(rand(PROCESSING_DELAY), status.id, uri, ...)
+   RefetchAndVerifyQuoteWorker.perform_in(rand(PROCESSING_DELAY), quote.id, ...)
+   ```
+
+2. **局部重试（非 Sidekiq 重试）**：
+   ```ruby
+   # 使用 begin-rescue-retry 模式在同一方法内重试
+   begin
+     Conversation.find_or_create_by!(uri: uri)
+   rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique
+     retry
+   end
+   ```
+
+##### 8.3.1.4 其他 Activity 处理器中的异常捕获
+
+| Activity | 捕获的异常 | 处理方式 |
+|----------|------------|----------|
+| **Update** | `Date::Error` | 静默 return `false` |
+| **LinkedDataSignature** | `OpenSSL::PKey::RSAError` | 静默 return `nil` |
+| **ProcessAccountService** | `JSON::ParserError` | 静默 return `nil` |
+
+#### 8.3.2 条件 return（正常控制流，非异常）
+
+这些情况使用 `return` 而非异常，永远不会触发 Sidekiq 重试。
+
+##### 8.3.2.1 去重命中场景
+
+```ruby
+# Create - Tombstone 存在
+return reject_payload! if ... tombstone_exists? ...
+
+# Create - Delete Upon Arrival 标记
+return if delete_arrived_first?(object_uri)
+
+# Create - 已存在相同 Status
+@status = find_existing_status
+if @status.nil?
+  process_status
+elsif @options[:delivered_to_account_id].present?
+  postprocess_audience_and_deliver  # 部分副作用，非异常
+end  # ⚠️ 没有 return，但也没有创建新记录
+
+# Follow - 已存在 FollowRequest
+existing_follow_request = ::FollowRequest.find_by(...)
+unless existing_follow_request.nil?
+  existing_follow_request.update!(uri: @json['id'])
+  return  # ⚠️ 直接 return
+end
+
+# Follow - 已存在 Follow
+existing_follow = ::Follow.find_by(...)
+unless existing_follow.nil?
+  existing_follow.update!(uri: @json['id'])
+  AuthorizeFollowService.new.call(...)
+  return  # ⚠️ 直接 return
+end
+```
+
+##### 8.3.2.2 解析失败场景
+
+```ruby
+# ProcessCollectionService - 不支持的 Context
+return if !supported_context? || ...
+
+# ProcessCollectionService - Actor 已暂停
+return if ... suspended_actor? ...
+
+# ProcessCollectionService - Actor 是本地账户
+return if ... @account.local?
+
+# Activity.factory - 未知 type
+def klass_for(json)
+  case json['type']
+  when 'Create' then ...
+  # ... 其他 type
+  # ⚠️ 没有 else 分支，未知 type 返回 nil
+  end
+end
+
+# process_item - 使用安全导航
+activity = ActivityPub::Activity.factory(item, ...)
+activity&.perform  # ⚠️ &. 操作符，activity 为 nil 时不执行
+```
+
+##### 8.3.2.3 前置检查失败
+
+```ruby
+# ProcessingWorker - Actor 不存在
+actor = Account.find_by(id: actor_id)
+return if actor.nil?  # ⚠️ find_by 返回 nil，不是异常
+
+# InboxesController - 前置检查（控制器阶段，不入队）
+skip_large_payload      # > 1MB 返回 413
+skip_unknown_actor_activity  # 未知 actor 返回 202
+```
+
+---
+
+### 8.4 静默结束 vs 触发重试的对比表
+
+| 场景 | 处理方式 | 触发条件 | 代码位置 |
+|------|----------|----------|----------|
+| **验签失败** | 控制器返回错误，不入队 | 签名验证失败 | `signature_verification.rb` |
+| **JSON::ParserError** | 静默 return nil | JSON 格式错误 | `process_collection_service.rb:41` |
+| **JSON::LD::JsonLdError** | 移除 signature 后继续 | JSON-LD 规范化失败 | `process_collection_service.rb:16-18` |
+| **不支持的 Context** | 静默 return | 非标准 JSON-LD Context | `process_collection_service.rb:21` |
+| **Actor 不匹配** | 静默 return | actor 与签名不一致 | `process_collection_service.rb:21` |
+| **Actor 已暂停** | 静默 return | 账户被暂停 | `process_collection_service.rb:21` |
+| **Actor 是本地** | 静默 return | 本地账户的 activity | `process_collection_service.rb:21` |
+| **未知 Activity type** | `activity&.perform` 不执行 | type 不在支持列表 | `activity.rb:30-65` |
+| **ActiveRecord::RecordInvalid** | 记录 debug 日志 | 数据验证失败 | `processing_worker.rb:17-19` |
+| **Tombstone 存在** | `reject_payload!` | 对象已被删除过 | `create.rb:18` |
+| **Delete Upon Arrival** | 静默 return | Delete 先于 Create 到达 | `create.rb:22` |
+| **Status 已存在** | 部分副作用或直接 return | 已处理过相同 URI | `create.rb:24-31` |
+| **FollowRequest 已存在** | 更新 URI 后 return | 重复的关注请求 | `follow.rb:12-16` |
+| **Follow 已存在** | 更新 URI + 调用服务后 return | 重复的关注 | `follow.rb:24-29` |
+| **网络异常（process_mention）** | 加入 unresolved_mentions | 远程账户获取失败 | `create.rb:260-261` |
+| **网络异常（process_attachments）** | 入队 RedownloadMediaWorker | 媒体下载失败 | `create.rb:320-324` |
+| **数据库连接异常** | 触发 Sidekiq 重试 | 数据库暂时不可用 | 未被捕获 |
+| **Redis 异常** | 触发 Sidekiq 重试 | Redis 故障 | 未被捕获 |
+| **Activity::Move 中异常** | 清理后重新抛出 → 触发重试 | 账户迁移失败 | `move.rb:22-24` |
+| **乐观锁冲突（部分场景）** | 触发 Sidekiq 重试 | 并发更新 | 未被捕获 |
+
+---
+
+### 8.5 关键设计理念
+
+#### 8.5.1 可重试 vs 不可重试的区分原则
+
+| 维度 | 可重试（触发 Sidekiq） | 不可重试（静默结束） |
+|------|------------------------|----------------------|
+| **错误性质** | 临时性故障 | 永久性错误 |
+| **典型场景** | 数据库连接中断、Redis 故障、网络抖动 | JSON 格式错误、数据验证失败、重复请求 |
+| **重试价值** | 重试可能成功 | 重试也无法解决 |
+| **处理策略** | 指数退避重试 | 记录日志、部分副作用、延迟 Worker |
+
+#### 8.5.2 延迟重试模式
+
+**不是使用 Sidekiq 重试，而是使用专用的延迟 Worker**：
+
+```ruby
+# 示例 1: 媒体下载失败
+RedownloadMediaWorker.perform_in(rand(PROCESSING_DELAY), media_attachment.id)
+# PROCESSING_DELAY = (30.seconds)..(10.minutes)
+
+# 示例 2: 提及解析失败
+MentionResolveWorker.perform_in(rand(PROCESSING_DELAY), status.id, uri, ...)
+
+# 示例 3: 引用验证失败
+RefetchAndVerifyQuoteWorker.perform_in(rand(PROCESSING_DELAY), quote.id, ...)
+```
+
+**优势**：
+1. **精细控制**：可以为不同类型的失败设置不同的延迟策略
+2. **不阻塞主流程**：主 Worker 可以继续处理其他任务
+3. **避免级联失败**：一个组件的失败不会影响整个 Activity 的处理
+
+#### 8.5.3 幂等性保障
+
+**多层去重机制确保重试是安全的**：
+
+1. **URI 查找**：`find_existing_status` 检查是否已存在
+2. **Tombstone**：已删除的对象不会被重建
+3. **Delete Upon Arrival**：Redis 标记防止 Delete 先于 Create 到达
+4. **Redis 分布式锁**：`with_redis_lock` 防止并发处理
+
+**设计目标**：
+> 即使同一个 Activity 被处理多次，也应该产生相同的结果（或不产生副作用）
+
+#### 8.5.4 Move 操作的特殊设计
+
+```ruby
+# 位于 app/lib/activitypub/activity/move.rb:22-24
+
+rescue
+  unmark_as_processing!  # 清理 Redis 锁
+  raise                   # 重新抛出，允许重试
+end
+```
+
+**为什么这样设计**：
+
+1. **状态一致性**：`move_in_progress` 标记必须在失败时清除
+2. **并发安全**：`mark_as_processing!` 使用 `nx: true`（set if not exists）
+3. **允许恢复**：临时故障（如网络中断）应该可以重试
+
+**Redis 锁的完整逻辑**：
+
+```ruby
+# 位于 app/lib/activitypub/activity/move.rb:37-39
+
+def mark_as_processing!
+  # nx: true = 只有 key 不存在时才设置
+  # ex: PROCESSING_COOLDOWN = 7 天自动过期
+  redis.set("move_in_progress:#{@account.id}", true, nx: true, ex: PROCESSING_COOLDOWN)
+end
+
+# 位于 app/lib/activitypub/activity/move.rb:41-43
+
+def unmark_as_processing!
+  redis.del("move_in_progress:#{@account.id}")
+end
+```
+
+---
+
+### 8.6 重试行为决策树（完整版）
+
+```
+远端实例 POST Activity
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 1: 控制器 before_action (验签)                           │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── 验签失败 ───────────────────────────────────────┐
+         │                                                    │
+         │    HTTP 响应: 400/401/403/503                   │
+         │    ❌ 不入队，不重试                               │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ▼ 验签成功
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 2: 控制器 create 动作                                    │
+│  - 入队 ProcessingWorker                                      │
+│  - 返回 202 Accepted                                          │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 3: ProcessingWorker#perform                             │
+│  sidekiq_options retry: 8                                    │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── Actor 不存在 ──────────────────────────────────┐
+         │  (Account.find_by 返回 nil)                        │
+         │                                                    │
+         │    静默 return，非异常                             │
+         │    ❌ 不触发重试                                   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ▼ Actor 存在
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 4: ProcessCollectionService#call                        │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── JSON::ParserError ─────────────────────────────┐
+         │                                                    │
+         │    rescue 捕获，return nil                         │
+         │    ❌ 不触发重试                                   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ├── JSON::LD::JsonLdError ─────────────────────────┐
+         │                                                    │
+         │    rescue 捕获，移除 signature 后继续              │
+         │    ❌ 不触发重试                                   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ├── 前置检查失败 ───────────────────────────────────┐
+         │  (!supported_context? || suspended_actor? || ...) │
+         │                                                    │
+         │    条件 return，非异常                             │
+         │    ❌ 不触发重试                                   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 5: Activity 处理器 (根据 type 分发)                       │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── 去重命中 ───────────────────────────────────────┐
+         │  (Tombstone / Delete Upon Arrival / URI 已存在)    │
+         │                                                    │
+         │    条件 return 或 reject_payload!                  │
+         │    ❌ 不触发重试                                   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ├── 局部异常（被捕获）──────────────────────────────┐
+         │                                                    │
+         │    ┌──────────────────────────────────────────┐   │
+         │    │ 异常类型不同，处理方式不同:               │   │
+         │    │                                          │   │
+         │    │ ❌ 静默结束:                             │   │
+         │    │    - ActiveRecord::RecordInvalid         │   │
+         │    │    - Addressable::URI::InvalidURIError  │   │
+         │    │                                          │   │
+         │    │ ⏰ 延迟重试（专用 Worker）:               │   │
+         │    │    - 网络异常 → RedownloadMediaWorker    │   │
+         │    │    - 提及解析失败 → MentionResolveWorker │   │
+         │    │    - 引用验证失败 → RefetchQuoteWorker    │   │
+         │    │                                          │   │
+         │    │ 🔄 局部重试（begin-rescue-retry）:        │   │
+         │    │    - RecordNotUnique (并发创建)           │   │
+         │    │    - StaleObjectError (乐观锁)            │   │
+         │    └──────────────────────────────────────────┘   │
+         │                                                    │
+         │    ❌ 不触发 Sidekiq 重试                         │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ├── Activity::Move 异常 ──────────────────────────┐
+         │                                                    │
+         │    rescue 捕获所有异常                             │
+         │    ├── unmark_as_processing! (清理 Redis 锁)      │
+         │    └── raise (重新抛出)                            │
+         │                                                    │
+         │    ✅ 触发 Sidekiq 重试（指数退避）                │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ├── 未被捕获的异常 ─────────────────────────────────┐
+         │                                                    │
+         │    异常向上冒泡到 Sidekiq 框架                      │
+         │                                                    │
+         │    典型异常:                                        │
+         │    - ActiveRecord::StatementInvalid (数据库)       │
+         │    - Redis::BaseError (Redis)                      │
+         │    - HTTP::Error (网络，部分场景)                   │
+         │    - 其他 StandardError 子类                       │
+         │                                                    │
+         │    ✅ 触发 Sidekiq 重试（指数退避）                │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ▼ 重试 8 次后仍失败
+┌─────────────────────────────────────────────────────────────┐
+│ 任务被移到 Dead Job（死信）队列                              │
+│ 需要手动干预或使用 sidekiq 重试命令                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 8.7 重试相关配置汇总
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| ProcessingWorker `retry` | `8` | 最多重试 8 次 |
+| ProcessingWorker `queue` | `'ingress'` | 优先级 4 |
+| PROCESSING_DELAY | `30s ~ 10min` | 延迟 Worker 的随机延迟范围 |
+| DISTRIBUTE_DELAY | `1min` | 链接爬取的延迟 |
+| Sidekiq 指数退避 | `15^n 秒` | 第 n 次重试的延迟 |
+| Move 操作冷却期 | `7 天` | `move_in_progress` 锁的 TTL |
+
+---
+
+### 8.8 关键代码位置汇总
+
+| 功能 | 文件路径 | 行号 |
+|------|----------|------|
+| ProcessingWorker 重试配置 | `app/workers/activitypub/processing_worker.rb` | 6 |
+| ProcessingWorker 异常捕获 | `app/workers/activitypub/processing_worker.rb` | 17-19 |
+| Move 操作重试设计 | `app/lib/activitypub/activity/move.rb` | 22-24 |
+| ProcessCollectionService 解析错误 | `app/services/activitypub/process_collection_service.rb` | 14-19, 41-43 |
+| Create 媒体下载延迟重试 | `app/lib/activitypub/activity/create.rb` | 320-324 |
+| Create 提及解析延迟重试 | `app/lib/activitypub/activity/create.rb` | 260-261 |
+| Create 引用验证延迟重试 | `app/lib/activitypub/activity/create.rb` | 399-400 |
+| Sidekiq 队列配置 | `config/sidekiq.yml` | 6 |
