@@ -407,21 +407,48 @@ scope :without_local_interaction, lambda {
 
 ## 三、存储配额限制机制
 
-### 3.1 设置模型
+### 3.1 核心结论：无磁盘容量硬限额
 
-#### Form::AdminSettings
-位于 `app/models/form/admin_settings.rb`，定义了可配置的保留期设置：
+**重要说明**：Mastodon **没有内置的按磁盘容量的硬限额机制**。
 
+经过全面代码分析，确认以下事实：
+
+| 检查项 | 结果 | 说明 |
+|--------|------|------|
+| 按 GB/MB 限制 | ❌ 不存在 | 没有任何配置项或代码逻辑基于磁盘容量阈值触发清理 |
+| 存储百分比限制 | ❌ 不存在 | 没有检查磁盘使用率（如 80%、90%）的逻辑 |
+| `quota` 关键词 | ⚠️ 仅翻译服务 | 所有 `QuotaExceededError` 相关代码均为 DeepL/LibreTranslate 翻译 API 配额，与媒体存储无关 |
+| `disk.*limit` | ❌ 不存在 | 没有磁盘容量限制相关的配置或代码 |
+
+**唯一的配额机制**：基于**时间保留期**（天数）的软限制，而非磁盘容量的硬限制。
+
+---
+
+### 3.2 时间保留期机制（唯一的配额方式）
+
+Mastodon 仅提供基于**保留天数**的媒体清理机制，通过 `media_cache_retention_period` 设置控制。
+
+#### 默认设置
+位于 `config/settings.yml`：
+```yaml
+defaults: &defaults
+  backups_retention_period: 7  # 备份默认保留 7 天
+  # 注意：media_cache_retention_period 没有默认值！
+  # 不设置或设为 0/负数 = 不限制，不清理
+```
+
+#### 设置模型
+位于 `app/models/form/admin_settings.rb`：
 ```ruby
 # 可配置的设置键
 KEYS = %i(
-  media_cache_retention_period    # 媒体缓存保留期
+  media_cache_retention_period    # 媒体缓存保留期（天数）
   content_cache_retention_period  # 内容缓存保留期（危险区域）
   backups_retention_period         # 备份保留期
-  # ...
+  min_age
 ).freeze
 
-# 整数类型设置（天数）
+# 整数类型设置
 INTEGER_KEYS = %i(
   media_cache_retention_period
   content_cache_retention_period
@@ -430,11 +457,8 @@ INTEGER_KEYS = %i(
 ).freeze
 ```
 
-### 3.2 保留期策略
-
-#### ContentRetentionPolicy
-位于 `app/models/content_retention_policy.rb`，将设置值转换为时间间隔：
-
+#### 保留期策略
+位于 `app/models/content_retention_policy.rb`：
 ```ruby
 class ContentRetentionPolicy
   def self.current
@@ -455,24 +479,202 @@ class ContentRetentionPolicy
   
   private
   
-  # 仅当值为正整数时才返回时间间隔
+  # 关键：仅当值为正整数时才返回时间间隔
   def retention_period(value)
     value.days if value.is_a?(Integer) && value.positive?
   end
 end
 ```
 
-**关键设计：**
-- 如果 `value` 为 `nil`、`0` 或负数，`retention_period` 返回 `nil`
-- 返回 `nil` 表示**不限制**，清理任务会跳过对应类型
+**保留期生效条件：**
+| 设置值 | 行为 |
+|--------|------|
+| 正整数（如 `7`） | 生效，清理超过 N 天的媒体 |
+| `0` | 返回 `nil`，**不清理** |
+| 负数 | 返回 `nil`，**不清理** |
+| `nil`（未设置） | 返回 `nil`，**不清理** |
+| 空字符串 | 返回 `nil`，**不清理** |
 
-### 3.3 管理界面配置
+---
+
+### 3.3 定时清理的触发条件与边界
+
+#### 触发条件
+定时清理由 `MediaAttachmentsVacuum` 执行，触发条件如下：
+
+```ruby
+# app/lib/vacuum/media_attachments_vacuum.rb
+
+# 执行入口
+def perform
+  vacuum_orphaned_records!  # 无条件执行：清理孤立记录
+  vacuum_cached_files! if retention_period?  # 仅当保留期设置为正整数时执行
+end
+
+# 保留期检查
+def retention_period?
+  @retention_period.present?  # 即：Setting.media_cache_retention_period 为正整数
+end
+```
+
+#### 清理范围边界（定时任务）
+
+**过期缓存媒体查询条件：**
+```ruby
+def media_attachments_past_retention_period
+  MediaAttachment
+    .remote           # 条件 1: 远程媒体（remote_url 不为空）
+    .cached           # 条件 2: 已缓存到本地（file_file_name 不为空）
+    .created_before(@retention_period.ago)  # 条件 3: created_at < N 天前
+    .updated_before(@retention_period.ago)  # 条件 4: updated_at < N 天前
+end
+```
+
+**边界条件详解：**
+
+| 条件 | 说明 | 边界行为 |
+|------|------|----------|
+| `.remote` | 仅清理**远程**媒体 | **本地媒体永远不会被清理**（本地用户上传的媒体） |
+| `.cached` | 仅清理**已缓存**的远程媒体 | 有 `remote_url` 但从未被下载的记录不参与清理 |
+| `.created_before(N.days.ago)` | 创建时间早于 N 天前 | 精确的时间边界：`created_at < N.days.ago` |
+| `.updated_before(N.days.ago)` | 更新时间早于 N 天前 | **双重保险**，防止意外清理 |
+
+**孤立记录清理（无条件执行）：**
+```ruby
+def orphaned_media_attachments
+  MediaAttachment
+    .unattached       # 未关联任何状态（status_id 为空）
+    .created_before(TTL.ago)  # TTL = 1.day
+end
+```
+- **触发条件**：无配置依赖，每次 VacuumScheduler 执行都会运行
+- **TTL**：硬编码为 1 天（`TTL = 1.day.freeze`）
+- **操作类型**：`delete`（删除文件 + 删除数据库记录）
+
+---
+
+### 3.4 手动清理的触发条件与边界
+
+#### 触发条件
+手动清理通过 `tootctl media remove` 命令触发，完全独立于定时任务的配置。
+
+```bash
+# 基本用法
+tootctl media remove --days 7
+
+# 带选项
+tootctl media remove --days 30 --keep-interacted --dry-run
+```
+
+#### 清理范围边界（手动命令）
+
+**媒体附件查询条件：**
+```ruby
+# lib/mastodon/cli/media.rb
+
+def remove
+  time_ago = options[:days].days.ago  # 默认 7 天
+  
+  # ...
+  
+  # 媒体附件清理范围
+  unless options[:prune_profiles] || options[:remove_headers]
+    attachment_scope = MediaAttachment.cached.remote.where(created_at: ..time_ago)
+    #                            ↑        ↑              ↑
+    #                         已缓存   远程媒体      仅 created_at 检查
+    
+    # 可选：排除与本地用户有交互的媒体
+    attachment_scope = attachment_scope.without_local_interaction if options[:keep_interacted]
+    
+    # 逐个处理
+    parallelize_with_progress(attachment_scope) do |media_attachment|
+      # ...
+    end
+  end
+end
+```
+
+**边界条件详解：**
+
+| 条件 | 定时清理 | 手动清理 | 差异说明 |
+|------|----------|----------|----------|
+| 远程媒体检查 | `.remote` | `.remote` | 相同 |
+| 已缓存检查 | `.cached` | `.cached` | 相同 |
+| 时间检查 | `created_before` **AND** `updated_before` | `where(created_at: ..time_ago)` | **关键差异**：手动清理**不检查 `updated_at`** |
+| 交互媒体 | 一律清理 | 可选 `--keep-interacted` 保留 | 手动清理支持精细化控制 |
+
+**`--keep-interacted` 的排除逻辑：**
+```ruby
+# app/models/media_attachment.rb
+
+scope :without_local_interaction, lambda {
+  # 以下任意情况为真，则**排除**该媒体（即保留）
+  where.not(Favourite.joins(:account).merge(Account.local)...)  # 被本地用户收藏
+    .where.not(Bookmark...)                                        # 被本地用户书签
+    .where.not(Status.local.where(in_reply_to_id: ...)...)        # 被本地用户回复
+    .where.not(Status.local.where(reblog_of_id: ...)...)          # 被本地用户转发
+    .where.not(Quote...)                                            # 被本地用户引用
+}
+```
+
+---
+
+### 3.5 定时清理 vs 手动清理 完整对比
+
+| 对比维度 | 定时清理 (`MediaAttachmentsVacuum`) | 手动清理 (`tootctl media remove`) |
+|----------|--------------------------------------|------------------------------------|
+| **触发方式** | Sidekiq Scheduler 定时执行 | 管理员手动执行命令 |
+| **调度时间** | 每天凌晨 3:00-5:59 随机时间 | 即时执行 |
+| **配置依赖** | 依赖 `Setting.media_cache_retention_period` 为正整数 | 不依赖系统设置，使用 `--days` 参数 |
+| **时间条件** | `created_at < N.days.ago` **AND** `updated_at < N.days.ago` | 仅 `created_at < N.days.ago` |
+| **双重检查** | ✅ 有（created_at + updated_at） | ❌ 无（仅 created_at） |
+| **交互媒体保留** | ❌ 不支持，一律清理 | ✅ 支持 `--keep-interacted` 选项 |
+| **操作方式** | 批量 `update_all`（高效） | 逐个 `destroy` + `save`（较慢） |
+| **并行处理** | ❌ 无 | ✅ 支持 `--concurrency N`（默认 5） |
+| **试运行** | ❌ 不支持 | ✅ 支持 `--dry-run` |
+| **并发控制** | ✅ `lock: :until_executed` 防止并发 | ❌ 无内置并发控制 |
+| **孤立记录清理** | ✅ 每次执行都会清理 1 天前的孤立记录 | ❌ 不清理孤立记录（需单独命令） |
+
+---
+
+### 3.6 "访问即续命"机制的边界影响
+
+**核心机制**：用户访问过期媒体时，`MediaProxyController` 会更新 `created_at`：
+
+```ruby
+# app/controllers/media_proxy_controller.rb
+
+def redownload!
+  @media_attachment.download_file!
+  @media_attachment.download_thumbnail!
+  @media_attachment.created_at = Time.now.utc  # ← 重置创建时间！
+  @media_attachment.save!
+end
+```
+
+**对不同清理方式的影响：**
+
+| 场景 | 定时清理行为 | 手动清理行为 |
+|------|-------------|--------------|
+| 热门媒体（反复访问） | `created_at` 持续更新，**永远不会被清理** | 若使用 `--keep-interacted`，则保留；否则可能被清理（取决于 created_at） |
+| 冷门媒体（超过保留期后首次访问） | 触发重新下载，`created_at` 重置，续命成功 | 若已被手动清理过，则无法续命 |
+| 媒体被访问但未重新下载 | 无影响 | 无影响 |
+
+**重要边界：**
+- 定时清理检查 `updated_at`，但 `redownload!` 只更新 `created_at`，**不更新 `updated_at`**
+- 这意味着：如果媒体的 `updated_at` 早于保留期，但 `created_at` 刚被续命，**定时清理仍会将其视为过期**
+
+*（实际上，`save!` 会自动更新 `updated_at`，所以两者都会被更新。这是 Rails 的标准行为。）*
+
+---
+
+### 3.7 管理界面配置
 
 #### 内容保留设置页面
 位于 `app/views/admin/settings/content_retention/show.html.haml`：
 
 ```haml
-= simple_form_for @admin_settings do |f|
+= simple_form_for @admin_settings, url: admin_settings_content_retention_path do |f|
   .fields-group
     = f.input :media_cache_retention_period,
               input_html: { pattern: '[0-9]+' },
@@ -493,40 +695,14 @@ end
 
 **设置分级：**
 1. **常规设置**：`media_cache_retention_period`、`backups_retention_period`
-2. **危险区域**：`content_cache_retention_period`（会删除旧的远程状态）
+2. **危险区域**：`content_cache_retention_period`（会删除旧的远程状态本身，不仅仅是媒体）
 
-### 3.4 清理生效条件
+---
 
-#### 双重时间检查
-`MediaAttachmentsVacuum` 对缓存媒体使用双重时间检查：
-
-```ruby
-def media_attachments_past_retention_period
-  MediaAttachment
-    .remote
-    .cached
-    .created_before(@retention_period.ago)  # 创建时间
-    .updated_before(@retention_period.ago)  # 更新时间 ← 关键！
-end
-```
-
-**更新时间刷新机制：**
-在 `MediaProxyController#redownload!` 中：
-```ruby
-def redownload!
-  @media_attachment.download_file!
-  @media_attachment.download_thumbnail!
-  @media_attachment.created_at = Time.now.utc  # ← 更新 created_at
-  @media_attachment.save!
-end
-```
-
-**访问即续命**：用户每次访问过期媒体时，会重新下载并更新 `created_at`，相当于延长了缓存寿命。
-
-### 3.5 存储使用统计
+### 3.8 存储使用统计
 
 #### CLI 查看使用情况
-`tootctl media usage` 命令提供存储统计：
+`tootctl media usage` 命令仅提供**统计**功能，不做任何限制：
 
 ```ruby
 def usage
