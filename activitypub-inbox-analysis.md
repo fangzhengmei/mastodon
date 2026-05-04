@@ -652,3 +652,727 @@ end
 | Create 处理器 | `app/lib/activitypub/activity/create.rb` |
 | Delete 处理器 | `app/lib/activitypub/activity/delete.rb` |
 | Follow 处理器 | `app/lib/activitypub/activity/follow.rb` |
+
+## 七、异常链路分析
+
+本章详细分析三种异常场景：**验签失败**、**解析失败**、**去重命中**，包括各自的终止条件、返回结果和是否进入后续副作用处理。
+
+### 7.1 异常场景总览
+
+| 异常类型 | 发生阶段 | 终止方式 | HTTP 状态码 | 是否进入 Worker | 是否执行副作用 |
+|----------|----------|----------|-------------|-----------------|----------------|
+| **验签失败** | 控制器 before_action | 渲染错误响应 | 400/401/403/503 | ❌ 否 | ❌ 否 |
+| **解析失败** | Worker 处理阶段 | 静默 return | 已返回 202 | ✅ 已进入 | ❌ 否 |
+| **去重命中** | Activity 处理器 | 条件 return/reject_payload! | 已返回 202 | ✅ 已进入 | ⚠️ 部分情况 |
+
+---
+
+### 7.2 验签失败场景
+
+验签发生在 **控制器 before_action** 阶段（`require_actor_signature!`），在 `InboxesController#create` 动作执行之前。
+
+#### 7.2.1 验签失败的各种子场景
+
+| 失败原因 | 错误信息 | HTTP 状态码 | 代码位置 |
+|----------|----------|-------------|----------|
+| **请求未签名** | `Request not signed` | 401 | `signature_verification.rb:54` |
+| **公钥未找到** | `Public key not found for key #{key_id}` | 401 | `signature_verification.rb:58` |
+| **密钥已撤销** | `Key #{key_id} is revoked` | 401 | `signature_verification.rb:160` |
+| **密钥已过期** | `Key #{key_id} has expired` | 401 | `signature_verification.rb:161` |
+| **域名被屏蔽** | 无特殊错误信息 | 403 | `signature_verification.rb:98-100` |
+| **签名参数缺失** | `Incompatible request signature. ... are required` | 401 | `signed_request.rb:248` |
+| **算法不支持** | `Unsupported signature algorithm ...` | 401 | `signed_request.rb:249` |
+| **时间窗口过期** | `Signed request date outside acceptable time window` | 401 | `signed_request.rb:250` |
+| **签名强度不足** | 多种信息（Date/Digest/Host 未签名） | 401 | `signed_request.rb:55-58` |
+| **摘要不匹配** | `Invalid Digest value. Computed: ... given: ...` | 401 | `signed_request.rb:79,197` |
+| **签名验证失败** | `Verification failed for ...` | 401 | `signature_verification.rb:70` |
+| **密钥刷新失败** | `Could not refresh public key #{key_id}` | 401 | `signature_verification.rb:65` |
+| **网络错误** | `Failed to fetch remote data: ...` | 503 | `signature_verification.rb:77-78` |
+| **熔断保护** | `Fetching attempt skipped because of recent connection failure` | 503 | `signature_verification.rb:83-84` |
+| **签名头格式错误** | `Error parsing signature parameters` | 400 | `signed_request.rb:91` |
+| **重复签名参数** | `Error parsing signature with duplicate keys` | 401 | `signature_parser.rb:30` |
+
+#### 7.2.2 验签失败的终止条件
+
+```ruby
+# 位于 app/controllers/concerns/signature_verification.rb:19-21
+
+def require_actor_signature!
+  render json: signature_verification_failure_reason, status: signature_verification_failure_code unless signed_request_actor
+end
+```
+
+**终止条件**：`signed_request_actor` 返回 `nil`
+
+#### 7.2.3 验签失败的完整流程
+
+```
+远端实例 POST /inbox
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ before_action :require_actor_signature!                      │
+│                                                              │
+│ 1. signed_request? 检查是否有 Signature 头                    │
+│    └── 无签名头 → 401 Unauthorized                          │
+│                                                              │
+│ 2. keypair_from_key_id 获取公钥                              │
+│    ├── 域名被屏蔽 → 403 Forbidden                           │
+│    ├── 本地无缓存 → 远程获取                                 │
+│    └── 获取失败 → 401/503                                   │
+│                                                              │
+│ 3. check_keypair_validity! 检查密钥状态                      │
+│    ├── 已撤销 → 401                                         │
+│    └── 已过期 → 401                                         │
+│                                                              │
+│ 4. signed_request.verified?(keypair) 验证签名               │
+│    ├── 参数缺失 → 401                                       │
+│    ├── 算法不支持 → 401                                     │
+│    ├── 时间窗口过期 → 401                                   │
+│    ├── 签名强度不足 → 401                                   │
+│    ├── 摘要不匹配 → 401                                     │
+│    └── 签名验证失败 → 尝试刷新密钥后重试                     │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── 验签成功 → 继续执行 create 动作 → process_payload → 进入 Worker
+         │
+         └── 验签失败 → render json: { error: ... }, status: 4xx/503
+                      → ❌ 不进入后续流程
+                      → ❌ 不执行 process_payload
+                      → ❌ 不进入 Worker
+                      → ❌ 不执行任何副作用
+```
+
+#### 7.2.4 验签失败的返回结果
+
+```ruby
+# 位于 app/controllers/concerns/signature_verification.rb:87-92
+
+def fail_with!(message, **options)
+  Rails.logger.debug { "Signature verification failed: #{message}" }
+  
+  @signature_verification_failure_reason = { error: message }.merge(options)
+  @signed_request_actor = nil
+end
+```
+
+**返回格式**：
+```json
+{
+  "error": "具体错误信息"
+}
+```
+
+**状态码**：
+- `400`：签名头格式错误（`MalformedHeaderError`）
+- `401`：签名验证失败（默认）
+- `403`：域名被屏蔽
+- `503`：网络错误或熔断保护
+
+#### 7.2.5 验签失败的副作用影响
+
+| 流程步骤 | 是否执行 |
+|----------|----------|
+| `upgrade_account` | ❌ 否 |
+| `process_collection_synchronization` | ❌ 否 |
+| `process_payload` (入队 Worker) | ❌ 否 |
+| `ActivityPub::ProcessingWorker` | ❌ 否 |
+| 本地副作用处理 | ❌ 否 |
+
+---
+
+### 7.3 解析失败场景
+
+解析失败发生在 **Worker 处理阶段**，此时控制器已返回 `202 Accepted`。
+
+#### 7.3.1 解析失败的各种子场景
+
+| 失败原因 | 发生位置 | 处理方式 | 是否记录日志 |
+|----------|----------|----------|--------------|
+| **JSON 解析失败** | `ProcessCollectionService#call` | `rescue JSON::ParserError` → `return nil` | 否 |
+| **JSON-LD compact 失败** | `ProcessCollectionService#call` | 移除 signature 后继续 | `Rails.logger.debug` |
+| **不支持的 JSON-LD Context** | `ProcessCollectionService#call` | 直接 `return` | 否 |
+| **Actor 不匹配且 LD 签名验证失败** | `ProcessCollectionService#call` | 直接 `return` | `Rails.logger.debug` |
+| **Actor 已被暂停** | `ProcessCollectionService#call` | 直接 `return` | 否 |
+| **Actor 是本地账户** | `ProcessCollectionService#call` | 直接 `return` | 否 |
+| **未知的 Activity type** | `Activity.factory` | 返回 `nil`，`activity&.perform` 不执行 | 否 |
+
+#### 7.3.2 解析失败的终止条件分析
+
+**场景 1：JSON 解析失败**
+
+```ruby
+# 位于 app/services/activitypub/process_collection_service.rb:41-43
+
+rescue JSON::ParserError
+  nil
+end
+```
+
+- **触发条件**：`JSON.parse(body)` 抛出 `JSON::ParserError`
+- **终止方式**：`rescue` 块返回 `nil`
+- **影响**：整个 `call` 方法提前结束
+
+**场景 2：JSON-LD Context 不支持**
+
+```ruby
+# 位于 app/services/activitypub/process_collection_service.rb:26
+
+return if !supported_context? || (different_actor? && verify_account!.nil?) || suspended_actor? || @account.local?
+```
+
+- **触发条件**：`supported_context?` 返回 `false`
+- **终止方式**：条件 `return`
+- **影响**：不处理 activity
+
+**场景 3：Actor 不匹配且 LD 签名验证失败**
+
+```ruby
+# 位于 app/services/activitypub/process_collection_service.rb:72-83
+
+def verify_account!
+  return unless @json['signature'].is_a?(Hash)
+  return if domain_not_allowed?(@json['signature']['creator'])
+  
+  @options[:relayed_through_actor] = @account
+  @account = ActivityPub::LinkedDataSignature.new(@json).verify_actor!
+  @account = nil unless @account.is_a?(Account)
+  @account
+rescue JSON::LD::JsonLdError, RDF::WriterError => e
+  Rails.logger.debug { "Could not verify LD-Signature for #{value_or_id(@json['actor'])}: #{e.message}" }
+  nil
+end
+```
+
+- **触发条件**：`@json['actor'] != @account.uri` 且 `verify_account!` 返回 `nil`
+- **终止方式**：条件 `return`
+- **影响**：不处理 activity
+
+**场景 4：未知的 Activity type**
+
+```ruby
+# 位于 app/lib/activitypub/activity.rb:30-65
+
+def klass_for(json)
+  case json['type']
+  when 'Create'      then ActivityPub::Activity::Create
+  when 'Announce'    then ActivityPub::Activity::Announce
+  # ... 其他 type
+  # 没有 else 分支，未知 type 返回 nil
+  end
+end
+
+# 位于 app/services/activitypub/process_collection_service.rb:246-250
+
+def process_item(item)
+  activity = ActivityPub::Activity.factory(item, @account, **@options)
+  activity&.perform  # &. 安全导航，activity 为 nil 时不执行
+end
+```
+
+- **触发条件**：`json['type']` 不在支持列表中
+- **终止方式**：`klass_for` 返回 `nil`，`activity&.perform` 不执行
+- **影响**：`perform` 方法不被调用
+
+#### 7.3.3 解析失败的完整流程
+
+```
+控制器已返回 202 Accepted
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ActivityPub::ProcessingWorker#perform                        │
+│                                                              │
+│ 1. Account.find_by(id: actor_id)                            │
+│    └── actor 不存在 → return                                │
+│                                                              │
+│ 2. ProcessCollectionService.new.call(body, actor, ...)     │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ProcessCollectionService#call                                │
+│                                                              │
+│ 1. JSON.parse(body)                                          │
+│    └── 解析失败 → rescue JSON::ParserError → return nil    │
+│                                                              │
+│ 2. JSON-LD compact (如果有 signature)                        │
+│    └── 失败 → 移除 signature 后继续                         │
+│                                                              │
+│ 3. 前置检查 return unless ...                                │
+│    ├── !supported_context? → return                         │
+│    ├── different_actor? && verify_account!.nil? → return   │
+│    ├── suspended_actor? → return                            │
+│    └── @account.local? → return                             │
+│                                                              │
+│ 4. process_item(item)                                        │
+│    └── Activity.factory → 未知 type 返回 nil                │
+│         └── activity&.perform 不执行                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.4 解析失败的返回结果
+
+由于解析失败发生在 **异步 Worker** 中，控制器已提前返回 `202 Accepted`，因此：
+
+- **HTTP 响应**：`202 Accepted`（控制器已返回）
+- **Worker 行为**：静默 `return`，不抛出异常
+- **日志记录**：
+  - JSON-LD compact 失败：`Rails.logger.debug`
+  - LD-Signature 验证失败：`Rails.logger.debug`
+  - 其他解析失败：无日志
+
+#### 7.3.5 解析失败的副作用影响
+
+| 流程步骤 | 是否执行 |
+|----------|----------|
+| 控制器 `create` 动作 | ✅ 已执行（返回 202） |
+| `ProcessingWorker` 入队 | ✅ 已入队 |
+| `ProcessCollectionService` 调用 | ✅ 已调用 |
+| `Activity.factory` 创建 | ⚠️ 部分情况（JSON 解析成功才执行） |
+| `activity.perform` 执行 | ❌ 否 |
+| 本地副作用处理 | ❌ 否 |
+
+---
+
+### 7.4 去重命中场景
+
+去重命中发生在 **Activity 处理器的 `perform` 方法** 中，此时已通过验签和基本解析。
+
+#### 7.4.1 去重机制回顾
+
+Mastodon 使用四层去重机制：
+
+| 机制 | 检查方法 | 用途 |
+|------|----------|------|
+| **URI 查找** | `find_existing_status` | 检查是否已存在相同 URI 的记录 |
+| **Tombstone (墓碑)** | `tombstone_exists?` | 检查是否已被删除过 |
+| **Delete Upon Arrival** | `delete_arrived_first?` | 处理 Delete 先于 Create 到达的情况 |
+| **Redis 分布式锁** | `with_redis_lock` | 防止并发处理相同资源 |
+
+#### 7.4.2 各 Activity 类型的去重命中分析
+
+##### 7.4.2.1 Create (发帖) 的去重命中
+
+```ruby
+# 位于 app/lib/activitypub/activity/create.rb:17-35
+
+def create_status
+  # 第 1 层：前置检查（去重相关）
+  return reject_payload! if unsupported_object_type? || non_matching_uri_hosts?(@account.uri, object_uri) || tombstone_exists? || !related_to_local_activity?
+  
+  with_redis_lock("create:#{object_uri}") do
+    Status.uncached do
+      # 第 2 层：Delete Upon Arrival 检查
+      return if delete_arrived_first?(object_uri) || poll_vote?
+      # 第 3 层：URI 查找
+      @status = find_existing_status
+    end
+    
+    if @status.nil?
+      process_status  # 创建新状态
+    elsif @options[:delivered_to_account_id].present?
+      postprocess_audience_and_deliver  # 已存在，更新受众
+    end
+  end
+end
+```
+
+**Create 去重命中场景**：
+
+| 去重检查 | 命中条件 | 终止方式 | 是否执行副作用 |
+|----------|----------|----------|----------------|
+| `tombstone_exists?` | URI 存在于 Tombstone 表 | `reject_payload!` | ❌ 否 |
+| `delete_arrived_first?` | Redis 有 `delete_upon_arrival` 标记 | 直接 `return` | ❌ 否 |
+| `find_existing_status` | 已存在相同 URI 的 Status | 不 `return` | ⚠️ 部分执行 |
+
+**特殊情况：Status 已存在但有 delivered_to_account_id**
+
+```ruby
+# 位于 app/lib/activitypub/activity/create.rb:156-165
+
+def postprocess_audience_and_deliver
+  return if @status.mentions.find_by(account_id: @options[:delivered_to_account_id])
+  
+  # 添加新的提及
+  @status.mentions.create(account: delivered_to_account, silent: true)
+  @status.update(visibility: :limited) if @status.direct_visibility?
+  
+  # 如果收件人已关注作者，插入到时间线
+  return unless delivered_to_account.following?(@account)
+  
+  FeedInsertWorker.perform_async(@status.id, delivered_to_account.id, 'home')
+end
+```
+
+**这种情况下的副作用**：
+- ❌ 不创建新的 Status 记录
+- ✅ 可能添加新的 Mention 记录
+- ✅ 可能更新 Status 的 visibility
+- ✅ 可能插入到收件人的时间线
+
+##### 7.4.2.2 Delete (删除) 的去重命中
+
+```ruby
+# 位于 app/lib/activitypub/activity/delete.rb:19-43
+
+def delete_object
+  return if object_uri.nil?  # 去重：URI 为空直接返回
+  
+  with_redis_lock("delete_status_in_progress:#{object_uri}", raise_on_failure: false) do
+    unless non_matching_uri_hosts?(@account.uri, object_uri)
+      # 标记：即使对象不存在，也要创建 Tombstone 和 delete_upon_arrival
+      with_redis_lock("create:#{object_uri}") { delete_later!(object_uri) }
+      Tombstone.find_or_create_by(uri: object_uri, account: @account)
+    end
+    
+    # 实际删除
+    case @object['type']
+    when 'QuoteAuthorization'
+      revoke_quote
+    when 'Note', 'Question'
+      delete_status
+    else
+      delete_status || revoke_quote
+    end
+  end
+end
+
+# 位于 app/lib/activitypub/activity/delete.rb:45-55
+
+def delete_status
+  @status = Status.find_by(uri: object_uri, account: @account)
+  @status ||= Status.find_by(uri: @object['atomUri'], account: @account) if @object.is_a?(Hash) && @object['atomUri'].present?
+  
+  return if @status.nil?  # 去重：状态不存在直接返回
+  
+  forwarder.forward! if forwarder.forwardable?
+  RemoveStatusService.new.call(@status, redraft: false)
+  
+  true
+end
+```
+
+**Delete 去重命中场景**：
+
+| 去重检查 | 命中条件 | 终止方式 | 是否执行副作用 |
+|----------|----------|----------|----------------|
+| `object_uri.nil?` | URI 为空 | 直接 `return` | ❌ 否 |
+| `non_matching_uri_hosts?` | URI 域名与 actor 不匹配 | 不创建 Tombstone | ⚠️ 部分 |
+| `Status.find_by` 返回 nil | 状态不存在 | `delete_status` 内 `return` | ⚠️ 部分 |
+
+**Delete 的特殊设计**：
+
+```ruby
+# 即使 Status 不存在，也会执行：
+with_redis_lock("create:#{object_uri}") { delete_later!(object_uri) }  # Redis 标记
+Tombstone.find_or_create_by(uri: object_uri, account: @account)        # 墓碑记录
+```
+
+**这种设计的目的**：防止后续迟到的 Create 操作重建已删除的对象。
+
+**Delete 去重命中后的副作用**：
+
+| 情况 | 副作用 |
+|------|--------|
+| `object_uri.nil?` | ❌ 无任何副作用 |
+| URI 域名不匹配 | ❌ 不创建 Tombstone，不执行删除 |
+| Status 存在 | ✅ 转发删除活动 ✅ 调用 RemoveStatusService |
+| Status 不存在 | ✅ 创建 Tombstone ✅ 设置 delete_upon_arrival 标记 |
+
+##### 7.4.2.3 Follow (关注) 的去重命中
+
+```ruby
+# 位于 app/lib/activitypub/activity/follow.rb:3-39
+
+def perform
+  target_account = account_from_uri(object_uri)
+  
+  # 前置检查
+  return if target_account.nil? || !target_account.local? || delete_arrived_first?(@json['id'])
+  
+  # 第 1 层去重：已存在 FollowRequest
+  existing_follow_request = ::FollowRequest.find_by(account: @account, target_account: target_account)
+  unless existing_follow_request.nil?
+    existing_follow_request.update!(uri: @json['id'])
+    return  # 直接返回
+  end
+  
+  # 被屏蔽检查
+  if target_account.blocking?(@account) || target_account.domain_blocking?(@account.domain) || target_account.moved? || target_account.instance_actor?
+    reject_follow_request!(target_account)
+    return
+  end
+  
+  # 第 2 层去重：已存在 Follow 关系
+  existing_follow = ::Follow.find_by(account: @account, target_account: target_account)
+  unless existing_follow.nil?
+    existing_follow.update!(uri: @json['id'])
+    AuthorizeFollowService.new.call(@account, target_account, skip_follow_request: true, follow_request_uri: @json['id'])
+    return  # 直接返回
+  end
+  
+  # 创建新的关注请求
+  follow_request = FollowRequest.create!(account: @account, target_account: target_account, uri: @json['id'])
+  # ... 后续处理
+end
+```
+
+**Follow 去重命中场景**：
+
+| 去重检查 | 命中条件 | 终止方式 | 是否执行副作用 |
+|----------|----------|----------|----------------|
+| `delete_arrived_first?(@json['id'])` | Activity URI 被标记为删除 | 直接 `return` | ❌ 否 |
+| `existing_follow_request` 存在 | 已存在相同的 FollowRequest | 更新 URI 后 `return` | ⚠️ 部分 |
+| `existing_follow` 存在 | 已存在 Follow 关系 | 更新 URI + 调用 AuthorizeFollowService | ⚠️ 部分 |
+
+**Follow 去重命中后的副作用**：
+
+| 情况 | 副作用 |
+|------|--------|
+| `delete_arrived_first?` | ❌ 无任何副作用 |
+| FollowRequest 已存在 | ✅ 更新 FollowRequest.uri ❌ 不创建新记录 |
+| Follow 已存在 | ✅ 更新 Follow.uri ✅ 调用 AuthorizeFollowService |
+
+##### 7.4.2.4 Announce (转发) 的去重命中
+
+```ruby
+# 位于 app/lib/activitypub/activity/announce.rb:3-33
+
+def perform
+  # 前置检查
+  return reject_payload! if delete_arrived_first?(@json['id']) || !related_to_local_activity?
+  return reject_payload! if @object.nil?
+  
+  with_redis_lock("announce:#{value_or_id(@object)}") do
+    original_status = status_from_object
+    
+    return reject_payload! if original_status.nil? || !announceable?(original_status)
+    return if requested_through_relay?  # 去重：通过中继接收的重复转发
+    
+    # 去重检查：已存在相同的转发
+    @status = Status.find_by(account: @account, reblog: original_status)
+    
+    return @status unless @status.nil?  # 已存在则直接返回
+    
+    # 创建新的转发
+    @status = Status.create!(...)
+    # ... 后续处理
+  end
+end
+```
+
+**Announce 去重命中场景**：
+
+| 去重检查 | 命中条件 | 终止方式 | 是否执行副作用 |
+|----------|----------|----------|----------------|
+| `delete_arrived_first?(@json['id'])` | Activity URI 被标记 | `reject_payload!` | ❌ 否 |
+| `requested_through_relay?` | 通过中继接收 | 直接 `return` | ❌ 否 |
+| `Status.find_by(account: @account, reblog: original_status)` | 已存在相同转发 | 直接 `return @status` | ❌ 否 |
+
+##### 7.4.2.5 Undo (撤销) 的去重命中
+
+```ruby
+# 位于 app/lib/activitypub/activity/undo.rb
+
+def perform
+  # Undo 的 object 是另一个 Activity
+  @object = @json['object']
+  
+  case @object['type']
+  when 'Follow'
+    undo_follow
+  when 'Announce'
+    undo_announce
+  when 'Like'
+    undo_like
+  when 'Block'
+    undo_block
+  # ...
+  end
+end
+
+def undo_follow
+  target_account = account_from_uri(object_uri)
+  return if target_account.nil?
+  
+  # 去重：查找并删除 FollowRequest 或 Follow
+  follow_request = FollowRequest.find_by(account: @account, target_account: target_account)
+  if follow_request
+    follow_request.destroy
+    return
+  end
+  
+  follow = Follow.find_by(account: @account, target_account: target_account)
+  if follow
+    UnfollowService.new.call(@account, target_account, skip_unfollow: true)
+  end
+end
+```
+
+**Undo 去重命中场景**：
+
+| 去重检查 | 命中条件 | 终止方式 | 是否执行副作用 |
+|----------|----------|----------|----------------|
+| `FollowRequest.find_by` 存在 | 待撤销的关注请求存在 | 销毁后 `return` | ✅ 执行销毁 |
+| `Follow.find_by` 存在 | 待撤销的关注关系存在 | 调用 UnfollowService | ✅ 执行撤销 |
+| 两者都不存在 | 没有可撤销的记录 | 静默结束 | ❌ 无副作用 |
+
+#### 7.4.3 去重命中的返回结果
+
+由于去重命中发生在 **异步 Worker** 中：
+
+- **HTTP 响应**：`202 Accepted`（控制器已返回）
+- **Worker 行为**：
+  - 大多数情况：静默 `return`
+  - 部分情况：调用 `reject_payload!`（记录日志后返回 `nil`）
+- **日志记录**：
+  - `reject_payload!` 会记录 info 日志：`Rails.logger.info("Rejected #{@json['type']} activity ...")`
+
+```ruby
+# 位于 app/lib/activitypub/activity.rb:202-205
+
+def reject_payload!
+  Rails.logger.info("Rejected #{@json['type']} activity #{@json['id']} from #{@account.uri}#{@options[:relayed_through_actor] && "via #{@options[:relayed_through_actor].uri}"}")
+  nil
+end
+```
+
+#### 7.4.4 去重命中的副作用影响总结
+
+| Activity 类型 | 去重场景 | 副作用执行情况 |
+|---------------|----------|----------------|
+| **Create** | Tombstone 存在 | ❌ 无 |
+| **Create** | Delete Upon Arrival 标记 | ❌ 无 |
+| **Create** | Status 已存在（无 delivered_to） | ❌ 无 |
+| **Create** | Status 已存在（有 delivered_to） | ✅ 更新受众 ✅ 可能插入时间线 |
+| **Delete** | object_uri 为空 | ❌ 无 |
+| **Delete** | Status 不存在 | ✅ 创建 Tombstone ✅ Redis 标记 |
+| **Delete** | Status 存在 | ✅ 完整删除流程 |
+| **Follow** | Delete Upon Arrival 标记 | ❌ 无 |
+| **Follow** | FollowRequest 已存在 | ✅ 仅更新 URI |
+| **Follow** | Follow 已存在 | ✅ 更新 URI ✅ 调用 AuthorizeFollowService |
+| **Announce** | Delete Upon Arrival 标记 | ❌ 无 |
+| **Announce** | 已存在相同转发 | ❌ 无 |
+| **Undo** | 目标记录存在 | ✅ 执行撤销 |
+| **Undo** | 目标记录不存在 | ❌ 无 |
+
+---
+
+### 7.5 异常链路决策树
+
+```
+远端实例 POST Activity
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 1: 控制器 before_action (验签)                           │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── 验签失败 ───────────────────────────────────────┐
+         │                                                    │
+         │    HTTP 响应: 400/401/403/503                   │
+         │    响应体: { "error": "具体错误信息" }            │
+         │    后续流程: ❌ 全部终止                           │
+         │    副作用: ❌ 无                                   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ▼ 验签成功
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 2: 控制器 create 动作                                    │
+│  - upgrade_account                                           │
+│  - process_collection_synchronization                        │
+│  - process_payload (入队 Worker)                             │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼ 返回 202 Accepted
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 3: 异步 Worker 处理                                      │
+│ ActivityPub::ProcessingWorker                                │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── Actor 不存在 ───────────────────────────────────┐
+         │                                                    │
+         │    Worker: 静默 return                             │
+         │    副作用: ❌ 无                                   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ▼ Actor 存在
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 4: ProcessCollectionService                             │
+│  - JSON.parse                                                │
+│  - JSON-LD compact                                           │
+│  - 前置检查 (supported_context?, different_actor?, etc.)     │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── 解析失败 ───────────────────────────────────────┐
+         │  (JSON 错误 / 不支持的 Context / 未知 type 等)     │
+         │                                                    │
+         │    Worker: 静默 return                             │
+         │    日志: 部分情况有 debug 日志                      │
+         │    副作用: ❌ 无                                   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ▼ 解析成功
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 5: Activity 处理器 (根据 type 分发)                       │
+│  - 去重检查 (URI 查找 / Tombstone / Delete Upon Arrival)     │
+│  - 本地副作用处理                                             │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ├── 去重命中 ───────────────────────────────────────┐
+         │                                                    │
+         │    ┌──────────────────────────────────────────┐   │
+         │    │ 去重类型不同，副作用执行情况不同:          │   │
+         │    │                                          │   │
+         │    │ ❌ 完全跳过:                             │   │
+         │    │    - Tombstone 存在                      │   │
+         │    │    - Delete Upon Arrival 标记            │   │
+         │    │    - 目标记录完全不存在                   │   │
+         │    │                                          │   │
+         │    │ ⚠️ 部分执行:                             │   │
+         │    │    - Create: 已存在但更新受众           │   │
+         │    │    - Delete: 状态不存在但创建 Tombstone  │   │
+         │    │    - Follow: 已存在但更新 URI            │   │
+         │    │    - Undo: 目标存在则执行撤销            │   │
+         │    └──────────────────────────────────────────┘   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+         │
+         ▼ 去重未命中
+┌─────────────────────────────────────────────────────────────┐
+│ 阶段 6: 执行完整本地副作用                                     │
+│  - Create: 创建 Status + 时间线分发                          │
+│  - Delete: 执行删除 + 创建 Tombstone                          │
+│  - Follow: 创建 FollowRequest / Follow                        │
+│  - ... 其他 activity                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 7.6 异常场景对比表
+
+| 维度 | 验签失败 | 解析失败 | 去重命中 |
+|------|----------|----------|----------|
+| **发生阶段** | 控制器 before_action | Worker ProcessCollectionService | Worker Activity 处理器 |
+| **HTTP 状态码** | 400/401/403/503 | 202 Accepted | 202 Accepted |
+| **响应体** | `{ "error": "..." }` | 无（异步） | 无（异步） |
+| **是否进入 Worker** | ❌ 否 | ✅ 是 | ✅ 是 |
+| **是否执行副作用** | ❌ 否 | ❌ 否 | ⚠️ 视情况而定 |
+| **是否记录日志** | ✅ Rails.logger.debug | ⚠️ 部分情况 | ⚠️ reject_payload! 时 |
+| **重试机制** | 无（客户端重试） | Sidekiq retry: 8 | Sidekiq retry: 8 |
+| **数据一致性** | 无影响 | 无影响 | 保证不重复处理 |
+
+---
+
+### 7.7 关键设计理念
+
+1. **验签失败快速失败**：在控制器层面直接返回错误，避免无效请求进入队列
+2. **异步解耦**：控制器返回 202 后，实际处理在 Worker 中进行，提高吞吐量
+3. **多层去重**：URI 查找 + Tombstone + Delete Upon Arrival + 分布式锁，确保幂等性
+4. **宽容处理**：解析失败和部分去重场景静默处理，不抛出异常，避免 Worker 无限重试
+5. **部分更新**：某些去重场景（如 Create 更新受众、Follow 更新 URI）允许部分副作用，保证数据最终一致性
