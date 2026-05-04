@@ -637,34 +637,175 @@ scope :without_local_interaction, lambda {
 
 ---
 
-### 3.6 "访问即续命"机制的边界影响
+---
 
-**核心机制**：用户访问过期媒体时，`MediaProxyController` 会更新 `created_at`：
+## 3.9 缓存失效边界：最终统一口径
 
+### 3.9.1 重下载后的时间戳变化（最终确认）
+
+**重下载触发场景**：
+- 用户访问过期媒体（`needs_redownload?` = true，即 `file.blank? && remote_url.present?`）
+- 或通过 `RedownloadMediaWorker` 后台任务
+
+**重下载核心代码**（MediaProxyController#redownload!）：
 ```ruby
 # app/controllers/media_proxy_controller.rb
 
 def redownload!
   @media_attachment.download_file!
   @media_attachment.download_thumbnail!
-  @media_attachment.created_at = Time.now.utc  # ← 重置创建时间！
-  @media_attachment.save!
+  @media_attachment.created_at = Time.now.utc  # 显式设置 created_at
+  @media_attachment.save!                        # Rails 自动更新 updated_at
 end
 ```
 
-**对不同清理方式的影响：**
+**时间戳变化分析**：
 
-| 场景 | 定时清理行为 | 手动清理行为 |
-|------|-------------|--------------|
-| 热门媒体（反复访问） | `created_at` 持续更新，**永远不会被清理** | 若使用 `--keep-interacted`，则保留；否则可能被清理（取决于 created_at） |
-| 冷门媒体（超过保留期后首次访问） | 触发重新下载，`created_at` 重置，续命成功 | 若已被手动清理过，则无法续命 |
-| 媒体被访问但未重新下载 | 无影响 | 无影响 |
+| 字段 | 变化方式 | 重下载后的值 | 代码依据 |
+|------|----------|-------------|----------|
+| `created_at` | **显式设置** | 当前时间 `Time.now.utc` | 第 650 行：`created_at = Time.now.utc` |
+| `updated_at` | **Rails 自动更新** | 当前时间 | Rails `save!` 触发 `timestamps` 自动更新 |
 
-**重要边界：**
-- 定时清理检查 `updated_at`，但 `redownload!` 只更新 `created_at`，**不更新 `updated_at`**
-- 这意味着：如果媒体的 `updated_at` 早于保留期，但 `created_at` 刚被续命，**定时清理仍会将其视为过期**
+**最终结论**：重下载后，`created_at` 和 `updated_at` **都被刷新为当前时间**。
 
-*（实际上，`save!` 会自动更新 `updated_at`，所以两者都会被更新。这是 Rails 的标准行为。）*
+---
+
+### 3.9.2 时间比较方式的精确分析
+
+#### 定时清理的时间比较
+
+**定时清理的 Scope 定义**（app/models/media_attachment.rb）：
+```ruby
+scope :created_before, ->(value) { where(arel_table[:created_at].lt(value)) }  # created_at < value
+scope :updated_before, ->(value) { where(arel_table[:updated_at].lt(value)) }  # updated_at < value
+```
+
+**定时清理的查询组合**（app/lib/vacuum/media_attachments_vacuum.rb）：
+```ruby
+def media_attachments_past_retention_period
+  MediaAttachment
+    .remote
+    .cached
+    .created_before(@retention_period.ago)  # created_at < N.days.ago
+    .updated_before(@retention_period.ago)  # updated_at < N.days.ago
+end
+```
+
+**定时清理时间比较特性**：
+- 使用 `.lt(value)` = **`<`**（**不包含边界**）
+- 两个条件是 **AND** 关系，必须同时满足
+- 重下载后，两个时间戳都被刷新，所以都不会满足 `< N.days.ago`
+
+#### 手动清理的时间比较
+
+**手动清理的查询**（lib/mastodon/cli/media.rb）：
+```ruby
+attachment_scope = MediaAttachment.cached.remote.where(created_at: ..time_ago)
+```
+
+**手动清理时间比较特性**：
+- Ruby Range `..time_ago` 表示 `created_at <= time_ago`（**包含边界**）
+- **不检查** `updated_at`
+- 重下载后，`created_at` 被刷新，所以不会满足 `<= time_ago`（如果 time_ago 在刷新时间之前）
+
+---
+
+### 3.9.3 精确时间边界对比
+
+**假设条件**：
+- 保留期 N = 7 天
+- 媒体在时间 **T** 被重下载
+
+| 时间点 | created_at | updated_at | 定时清理条件判定 | 手动清理条件判定 |
+|--------|------------|------------|------------------|------------------|
+| 重下载时（T） | T | T | ❌ 否（`T < T-7d`？假） | ❌ 否（`T <= T-7d`？假） |
+| T+6 天 23:59:59 | T | T | ❌ 否（`T < (T+6d23h59m59s)-7d = T-1s`？假） | ❌ 否（`T <= T-1s`？假） |
+| T+7 天 00:00:00 | T | T | ❌ 否（`T < (T+7d)-7d = T`？假，`<` 不包含边界） | ✅ 是（`T <= T`？真，`<=` 包含边界） |
+| T+7 天 00:00:01 | T | T | ✅ 是（`T < (T+7d1s)-7d = T+1s`？真） | ✅ 是（`T <= T+1s`？真） |
+
+**关键发现**：
+- **定时清理**：在 T+7 天整**不会**命中（因为 `< T` 不包含边界），在 T+7 天 1 秒**才会**命中
+- **手动清理**：在 T+7 天整**就会**命中（因为 `<= T` 包含边界）
+
+---
+
+### 3.9.4 对两种清理方式的实际影响
+
+#### 重下载对定时清理的影响
+
+| 重下载前状态 | 重下载后状态 | 定时清理命中情况 |
+|--------------|--------------|------------------|
+| `created_at` = T-10d, `updated_at` = T-10d | `created_at` = T, `updated_at` = T | ❌ 续命成功，**不会**被清理 |
+| `created_at` = T-10d, `updated_at` = T-8d | `created_at` = T, `updated_at` = T | ❌ 续命成功，**不会**被清理 |
+| `created_at` = T-3d, `updated_at` = T-3d | `created_at` = T, `updated_at` = T | ❌ 续命成功，**不会**被清理 |
+
+**结论**：重下载后，定时清理的**两个时间条件都被重置**，媒体获得完整的 N 天续命。
+
+#### 重下载对手动清理的影响
+
+| 重下载前状态 | 重下载后状态 | 手动清理命中情况（`--days 7`） |
+|--------------|--------------|-------------------------------|
+| `created_at` = T-10d | `created_at` = T | ❌ 续命成功，**不会**被清理 |
+| `created_at` = T-3d | `created_at` = T | ❌ 续命成功，**不会**被清理 |
+
+**结论**：重下载后，`created_at` 被重置，手动清理同样**续命成功**。
+
+#### `--keep-interacted` 的特殊影响
+
+手动清理的 `--keep-interacted` 选项：
+```ruby
+# app/models/media_attachment.rb
+
+scope :without_local_interaction, lambda {
+  where.not(Favourite.joins(:account).merge(Account.local)...)  # 未被本地用户收藏
+    .where.not(Bookmark...)                                        # 未被本地用户书签
+    .where.not(Status.local.where(in_reply_to_id: ...)...)        # 未被本地用户回复
+    .where.not(Status.local.where(reblog_of_id: ...)...)          # 未被本地用户转发
+    .where.not(Quote...)                                            # 未被本地用户引用
+}
+```
+
+**影响**：
+- 这是一个**额外的过滤条件**，与时间戳无关
+- 即使时间戳满足清理条件，如果媒体与本地用户有交互，也会**被保留**
+- **定时清理不支持**这个逻辑，定时清理一律清理过期媒体
+
+---
+
+### 3.9.5 最终结论汇总表
+
+| 问题 | 最终答案 | 代码依据 |
+|------|----------|----------|
+| 重下载后 `created_at` 变化？ | ✅ 显式设置为当前时间 `Time.now.utc` | `app/controllers/media_proxy_controller.rb:650` |
+| 重下载后 `updated_at` 变化？ | ✅ Rails `save!` 自动更新为当前时间 | Rails `timestamps` 标准行为 |
+| 定时清理检查哪些字段？ | `created_at` **AND** `updated_at`（AND 关系） | `app/lib/vacuum/media_attachments_vacuum.rb:37-38` |
+| 手动清理检查哪些字段？ | 仅 `created_at` | `lib/mastodon/cli/media.rb:682` |
+| 定时清理时间比较方式？ | `.lt(value)` = **`<`**（不包含边界） | `app/models/media_attachment.rb:214,219` |
+| 手动清理时间比较方式？ | `..time_ago` = **`<=`**（包含边界） | Ruby Range 语法 |
+| 重下载后定时清理是否续命？ | ✅ 是，两个字段都被重置 | 两个时间戳都刷新 |
+| 重下载后手动清理是否续命？ | ✅ 是，`created_at` 被重置 | `created_at` 刷新 |
+| 哪个清理更早命中？ | 手动清理（N 天整就命中，`<=` 包含边界） | 时间比较方式差异 |
+| 哪个清理更晚命中？ | 定时清理（N 天整 + 1 秒才命中，`<` 不包含边界） | 时间比较方式差异 |
+| `--keep-interacted` 哪个支持？ | 仅手动清理，定时清理不支持 | `without_local_interaction` scope 仅在 CLI 中使用 |
+
+---
+
+### 3.9.6 关键代码位置索引
+
+| 功能 | 文件路径 | 行号 |
+|------|----------|------|
+| 重下载时间戳更新 | `app/controllers/media_proxy_controller.rb` | 第 647-652 行 |
+| 定时清理 created_before scope | `app/models/media_attachment.rb` | 第 214 行 |
+| 定时清理 updated_before scope | `app/models/media_attachment.rb` | 第 219 行 |
+| 定时清理查询组合 | `app/lib/vacuum/media_attachments_vacuum.rb` | 第 33-39 行 |
+| 手动清理查询 | `lib/mastodon/cli/media.rb` | 第 682 行 |
+| 交互保留 scope | `app/models/media_attachment.rb` | 第 220-227 行 |
+
+---
+
+## 3.10 "访问即续命"机制的边界影响（已整合到 3.9）
+
+*本小节内容已整合到上方"3.9 缓存失效边界：最终统一口径"中，以确保结论的一致性。*
 
 ---
 
@@ -970,6 +1111,10 @@ backups_retention_period: 7
 
 # 不配置 content_cache_retention_period（保留所有远程状态）
 ```
+**行为说明**：
+- 定时任务每天凌晨 3-5 点清理超过 7 天的远程媒体缓存
+- 热门媒体因"访问即续命"可能永远保留
+- 本地媒体不受影响
 
 #### 场景 2：非常有限的存储空间
 ```yaml
@@ -977,46 +1122,173 @@ backups_retention_period: 7
 media_cache_retention_period: 3
 backups_retention_period: 3
 ```
+**配合手动清理**：
+```bash
+# 每周手动清理一次，保留交互媒体
+tootctl media remove --days 7 --keep-interacted
+```
 
 #### 场景 3：无限存储（不清理远程媒体）
 ```yaml
 # 不配置或设为 0/负数
 media_cache_retention_period: null  # 或 0
 ```
+**行为说明**：
+- `ContentRetentionPolicy#retention_period` 返回 `nil`
+- `MediaAttachmentsVacuum#retention_period?` 返回 `false`
+- `vacuum_cached_files!` 永远不会执行
+- **仅孤立记录会被清理**（1 天前未关联状态的媒体）
 
-### 6.2 监控建议
+#### 场景 4：混合策略（定时 + 手动）
+```yaml
+# 定时任务保留 30 天
+media_cache_retention_period: 30
+```
+```bash
+# 但每周手动清理超过 7 天且无交互的媒体
+tootctl media remove --days 7 --keep-interacted --dry-run  # 先试运行
+tootctl media remove --days 7 --keep-interacted            # 实际执行
+```
 
-1. **定期检查存储使用**：
-   ```bash
-   tootctl media usage
-   ```
+---
 
-2. **试运行清理**：
-   ```bash
-   tootctl media remove --days 7 --dry-run
-   ```
+### 6.2 监控与运维建议
 
-3. **保留交互媒体**：
-   ```bash
-   tootctl media remove --days 30 --keep-interacted
-   ```
+#### 1. 存储使用监控
+```bash
+# 查看当前存储使用情况
+tootctl media usage
+```
 
-### 6.3 注意事项
+**典型输出**：
+```
+Object          Total   Local
+------------------------------
+Attachments     2.5 GB  500 MB
+Custom Emoji    10 MB   2 MB
+Avatars         50 MB   10 MB
+Headers         100 MB  20 MB
+Preview Cards   200 MB  (not applicable)
+Backups         1 GB    (not applicable)
+```
 
-1. **`content_cache_retention_period` 是危险设置**：
-   - 会删除超过保留期的**远程状态本身**（不仅仅是媒体）
-   - 可能导致时间线中出现"此状态已删除"
-   - 仅在极端存储压力下考虑使用
+#### 2. 试运行清理（推荐在实际清理前执行）
+```bash
+# 查看哪些媒体会被清理
+tootctl media remove --days 7 --dry-run
 
-2. **清理是不可逆的**：
-   - 删除的媒体文件无法恢复
-   - 依赖远程实例重新提供（如果仍可用）
+# 带交互保留的试运行
+tootctl media remove --days 30 --keep-interacted --dry-run
+```
 
-3. **S3 批量删除**：
-   - 默认每批 1000 个对象
-   - 可通过 `S3_BATCH_DELETE_LIMIT` 环境变量调整
+#### 3. 强制清理热门媒体
+由于"访问即续命"机制，热门媒体可能永远不会被定时任务清理。如需强制清理：
 
-4. **访问即续命**：
-   - 热门媒体会被反复访问，永远不会被清理
-   - 这是预期行为，但可能导致存储持续增长
-   - 如需强制清理，考虑使用 `--keep-interacted=false` 的手动命令
+```bash
+# 方式 1：手动清理（不保留交互媒体）
+tootctl media remove --days 7
+
+# 方式 2：清理特定域名的媒体（如果某个远程实例占用过多空间）
+# 注意：需要使用 ClearDomainMediaService 或手动 SQL
+```
+
+---
+
+### 6.3 边界情况与注意事项
+
+#### 1. `content_cache_retention_period` 是危险设置
+- **作用**：会删除超过保留期的**远程状态本身**（不仅仅是媒体）
+- **后果**：时间线中出现"此状态已删除"，无法恢复
+- **建议**：除非极端存储压力，否则**不要设置**
+
+#### 2. 本地媒体永远不会被清理
+- 定时清理条件：`.remote`（remote_url 不为空）
+- 手动清理条件：`.remote`
+- **结论**：本地用户上传的媒体不受任何保留期限制
+
+#### 3. 孤立记录的特殊处理
+孤立记录（`unattached`，即 `status_id` 为空的媒体）：
+- **触发条件**：无配置依赖，每次 VacuumScheduler 都会执行
+- **TTL**：硬编码为 1 天（`TTL = 1.day.freeze`）
+- **操作**：`delete`（删除文件 + 删除数据库记录）
+- **无法配置**：这是硬编码的清理逻辑，无设置项
+
+#### 4. 清理是不可逆的
+- 删除的媒体文件无法恢复
+- 依赖远程实例重新提供（如果远程实例仍可用且媒体未被删除）
+- 建议：重要媒体应考虑备份或使用 `--keep-interacted`
+
+#### 5. S3 批量删除配置
+- 默认每批 1000 个对象
+- 可通过环境变量调整：
+  ```bash
+  S3_BATCH_DELETE_LIMIT=500    # 每批 500 个
+  S3_BATCH_DELETE_RETRY=5      # 重试 5 次
+  ```
+
+---
+
+### 6.4 故障排查
+
+#### 问题 1：设置了保留期但媒体未被清理
+**可能原因**：
+1. **保留期设置无效**：设为 0、负数或空字符串
+2. **媒体被"续命"**：热门媒体被反复访问，`created_at` 持续更新
+3. **媒体是本地的**：`remote_url` 为空，永远不会被清理
+4. **媒体未被缓存**：有 `remote_url` 但从未被下载
+
+**排查步骤**：
+```ruby
+# 检查设置值
+Setting.media_cache_retention_period
+
+# 检查哪些媒体会被清理（在 Rails console 中执行）
+retention = 7.days
+MediaAttachment
+  .remote
+  .cached
+  .created_before(retention.ago)
+  .updated_before(retention.ago)
+  .count
+```
+
+#### 问题 2：手动清理与定时清理行为不一致
+**原因**：两种清理的查询条件不同
+- 定时：`created_before` + `updated_before`（双重检查）
+- 手动：仅 `created_at` 检查
+
+**如果需要一致的行为**：
+- 建议优先使用定时任务，手动清理仅作为补充
+- 或使用 `--keep-interacted` 获得更细粒度的控制
+
+#### 问题 3：磁盘空间持续增长
+**可能原因**：
+1. **热门媒体过多**：被反复访问，永远不会被清理
+2. **保留期设置过长**：如 `365` 天
+3. **孤立记录清理失败**：检查 Sidekiq 日志
+
+**解决建议**：
+```bash
+# 手动清理超过 7 天的所有媒体（包括有交互的）
+tootctl media remove --days 7
+
+# 或者更保守地：清理超过 30 天但保留有交互的
+tootctl media remove --days 30 --keep-interacted
+```
+
+---
+
+### 6.5 关键配置速查表
+
+| 配置项 | 类型 | 默认值 | 有效值 | 说明 |
+|--------|------|--------|--------|------|
+| `media_cache_retention_period` | 整数 | 无（不配置） | 正整数 = 生效；0/负数/空 = 不清理 | 远程媒体缓存保留天数 |
+| `content_cache_retention_period` | 整数 | 无（不配置） | 同上 | **危险**：远程状态本身保留天数 |
+| `backups_retention_period` | 整数 | `7` | 同上 | 备份文件保留天数 |
+
+| 命令 | 作用 | 等效定时行为 |
+|------|------|--------------|
+| `tootctl media remove --days 7` | 清理 7 天前的远程媒体 | 不等效（仅检查 `created_at`） |
+| `tootctl media remove --days 7 --keep-interacted` | 清理 7 天前且无交互的媒体 | 不等效（定时不支持交互保留） |
+| `tootctl media remove --days 7 --dry-run` | 试运行，统计但不删除 | 无 |
+| `tootctl media usage` | 查看存储使用统计 | 无 |
