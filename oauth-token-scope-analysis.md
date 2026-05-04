@@ -285,16 +285,64 @@ optional_scopes :profile,
 | `admin:write:email_domain_blocks` | 管理邮箱域名封禁 |
 | `admin:write:canonical_email_blocks` | 管理规范化邮箱封禁 |
 
-### 4.3 范围层级关系
+### 4.3 范围层级关系（继承机制）
 
-Doorkeeper 支持范围的层级关系，使用冒号 `:` 分隔：
+Doorkeeper 支持范围的层级关系，使用冒号 `:` 分隔，实现粗粒度范围到细粒度范围的自动继承。
 
-- `write` 包含所有 `write:*` 范围
-- `read` 包含所有 `read:*` 范围
-- `admin:read` 包含所有 `admin:read:*` 范围
-- `admin:write` 包含所有 `admin:write:*` 范围
+#### 4.3.1 继承规则
 
-例如，如果一个 access token 具有 `write` 范围，那么它自动拥有 `write:statuses`、`write:favourites` 等所有细粒度写入权限。
+| 粗粒度范围 | 自动包含的细粒度范围 |
+|-----------|---------------------|
+| `write` | `write:accounts`, `write:blocks`, `write:bookmarks`, `write:collections`, `write:conversations`, `write:favourites`, `write:filters`, `write:follows`, `write:lists`, `write:media`, `write:mutes`, `write:notifications`, `write:reports`, `write:statuses` |
+| `read` | `read:accounts`, `read:blocks`, `read:bookmarks`, `read:collections`, `read:favourites`, `read:filters`, `read:follows`, `read:lists`, `read:mutes`, `read:notifications`, `read:search`, `read:statuses` |
+| `admin:read` | `admin:read:accounts`, `admin:read:reports`, `admin:read:domain_allows`, `admin:read:domain_blocks`, `admin:read:ip_blocks`, `admin:read:email_domain_blocks`, `admin:read:canonical_email_blocks` |
+| `admin:write` | `admin:write:accounts`, `admin:write:reports`, `admin:write:domain_allows`, `admin:write:domain_blocks`, `admin:write:ip_blocks`, `admin:write:email_domain_blocks`, `admin:write:canonical_email_blocks` |
+
+#### 4.3.2 继承机制示例
+
+**场景 1：Token 具有 `write` 范围**
+- 自动拥有所有 `write:*` 细粒度权限
+- 可以访问任何需要 `write` 或 `write:statuses` 或 `write:favourites` 等的接口
+
+**场景 2：Token 仅具有 `write:statuses` 范围**
+- 只能访问需要 `write:statuses` 的接口
+- 不能访问需要 `write:favourites` 或其他细粒度写入权限的接口
+- 不能访问需要 `write` 粗粒度范围的接口（但实际上 `write` 包含 `write:statuses`，所以应该可以？需要验证）
+
+#### 4.3.3 流式服务中的范围优先级
+
+**位置：** `streaming/index.js:462-487`
+
+```javascript
+const checkScopes = (req, logger, channelName) => new Promise((resolve, reject) => {
+  // The `read` scope has the highest priority, if the token has it
+  // then it can access all streams
+  const requiredScopes = ['read'];
+  
+  // When accessing specifically the notifications stream,
+  // we need a read:notifications, while in all other cases,
+  // we can allow access with read:statuses.
+  if (channelName === 'user:notification') {
+    requiredScopes.push('read:notifications');
+  } else {
+    requiredScopes.push('read:statuses');
+  }
+  
+  if (req.scopes && requiredScopes.some(requiredScope => req.scopes.includes(requiredScope))) {
+    resolve();
+    return;
+  }
+  
+  reject(new AuthenticationError('Access token does not have the required scopes'));
+});
+```
+
+**关键点：**
+1. **`read` 范围优先级最高**：如果 token 具有 `read` 范围，可以访问所有流式 API
+2. **细粒度范围作为备选**：
+   - 通知流需要 `read:notifications`
+   - 其他流需要 `read:statuses`
+3. **匹配规则**：`requiredScopes.some(...)` - 只要 token 具有其中任意一个范围即可通过
 
 ### 4.4 范围强制配置
 
