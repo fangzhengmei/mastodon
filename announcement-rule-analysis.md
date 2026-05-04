@@ -1246,7 +1246,8 @@ end
 | 特性 | 公告 API | 规则 API |
 |------|----------|----------|
 | **端点** | `/api/v1/announcements` | `/api/v1/instance/rules` |
-| **权限要求** | 公开（已读状态需登录） | **完全公开** |
+| **权限要求** | **需登录** (`require_user!`) | **完全公开**（无需登录） |
+| **未登录访问** | 返回 422 错误 | 正常返回数据 |
 | **缓存** | 无特殊缓存 | `cache_even_if_authenticated!` |
 | **响应字段** | 含 `read` 个性化字段 | 纯公共数据 |
 | **更新频率** | 可能频繁变化 | 相对稳定 |
@@ -1705,22 +1706,114 @@ end
 
 ---
 
-## 九、关键设计决策分析
+## 九、权限与审计边界对比
 
-### 9.1 公告系统设计决策
+### 9.1 权限边界详细对比
+
+| 维度 | 公告系统 | 规则系统 |
+|------|----------|----------|
+| **用户 API 权限** | **全部需登录** | **完全公开** |
+| - 列表接口 | `require_user!` + 422 错误（未登录） | 无权限检查，任何人可访问 |
+| - 详情/操作接口 | 需登录 + 特定 OAuth scope | 无操作接口（只读） |
+| **管理后台权限** | 需管理员权限 + Pundit policy | 需管理员权限 + Pundit policy |
+| - 列表 | `authorize :announcement, :index?` | `authorize :rule, :index?` |
+| - 创建 | `authorize :announcement, :create?` | `authorize :rule, :create?` |
+| - 编辑/删除 | `authorize :announcement, :update?/:destroy?` | `authorize @rule, :update?/:destroy?` |
+| **权限设计意图** | 公告包含个性化已读状态，需用户身份识别 | 规则是实例公开信息，无需身份即可获取 |
+
+### 9.2 审计边界详细对比
+
+| 维度 | 公告系统 | 规则系统 |
+|------|----------|----------|
+| **审计日志记录** | **完整记录所有操作** | **无默认记录** |
+| - 创建 | `log_action :create, @announcement` | ❌ 无记录 |
+| - 更新 | `log_action :update, @announcement` | ❌ 无记录 |
+| - 发布/取消发布 | `log_action :update, @announcement` | ❌ 无记录 |
+| - 删除 | `log_action :destroy, @announcement` | ❌ 无记录 |
+| - 调整顺序 | 不适用 | ❌ 无记录 |
+| **审计数据存储** | `action_logs` 表（多态关联） | 无 |
+| **审计设计意图** | 公告是实时推送的重要通知，需追溯谁在何时发布了什么 | 规则变更频率低，影响相对间接 |
+
+### 9.3 权限与审计决策矩阵
+
+| 功能模块 | 用户 API 权限 | 管理 API 权限 | 审计日志 | 设计考量 |
+|----------|--------------|---------------|----------|----------|
+| **公告列表** | 需登录 | 管理员 | ✅ 记录 | 个性化已读状态需用户身份 |
+| **公告标记已读** | 需登录 + `write:accounts` | 不适用 | ❌ 不记录 | 用户自主操作，非管理员行为 |
+| **公告创建/发布** | 不适用 | 管理员 | ✅ 记录 | 重要管理操作，需追溯 |
+| **公告删除** | 不适用 | 管理员 | ✅ 记录 | 重要管理操作，需追溯 |
+| **规则列表** | 完全公开 | 管理员 | ❌ 不记录 | 实例公开信息，无需身份 |
+| **规则创建/编辑** | 不适用 | 管理员 | ❌ 无默认记录 | 变更频率低，可按需添加 |
+| **规则删除/排序** | 不适用 | 管理员 | ❌ 无默认记录 | 变更频率低，可按需添加 |
+
+### 9.4 为规则添加审计日志的方法
+
+如需为规则管理添加审计日志，可在 `app/controllers/admin/rules_controller.rb` 中参照公告的实现：
+
+```ruby
+# 创建规则时添加
+def create
+  @rule = Rule.new(resource_params)
+  if @rule.save
+    log_action :create, @rule  # 添加此行
+    redirect_to admin_rules_path
+  else
+    render :new
+  end
+end
+
+# 更新规则时添加
+def update
+  if @rule.update(resource_params)
+    log_action :update, @rule  # 添加此行
+    redirect_to admin_rules_path
+  else
+    render :edit
+  end
+end
+
+# 删除规则时添加
+def destroy
+  @rule.discard
+  log_action :destroy, @rule  # 添加此行
+  redirect_to admin_rules_path
+end
+
+# 调整顺序时添加
+def move_up
+  @rule.move!(-1)
+  log_action :update, @rule  # 添加此行
+  redirect_to admin_rules_path
+end
+
+def move_down
+  @rule.move!(+1)
+  log_action :update, @rule  # 添加此行
+  redirect_to admin_rules_path
+end
+```
+
+---
+
+## 十、关键设计决策分析
+
+### 10.1 公告系统设计决策
 
 | 决策点 | 设计选择 | 原因分析 |
 |--------|----------|----------|
+| **API 权限** | 全部需登录 (`require_user!`) | 公告包含个性化已读状态，必须识别用户身份 |
 | **已读状态存储** | 独立的 `announcement_mutes` 表 | 每个用户每条公告独立状态，支持快速查询 |
 | **实时推送** | Redis Pub/Sub | 低延迟，只推送给在线用户，不打扰离线用户 |
 | **自动标记已读** | 公告进入视野时触发 | 减少用户操作，提升体验 |
 | **视觉延迟更新** | 公告移出视野后才更新样式 | 避免用户看到"闪烁"效果，提升 UX |
 | **删除方式** | 物理删除 | 公告具有时效性，过期后无需保留 |
+| **审计日志** | 完整记录所有管理操作 | 公告是实时推送的重要通知，需追溯 |
 
-### 9.2 规则系统设计决策
+### 10.2 规则系统设计决策
 
 | 决策点 | 设计选择 | 原因分析 |
 |--------|----------|----------|
+| **API 权限** | 完全公开 | 规则是实例的公开信息，任何人都应能获取 |
 | **删除方式** | 软删除 (Discard gem) | 规则是重要文档，需要保留历史追溯 |
 | **多语言支持** | 独立 `rule_translations` 表 | 灵活支持任意语言，不影响主表结构 |
 | **排序机制** | `priority` 字段 + 重计算所有规则 | 确保排序连续，避免 gap |
