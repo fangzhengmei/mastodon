@@ -27,9 +27,782 @@ NotifyService.call(recipient, type, activity, **options)
                   └──► send_email! (邮件)
 ```
 
-## 二、各渠道分发机制详解
+## 二、Streaming 心跳机制与邮件判定窗口
 
-### 2.1 站内通知 (数据库存储)
+### 2.1 问题背景
+
+邮件发送的核心判断逻辑依赖 `recipient_online?` 方法：
+
+```ruby
+# app/services/notify_service.rb:291-298
+def email_needed?
+  (!recipient_online? || always_send_emails?) && send_email_for_notification_type?
+end
+
+def recipient_online?
+  subscribed_to_streaming_api? || subscribed_to_web_push?
+end
+
+def subscribed_to_streaming_api?
+  redis.exists?("subscribed:timeline:#{@recipient.id}") || 
+  redis.exists?("subscribed:timeline:#{@recipient.id}:notifications")
+end
+```
+
+这里的问题是：`subscribed:timeline:{user_id}` 这些 Redis 键的存在性并不完全等于用户"在线"。它们有自己的生命周期管理机制。
+
+### 2.2 Streaming 心跳机制详解
+
+**入口文件**: `streaming/index.js:274-288`
+
+```javascript
+const subscriptionHeartbeat = channels => {
+  const interval = 6 * 60;  // 心跳周期：6 分钟 = 360 秒
+
+  const tellSubscribed = () => {
+    channels.forEach(channel => 
+      redisClient.set(redisNamespaced(`subscribed:${channel}`), '1', 'EX', interval * 3)
+    );
+  };
+
+  tellSubscribed();  // 立即执行一次
+
+  const heartbeat = setInterval(tellSubscribed, interval * 1000);  // 每 6 分钟执行一次
+
+  return () => {
+    clearInterval(heartbeat);
+  };
+};
+```
+
+### 2.3 关键参数量化
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| **心跳周期** (`interval`) | 6 分钟 (360 秒) | 每次更新 Redis 键的间隔 |
+| **TTL** (`interval * 3`) | 18 分钟 (1080 秒) | Redis 键的过期时间 |
+| **最大"幽灵在线"窗口** | 18 分钟 | 连接断开后，键最长存活时间 |
+
+### 2.4 心跳机制的时序图
+
+```
+时间轴（分钟）:
+  0          6         12         18         24
+  │          │          │          │          │
+  ▼          ▼          ▼          ▼          ▼
+  │          │          │          │          │
+  ├─ 连接建立
+  │  tellSubscribed() ──► Redis 键设置 TTL=18min
+  │          │
+  │          ├─ 心跳 1 ──► 重置 TTL=18min
+  │          │
+  │          │          ├─ 心跳 2 ──► 重置 TTL=18min
+  │          │          │
+  │          │          ├─ 连接断开 (用户关闭页面)
+  │          │          │
+  │          │          │          ├─ Redis 键过期
+  │          │          │          │
+  │          │          │          │
+  ├──────────┴──────────┴──────────┤
+  │      实际在线期间               │
+  │                                 │
+  ├─────────────────────────────────┴───────────────┤
+  │              键存在期间（判定为"在线"）          │
+  │              幽灵在线窗口：最多 18 分钟          │
+  └───────────────────────────────────────────────────┘
+```
+
+### 2.5 对邮件判定的实际影响
+
+#### 场景分析
+
+**场景 1：用户正常在线浏览**
+
+```
+时间线:
+0min: 用户打开页面 → Streaming 连接建立 → Redis 键 TTL=18min
+6min: 心跳 1 → 重置 TTL=18min
+12min: 心跳 2 → 重置 TTL=18min
+15min: 有新通知 → recipient_online? = true → 不发邮件
+18min: 心跳 3 → 重置 TTL=18min
+...
+```
+
+**结果**：用户在线期间，邮件被正确抑制。
+
+**场景 2：用户关闭页面（连接断开）**
+
+```
+时间线:
+0min: 用户打开页面 → Redis 键 TTL=18min
+6min: 心跳 1 → 重置 TTL=18min
+10min: 用户关闭页面 → 连接断开 ❌
+12min: 心跳不再执行（连接已断）
+15min: 有新通知 
+       → Redis 键仍存在（还剩 3min 过期）
+       → recipient_online? = true
+       → 邮件被抑制 ❌（但用户实际已离线）
+28min: Redis 键过期 (10min + 18min = 28min)
+30min: 有新通知 
+       → recipient_online? = false
+       → 邮件正常发送 ✓
+```
+
+**关键发现**：用户关闭页面后，最多 **18 分钟** 内的通知仍会被判定为"在线"，邮件被错误抑制。
+
+#### 邮件延迟的复合效应
+
+邮件本身还有 **2 分钟延迟**：
+
+```ruby
+# app/services/notify_service.rb:282-290
+def send_email!
+  NotificationMailer
+    .with(recipient: @recipient, notification: @notification)
+    .public_send(@notification.type)
+    .deliver_later(wait: 2.minutes)  # 2 分钟延迟
+end
+```
+
+这意味着：
+- 通知发生时 → 检查在线状态 → 决定是否入队
+- 2 分钟后 → 实际发送邮件
+
+**时间窗口叠加**：
+
+| 阶段 | 时间 | 说明 |
+|------|------|------|
+| 通知时刻检查 | T=0 | 基于 Redis 键存在性判断 |
+| 邮件入队延迟 | T+2min | 如果判定在线，不入队；否则入队 2min 后发送 |
+| 最大误判窗口 | 18min | Redis 键最长存活时间 |
+
+**最坏情况**：用户在第 1 分钟关闭页面，第 17 分 59 秒有新通知
+- Redis 键还剩 1 秒过期
+- `recipient_online?` = true
+- 邮件被抑制
+- 用户实际已离线 16 分 59 秒
+
+### 2.6 与 Web Push 的联动
+
+`recipient_online?` 同时检查两个渠道：
+
+```ruby
+def recipient_online?
+  subscribed_to_streaming_api? || subscribed_to_web_push?
+end
+```
+
+这意味着：
+- 如果用户**订阅了 Web Push**，即使关闭了浏览器页面，`subscribed_to_web_push?` 仍可能返回 true
+- 邮件会被持续抑制，直到 Web Push 订阅过期或被撤销
+
+**Web Push 订阅的生命周期**：
+- Web Push 订阅是持久化的，存储在 `web_push_subscriptions` 表
+- 不会随浏览器关闭而消失
+- 只有用户手动撤销或推送失败时才会被清理
+
+**对邮件判定的影响**：
+- 如果用户启用了 Web Push，邮件可能被**长期抑制**
+- 这是设计意图（Web Push 作为实时通知渠道）
+- 但如果 Web Push 实际不可用（如浏览器未打开），用户可能长时间收不到通知
+
+### 2.7 缓解机制：always_send_emails 设置
+
+用户可以通过设置覆盖此行为：
+
+```ruby
+# app/models/user_settings.rb:39-41
+namespace :notification_emails do
+  setting :always_send, default: false
+  # ...
+end
+```
+
+当 `always_send_emails?` 为 true 时：
+
+```ruby
+def email_needed?
+  (!recipient_online? || always_send_emails?) && send_email_for_notification_type?
+  #                    ^^^^^^^^^^^^^^^^^^^^^
+  #                    这个条件为 true 时，忽略在线状态
+end
+```
+
+### 2.8 心跳机制的边界情况
+
+| 场景 | 实际在线 | Redis 键存在 | 邮件判定 | 结果 |
+|------|---------|-------------|---------|------|
+| 用户活跃浏览 | ✅ 是 | ✅ 是 | 在线 = 不发邮件 | ✓ 正确 |
+| 刚关闭页面（<18min） | ❌ 否 | ✅ 是 | 在线 = 不发邮件 | ✗ 误判 |
+| 关闭页面很久（>18min） | ❌ 否 | ❌ 否 | 离线 = 发邮件 | ✓ 正确 |
+| 订阅 Web Push | 可能否 | ✅ 是（Web Push） | 在线 = 不发邮件 | 设计意图 |
+| 多设备同时在线 | ✅ 是 | ✅ 是 | 在线 = 不发邮件 | ✓ 正确 |
+
+---
+
+## 三、LocalNotificationWorker 并发风险分析
+
+### 3.1 核心实现回顾
+
+**入口文件**: `app/workers/local_notification_worker.rb:1-23`
+
+```ruby
+class LocalNotificationWorker
+  include Sidekiq::Worker
+
+  def perform(receiver_account_id, activity_id, activity_class_name, type = nil, options = {})
+    receiver = Account.find(receiver_account_id)
+    activity = activity_class_name.constantize.find(activity_id)
+
+    # 注释说明：大多数通知类型应该只存在一条记录
+    if %w(update quoted_update collection_update).include?(type)
+      # 策略A：更新类通知 - 删除旧的，创建新的
+      Notification.where(account: receiver, activity: activity, type: type).in_batches.delete_all
+    elsif Notification.where(account: receiver, activity: activity, type: type).any?
+      # 策略B：普通通知 - 已存在则直接返回
+      return
+    end
+
+    NotifyService.new.call(receiver, type || activity_class_name.underscore, activity, **options.symbolize_keys)
+  rescue ActiveRecord::RecordNotFound
+    true
+  end
+end
+```
+
+### 3.2 竞态条件分析
+
+这段代码存在经典的 **"检查后操作" (Check-Then-Act)** 竞态条件：
+
+```
+时间线:
+Worker A                          Worker B
+─────────────────────────────────────────────────────
+1. 查询：是否存在？
+   → 结果：不存在
+                                  2. 查询：是否存在？
+                                     → 结果：不存在
+3. 调用 NotifyService
+   → 创建通知记录 #1
+   → 推送 Streaming
+   → 推送 Web Push
+   → 发送邮件
+                                  4. 调用 NotifyService
+                                     → 创建通知记录 #2 ⚠️ 重复！
+                                     → 推送 Streaming ⚠️ 重复！
+                                     → 推送 Web Push ⚠️ 重复！
+                                     → 发送邮件 ⚠️ 重复！
+```
+
+### 3.3 为什么会发生并发？
+
+`LocalNotificationWorker` 被大量服务异步调用：
+
+| 调用场景 | 可能的并发源 |
+|---------|-------------|
+| `FollowService` | 分布式环境中多次处理同一 Follow 事件 |
+| `FavouriteService` | 同一点赞的重复处理 |
+| `ReblogService` | 同一转发的重复处理 |
+| `FanOutOnWriteService` | 提及通知的多次投递 |
+| ActivityPub 处理 | 联邦环境中重复的 inbox 投递 |
+| Sidekiq 重试 | 任务失败后重试，原任务可能仍在执行 |
+
+**典型场景**：
+1. ActivityPub 投递延迟，发起重试
+2. 两次 `Announce` 活动（转发）几乎同时到达
+3. Sidekiq 任务超时，自动重试
+
+### 3.4 数据库层面的问题：缺少唯一约束
+
+**对比两张表的索引设计**：
+
+**notifications 表** (`db/schema.rb:843-858`):
+
+```ruby
+create_table "notifications", force: :cascade do |t|
+  t.bigint "account_id", null: false
+  t.bigint "activity_id", null: false
+  t.string "activity_type", null: false
+  # ... 其他字段
+  
+  # ⚠️ 注意：没有唯一约束！
+  t.index ["activity_id", "activity_type"], name: "index_notifications_on_activity_id_and_activity_type"
+  t.index ["from_account_id"], name: "index_notifications_on_from_account_id"
+  # ... 其他索引
+end
+```
+
+**notification_requests 表** (`db/schema.rb:831-841`):
+
+```ruby
+create_table "notification_requests", id: :bigint, ... do |t|
+  t.bigint "account_id", null: false
+  t.bigint "from_account_id", null: false
+  # ... 其他字段
+  
+  # ✅ 有唯一约束！
+  t.index ["account_id", "from_account_id"], 
+    name: "index_notification_requests_on_account_id_and_from_account_id", 
+    unique: true  # 唯一约束
+end
+```
+
+### 3.5 两张表的设计对比
+
+| 维度 | notifications | notification_requests |
+|------|---------------|----------------------|
+| **唯一约束** | ❌ 无 | ✅ `(account_id, from_account_id)` |
+| **去重键** | `(account_id, activity_id, activity_type, type)` | `(account_id, from_account_id)` |
+| **去重方式** | 应用层查询检查 | 数据库唯一约束 + `find_or_initialize_by` |
+| **并发安全** | ❌ 存在竞态条件 | ✅ 数据库层面保证 |
+| **去重粒度** | 细粒度（按活动） | 粗粒度（按发送者） |
+
+### 3.6 notification_requests 的正确实现
+
+**入口文件**: `app/services/notify_service.rb:241-247`
+
+```ruby
+def update_notification_request!
+  return unless %i(mention quote).include?(@notification.type)
+
+  # 使用 find_or_initialize_by + 数据库唯一约束
+  notification_request = NotificationRequest.find_or_initialize_by(
+    account_id: @recipient.id, 
+    from_account_id: @notification.from_account_id
+  )
+  notification_request.last_status_id = @notification.target_status.id
+  notification_request.save
+end
+```
+
+**即使并发，数据库层面也能保证**：
+
+```
+Worker A                          Worker B
+─────────────────────────────────────────────────────
+1. find_or_initialize_by
+   → 不存在，initialize 新对象
+                                  2. find_or_initialize_by
+                                     → 不存在，initialize 新对象
+3. save
+   → INSERT 语句
+   → 成功 ✓
+                                  4. save
+                                     → INSERT 语句
+                                     → 违反唯一约束 ❌
+                                     → 抛出 RecordNotUnique
+                                     → Rails 重试查询（内部机制）
+                                     → 找到 Worker A 创建的记录
+                                     → 更新 instead of 插入 ✓
+```
+
+### 3.7 notifications 表缺少唯一约束的影响
+
+#### 可能的后果
+
+| 后果 | 影响范围 | 严重程度 |
+|------|---------|---------|
+| 站内通知重复显示 | 用户体验 | 中 |
+| Streaming 重复推送 | 用户体验 | 中 |
+| Web Push 重复推送 | 用户体验（打扰） | 高 |
+| 邮件重复发送 | 用户体验（打扰） | 高 |
+| 数据库垃圾数据 | 存储/性能 | 低 |
+
+#### 为什么这是一个问题？
+
+1. **用户体验**：重复通知会打扰用户
+2. **信任问题**：用户可能认为系统不可靠
+3. **资源浪费**：重复的 Web Push 和邮件消耗系统资源
+
+#### 当前的"缓解"措施
+
+代码注释暗示了这个问题的已知性：
+
+```ruby
+# For most notification types, only one notification should exist, and the older one is
+# preferred. For updates, such as when a status is edited, the new notification
+# should replace the previous ones.
+```
+
+但实际实现依赖应用层检查，无法保证并发安全。
+
+### 3.8 可能的修复方案
+
+#### 方案 A：添加数据库唯一约束（推荐）
+
+```ruby
+# 迁移文件
+add_index :notifications, 
+  [:account_id, :activity_id, :activity_type, :type],
+  unique: true,
+  name: 'index_notifications_on_unique_activity'
+```
+
+**优点**：
+- 数据库层面保证，最可靠
+- 应用层无需改变（或只需添加异常处理）
+
+**缺点**：
+- 需要数据迁移
+- 现有数据可能有重复，需要先清理
+
+#### 方案 B：使用数据库锁
+
+```ruby
+def perform(...)
+  # 使用 advisory lock 或行级锁
+  Notification.transaction do
+    # 加锁查询
+    existing = Notification.lock("FOR UPDATE")
+      .find_by(account: receiver, activity: activity, type: type)
+    
+    if existing
+      return unless update_type
+      existing.destroy
+    end
+    
+    NotifyService.new.call(...)
+  end
+end
+```
+
+**优点**：
+- 无需迁移
+- 相对安全
+
+**缺点**：
+- 可能引入死锁
+- 性能开销
+
+#### 方案 C：使用 Redis 分布式锁
+
+```ruby
+def perform(...)
+  lock_key = "notify:#{receiver.id}:#{activity.id}:#{type}"
+  
+  # 使用 Redis SETNX 获取锁
+  redis.set(lock_key, '1', nx: true, ex: 30) do |locked|
+    if locked
+      begin
+        # 原有逻辑
+      ensure
+        redis.del(lock_key)
+      end
+    end
+  end
+end
+```
+
+**优点**：
+- 跨进程/跨机器有效
+- 性能较好
+
+**缺点**：
+- Redis 单点故障风险
+- 锁过期时间需要谨慎设置
+
+### 3.9 实际发生频率评估
+
+虽然代码存在竞态条件，但在实际生产环境中：
+
+1. **Sidekiq 默认配置**：
+   - 大多数任务不会频繁重试
+   - 任务执行相对较快
+
+2. **联邦场景**：
+   - 重复的 ActivityPub 投递确实可能发生
+   - 但通常有一定时间间隔，竞态窗口较小
+
+3. **实际影响**：
+   - 这是一个"罕见但可能发生"的问题
+   - 一旦发生，用户体验较差
+
+---
+
+## 四、notification_requests 对照分析
+
+### 4.1 什么是 NotificationRequest？
+
+当通知被标记为 `filtered = true` 时（根据 `FilterCondition`），它不会直接推送给用户，而是生成一个 `NotificationRequest`，等待用户审核。
+
+**触发条件** (`app/services/notify_service.rb:219-226`):
+
+```ruby
+# It's possible the underlying activity has been deleted
+# between the save call and now
+return if @notification.activity.nil?
+
+if @notification.filtered?
+  update_notification_request!    # 生成通知请求
+else
+  push_notification!               # 正常推送
+  push_to_conversation! if direct_message?
+  send_email! if email_needed?
+end
+```
+
+### 4.2 两张表的功能对比
+
+| 维度 | notifications | notification_requests |
+|------|---------------|----------------------|
+| **用途** | 正常通知记录 | 过滤后的通知请求 |
+| **显示位置** | 通知列表 | 通知请求列表（单独入口） |
+| **推送渠道** | Streaming / Web Push / 邮件 | ❌ 不推送任何渠道 |
+| **用户操作** | 可直接查看/交互 | 需审核（接受/拒绝） |
+| **生命周期** | 可被读取/清除 | 可被接受/拒绝/忽略 |
+
+### 4.3 数据模型对比
+
+**NotificationRequest 模型** (`app/models/notification_request.rb`):
+
+```ruby
+# == Schema Information
+#
+# Table name: notification_requests
+#
+#  id                  :bigint(8)        not null, primary key
+#  notifications_count :bigint(8)        default(0), not null
+#  created_at          :datetime         not null
+#  updated_at          :datetime         not null
+#  account_id          :bigint(8)        not null
+#  from_account_id     :bigint(8)        not null
+#  last_status_id      :bigint(8)
+#
+
+class NotificationRequest < ApplicationRecord
+  MAX_MEANINGFUL_COUNT = 100
+
+  belongs_to :account
+  belongs_to :from_account, class_name: 'Account'
+  belongs_to :last_status, class_name: 'Status'
+
+  before_save :prepare_notifications_count
+
+  def prepare_notifications_count
+    self.notifications_count = Notification
+      .where(
+        account: account, 
+        from_account: from_account, 
+        type: [:mention, :quote], 
+        filtered: true
+      )
+      .limit(MAX_MEANINGFUL_COUNT)
+      .count
+  end
+end
+```
+
+### 4.4 去重设计对比
+
+#### notifications 表的去重设计
+
+```ruby
+# app/workers/local_notification_worker.rb
+if %w(update quoted_update collection_update).include?(type)
+  Notification.where(account: receiver, activity: activity, type: type).in_batches.delete_all
+elsif Notification.where(account: receiver, activity: activity, type: type).any?
+  return
+end
+```
+
+**去重键**：`(account_id, activity_id, activity_type, type)`
+
+**粒度**：按**活动**去重（同一个 Follow、同一个 Favourite 等）
+
+#### notification_requests 表的去重设计
+
+```ruby
+# app/services/notify_service.rb:241-247
+def update_notification_request!
+  return unless %i(mention quote).include?(@notification.type)
+
+  notification_request = NotificationRequest.find_or_initialize_by(
+    account_id: @recipient.id, 
+    from_account_id: @notification.from_account_id  # 按发送者
+  )
+  notification_request.last_status_id = @notification.target_status.id
+  notification_request.save
+end
+```
+
+**去重键**：`(account_id, from_account_id)`
+
+**粒度**：按**发送者**去重（同一人的所有提及/引用聚合）
+
+### 4.5 聚合逻辑对比
+
+#### notifications 的聚合：group_key 机制
+
+- 按**类型 + 目标**聚合
+- `favourite/reblog`: 同一嘟文的互动聚合
+- `follow`: 所有新关注聚合
+- 时间窗口：12 小时
+
+#### notification_requests 的聚合：发送者聚合
+
+- 按**发送者账户**聚合
+- 同一人的多条 mention/quote 合并为一个请求
+- `notifications_count` 记录数量
+- `last_status_id` 指向最新的嘟文
+
+**聚合计算** (`app/models/notification_request.rb:51-53`):
+
+```ruby
+def prepare_notifications_count
+  self.notifications_count = Notification
+    .where(
+      account: account, 
+      from_account: from_account, 
+      type: [:mention, :quote],   # 仅这两种类型
+      filtered: true               # 仅被过滤的
+    )
+    .limit(MAX_MEANINGFUL_COUNT)  # 最多 100
+    .count
+end
+```
+
+### 4.6 唯一约束的设计哲学对比
+
+#### 为什么 notification_requests 有唯一约束？
+
+```ruby
+# db/schema.rb:838
+t.index ["account_id", "from_account_id"], 
+  name: "index_notification_requests_on_account_id_and_from_account_id", 
+  unique: true
+```
+
+**原因分析**：
+
+1. **聚合需求更强**：
+   - `NotificationRequest` 的核心就是**按发送者聚合**
+   - 同一发送者只应该有一个待审核请求
+   - 数据模型本身就是聚合体
+
+2. **更新频率更高**：
+   - 同一人可能发送多条提及
+   - `update_notification_request!` 可能被频繁调用
+   - 竞态风险更高
+
+3. **数据一致性要求**：
+   - `notifications_count` 是聚合计算的
+   - 如果存在重复记录，计数会混乱
+
+#### 为什么 notifications 没有唯一约束？
+
+**可能的设计考虑**：
+
+1. **历史原因**：
+   - 早期版本可能没有考虑到并发问题
+   - 后来添加的"检查后操作"逻辑是补丁方案
+
+2. **多态复杂性**：
+   - `activity_type` 是多态字段
+   - 唯一约束需要包含 `type`（区分 `update` 和普通通知）
+   - 某些通知类型可能不需要去重
+
+3. **策略差异**：
+   - `update` 类型需要删除旧的、创建新的
+   - 其他类型需要跳过已存在的
+   - 唯一约束的行为可能与这些策略不完全匹配
+
+### 4.7 处理流程对比
+
+#### 正常通知流程
+
+```
+LocalNotificationWorker
+    │
+    ▼
+检查是否存在 (account, activity, type)
+    │
+    ├──► 存在且是 update 类型 → 删除旧的，创建新的
+    │
+    ├──► 存在且非 update → 直接返回 (去重)
+    │
+    └──► 不存在 → 继续
+              │
+              ▼
+         NotifyService.call()
+              │
+              ▼
+         ┌────┴────┐
+         ▼         ▼
+    filtered=true  filtered=false
+         │              │
+         ▼              ▼
+    update_notification  push_to_streaming
+    _request!            push_to_web_push
+                          send_email (如需要)
+```
+
+#### 通知请求流程
+
+```
+filtered = true 的通知
+         │
+         ▼
+update_notification_request!
+         │
+         ▼
+find_or_initialize_by (account_id, from_account_id)
+         │
+         ▼
+    ┌────┴────┐
+    ▼         ▼
+  存在记录   新记录
+    │         │
+    ▼         ▼
+更新字段    新记录
+last_status_id
+notifications_count
+    │         │
+    └────┬────┘
+         ▼
+      save()
+         │
+         ▼
+    数据库唯一约束
+         │
+         ▼
+    并发安全保证
+```
+
+### 4.8 两张表的关系
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           通知事件流                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────┴─────────────────┐
+                    ▼                                   ▼
+            filtered = false                   filtered = true
+                    │                                   │
+                    ▼                                   ▼
+┌───────────────────────────┐         ┌───────────────────────────────────┐
+│    notifications 表        │         │      notification_requests 表      │
+│                           │         │                                   │
+│ - 所有通知记录             │         │ - 仅 mention/quote 类型            │
+│ - 按 activity 去重         │         │ - 按 from_account 聚合             │
+│ - 无唯一约束               │         │ - 有唯一约束 (account+from_account) │
+│ - 推送到所有渠道           │         │ - 不推送，等待审核                 │
+│ - 可被分组展示 (group_key) │         │ - notifications_count 聚合计数      │
+└───────────────────────────┘         └───────────────────────────────────┘
+                    │                                   │
+                    └─────────────────┬─────────────────┘
+                                      │
+                                      ▼
+                    notification_requests 通过外键关联
+                    到 notifications (间接，通过 count 查询)
+```
+
+---
+
+## 五、各渠道分发机制详解
+
+### 5.1 站内通知 (数据库存储)
 
 **入口文件**: `app/models/notification.rb`
 
@@ -55,7 +828,7 @@ PROPERTIES = {
 }
 ```
 
-### 2.2 Streaming API (实时 WebSocket)
+### 5.2 Streaming API (实时 WebSocket)
 
 **入口文件**: `app/services/notify_service.rb:254-260`
 
@@ -76,7 +849,7 @@ end
 - 使用 Redis Pub/Sub 机制
 - Streaming Server 订阅 Redis 频道，实时推送给 WebSocket 客户端
 
-### 2.3 Web Push (浏览器推送)
+### 5.3 Web Push (浏览器推送)
 
 **入口文件**: `app/services/notify_service.rb:270-276`
 
@@ -112,7 +885,7 @@ end
 - 支持标准和 legacy 两种加密方式
 - 4xx 错误会清理无效订阅
 
-### 2.4 邮件通知
+### 5.4 邮件通知
 
 **入口文件**: `app/services/notify_service.rb:282-305`
 
@@ -135,49 +908,17 @@ def email_needed?
 end
 ```
 
-三个关键条件：
-
-1. **用户在线状态** (`recipient_online?`):
-   ```ruby
-   def recipient_online?
-     subscribed_to_streaming_api? || subscribed_to_web_push?
-   end
-   ```
-   - 如果用户在线（订阅了 Streaming 或 Web Push），默认不发邮件
-
-2. **总是发送邮件** (`always_send_emails?`):
-   - 用户设置 `settings['always_send_emails']` 可以覆盖在线状态判断
-
-3. **通知类型允许** (`send_email_for_notification_type?`):
-   ```ruby
-   def send_email_for_notification_type?
-     NON_EMAIL_TYPES.exclude?(@notification.type) && @recipient.user.settings["notification_emails.#{@notification.type}"]
-   end
-   ```
-
 **不发送邮件的类型** (`NON_EMAIL_TYPES`):
 - `admin.report`, `admin.sign_up`
 - `update`, `quoted_update`, `poll`, `status`
 - `moderation_warning`, `severed_relationships`, `annual_report`
 - `added_to_collection`, `collection_update`
 
-**邮件通知设置** (`app/models/user_settings.rb:45-57`):
+---
 
-```ruby
-namespace :notification_emails do
-  setting :follow, default: true
-  setting :reblog, default: false
-  setting :favourite, default: false
-  setting :mention, default: true
-  setting :quote, default: true
-  setting :follow_request, default: true
-  # ... 更多
-end
-```
+## 六、用户偏好与通知过滤机制
 
-## 三、用户偏好与通知过滤机制
-
-### 3.1 三层过滤体系
+### 6.1 三层过滤体系
 
 通知在分发前会经过三层过滤：
 
@@ -200,7 +941,7 @@ end
 └───────────────┘
 ```
 
-### 3.2 DropCondition (完全丢弃)
+### 6.2 DropCondition (完全丢弃)
 
 **入口文件**: `app/services/notify_service.rb:102-163`
 
@@ -216,19 +957,7 @@ end
 | `conversation_muted?` | 会话被静音 |
 | `blocked_mention?` | 提及被过滤 (feed filter) |
 
-**策略过滤** (需同时满足):
-- `filterable_type?` - 通知类型可过滤
-- 非 `override_for_sender?` - 没有针对该发送者的权限
-- 非 staff 消息
-
-策略选项 (`NotificationPolicy`):
-- `drop_not_following?` - 未关注的人
-- `drop_not_followers?` - 非关注者
-- `drop_new_accounts?` - 新注册账户 (30天内)
-- `drop_private_mentions?` - 非回复的私密提及
-- `drop_limited_accounts?` - 受限账户
-
-### 3.3 FilterCondition (过滤到通知请求)
+### 6.3 FilterCondition (过滤到通知请求)
 
 **入口文件**: `app/services/notify_service.rb:165-199`
 
@@ -237,9 +966,7 @@ end
 - 不推送到 Streaming/Web Push/邮件
 - 生成 `NotificationRequest` 等待用户审核
 
-过滤条件与 DropCondition 类似，但使用 `filter_*` 策略而非 `drop_*`。
-
-### 3.4 NotificationPolicy 模型
+### 6.4 NotificationPolicy 模型
 
 **入口文件**: `app/models/notification_policy.rb`
 
@@ -258,7 +985,9 @@ enum :for_limited_accounts, { accept: 0, filter: 1, drop: 2 }, suffix: :limited_
 - `filter`: 过滤到通知请求
 - `drop`: 完全丢弃
 
-## 四、三层去重机制详解
+---
+
+## 七、三层去重机制详解
 
 Mastodon 的通知去重机制分布在三个不同层面，形成完整的去重体系：
 
@@ -268,92 +997,11 @@ Mastodon 的通知去重机制分布在三个不同层面，形成完整的去�
 | **第二层** | Web Push 客户端聚合 | 浏览器显示时 | Web Push |
 | **第三层** | 通知列表分组展示 | 用户查看时 | API/前端 |
 
----
+### 7.1 第一层：源头重复拦截
 
-### 4.1 第一层：源头重复拦截
+详见本章前文关于 `LocalNotificationWorker` 的分析。
 
-**入口文件**: `app/workers/local_notification_worker.rb`
-
-这是最底层的去重机制，在通知创建之前拦截重复事件。
-
-#### 核心实现
-
-```ruby
-def perform(receiver_account_id, activity_id, activity_class_name, type = nil, options = {})
-  receiver = Account.find(receiver_account_id)
-  activity = activity_class_name.constantize.find(activity_id)
-
-  # 两种处理策略
-  if %w(update quoted_update collection_update).include?(type)
-    # 策略A：更新类通知 - 删除旧的，创建新的
-    Notification.where(account: receiver, activity: activity, type: type).in_batches.delete_all
-  elsif Notification.where(account: receiver, activity: activity, type: type).any?
-    # 策略B：普通通知 - 已存在则直接返回
-    return
-  end
-
-  NotifyService.new.call(receiver, type || activity_class_name.underscore, activity, **options.symbolize_keys)
-end
-```
-
-#### 去重键
-
-去重基于三元组 `(account_id, activity_id, activity_type, type)`：
-
-| 字段 | 说明 |
-|------|------|
-| `account_id` | 接收者账户 ID |
-| `activity_id` | 关联活动 ID (如 Follow、Favourite、Mention 等) |
-| `activity_type` | 活动类型 |
-| `type` | 通知类型 (可选，用于区分同一活动的不同通知类型) |
-
-#### 两种处理策略
-
-| 策略 | 适用类型 | 行为 | 设计意图 |
-|------|---------|------|---------|
-| **替换策略** | `update`, `quoted_update`, `collection_update` | 删除旧通知，创建新通知 | 编辑嘟文时，用新通知替换旧通知，用户看到最新状态 |
-| **去重策略** | 其他所有类型 | 已存在则直接返回，不重复创建 | 防止同一事件（如点赞、转发）产生多条通知 |
-
-#### 触发场景
-
-`LocalNotificationWorker` 被以下服务调用：
-
-| 服务 | 调用场景 | 活动类型 |
-|------|---------|---------|
-| `FollowService` | 关注用户 | `Follow` |
-| `FavouriteService` | 点赞嘟文 | `Favourite` |
-| `ReblogService` | 转发嘟文 | `Status` |
-| `FanOutOnWriteService` | 发布嘟文时提及/引用 | `Mention`, `Quote` |
-| `PollExpirationNotifyWorker` | 投票结束 | `Poll` |
-| `CreateCollectionService` | 创建收藏集 | `CollectionItem` |
-| `Admin::BaseAction` | 管理员 moderation | `AccountWarning` |
-
-#### 对各渠道的影响
-
-- **站内通知**：直接避免重复记录
-- **Streaming API**：避免重复推送
-- **Web Push**：避免重复推送
-- **邮件**：避免重复发送
-
-#### 时间窗口
-
-- **无时间窗口限制**：基于数据库查询，只要记录存在就去重
-- 依赖 `notifications` 表的存在性检查
-
-#### 数据库层面的辅助
-
-虽然没有数据库唯一约束（`(account_id, activity_id, activity_type, type)`），但 `LocalNotificationWorker` 的存在性检查起到了相同作用：
-
-```ruby
-# schema.rb 中 notifications 表的索引
-t.index ["activity_id", "activity_type"], name: "index_notifications_on_activity_id_and_activity_type"
-```
-
-这个索引加速了去重查询。
-
----
-
-### 4.2 第二层：Web Push 客户端聚合
+### 7.2 第二层：Web Push 客户端聚合
 
 **入口文件**: `app/javascript/mastodon/service_worker/web_push_notifications.js`
 
@@ -402,138 +1050,31 @@ const notify = options =>
 | 已有 1 条分组通知 | 追加内容到该分组 |
 | 通知数 < 5 且无分组 | 正常显示单个通知 |
 
-#### 单个通知的去重标识
-
-```javascript
-// handlePush 函数中
-options.tag = notification.id;  // 使用通知 ID 作为 tag
-```
-
-浏览器 Notification API 的 `tag` 属性有特殊行为：
-- 如果新通知的 `tag` 与已显示通知相同，**新通知会替换旧通知**
-- 这是浏览器层面的隐式去重机制
-
-#### 分组通知的结构
-
-```javascript
-{
-  title: "5 条新通知",  // 本地化字符串
-  body: "Alice 喜欢了你的嘟文\nBob 关注了你\n...",
-  tag: GROUP_TAG,        // 固定值 'tag'
-  data: {
-    url: '/notifications',
-    count: 5,              // 累计数量
-    preferred_locale: 'zh-CN'
-  }
-}
-```
-
-#### 对各渠道的影响
-
-- **Web Push**：客户端层面合并展示，不影响服务端数据
-- **其他渠道**：无影响
-
-#### 时间窗口
-
-- **实时**：浏览器收到推送时立即判断
-- **持久化**：通知显示在系统通知中心直到用户关闭
-
-#### 设计意图
-
-1. **避免通知轰炸**：同一时间过多通知会打扰用户
-2. **信息聚合**：将相似通知合并展示
-3. **渐进式去重**：
-   - 1-4 条：单独显示
-   - 5 条及以上：分组显示
-
----
-
-### 4.3 第三层：通知列表分组展示
+### 7.3 第三层：通知列表分组展示
 
 这是最上层的去重机制，在用户查看通知列表时进行分组展示。分为**服务端分组**和**前端聚合**两部分。
 
-#### 第一部分：服务端分组 (group_key)
+#### 服务端分组 (group_key)
 
 **入口文件**: `app/models/concerns/notification/groups.rb`
 
-##### 可分组的通知类型
-
 ```ruby
 GROUPABLE_NOTIFICATION_TYPES = %i(favourite reblog follow admin.sign_up).freeze
-MAXIMUM_GROUP_SPAN_HOURS = 12
-```
-
-##### 分组键生成逻辑
-
-```ruby
-def set_group_key!
-  return if filtered? || GROUPABLE_NOTIFICATION_TYPES.exclude?(type)
-
-  type_prefix = case type
-                when :favourite, :reblog
-                  [type, target_status&.id].join('-')  # 按状态分组
-                when :follow, :'admin.sign_up'
-                  type                                   # 按类型分组
-                else
-                  raise NotImplementedError
-                end
-  redis_key   = "notif-group/#{account.id}/#{type_prefix}"
-  hour_bucket = activity.created_at.utc.to_i / 1.hour.to_i
-
-  # 复用前一个分组（如果时间跨度不超过12小时）
-  previous_bucket = redis.get(redis_key).to_i
-  hour_bucket = previous_bucket if hour_bucket < previous_bucket + MAXIMUM_GROUP_SPAN_HOURS
-
-  redis.set(redis_key, hour_bucket, ex: MAXIMUM_GROUP_SPAN_HOURS.hours.to_i)
-
-  self.group_key = "#{type_prefix}-#{hour_bucket}"
-end
+MAXIMUM_GROUP_SPAN_HOURS = 12  # 12小时时间窗口
 ```
 
 ##### 分组规则
 
-| 通知类型 | 分组依据 | 示例 group_key | 分组逻辑 |
-|---------|---------|----------------|---------|
-| `favourite` | type + target_status_id | `favourite-12345-456789` | 同一嘟文的点赞合并 |
-| `reblog` | type + target_status_id | `reblog-12345-456789` | 同一嘟文的转发合并 |
-| `follow` | type | `follow-456789` | 所有新关注合并 |
-| `admin.sign_up` | type | `admin.sign_up-456789` | 所有新用户注册合并 |
+| 通知类型 | 分组依据 | 示例 group_key |
+|---------|---------|----------------|
+| `favourite` | type + target_status_id | `favourite-12345-456789` |
+| `reblog` | type + target_status_id | `reblog-12345-456789` |
+| `follow` | type | `follow-456789` |
+| `admin.sign_up` | type | `admin.sign_up-456789` |
 
-##### 时间窗口机制
-
-```ruby
-MAXIMUM_GROUP_SPAN_HOURS = 12  # 12小时
-```
-
-- 使用 Redis 键 `notif-group/{account_id}/{type_prefix}` 存储最后一个小时桶
-- 如果新通知的时间与最后一个分组的时间差 **< 12 小时**，复用同一分组
-- 超过 12 小时创建新分组
-- Redis 键过期时间 = 12 小时
-
-##### 服务端分组查询
-
-**入口文件**: `app/models/concerns/notification/groups.rb:38-126`
-
-`paginate_groups` 使用递归 CTE 实现分组分页：
-
-```sql
-WITH RECURSIVE grouped_notifications AS (
-  -- Base case: 获取第一条通知
-  SELECT notifications.*, ARRAY[group_key] AS groups ...
-  
-  -- Recursive case: 获取不同 group_key 的下一条通知
-  UNION ALL
-  SELECT ... WHERE group_key NOT IN (visited groups)
-)
-```
-
-这确保了每页中相同 `group_key` 的通知只出现一次（取最新的）。
-
-#### 第二部分：前端聚合
+#### 前端聚合
 
 **入口文件**: `app/javascript/mastodon/reducers/notification_groups.ts`
-
-##### 核心聚合逻辑
 
 ```typescript
 function processNewNotification(
@@ -541,13 +1082,6 @@ function processNewNotification(
   notification: ApiNotificationJSON,
   groupedTypes: NotificationType[],
 ) {
-  if (!groupedTypes.includes(notification.type)) {
-    notification = {
-      ...notification,
-      group_key: `ungrouped-${notification.id}`,
-    };
-  }
-
   // 查找现有分组
   const existingGroupIndex = groups.findIndex(
     (group) =>
@@ -555,21 +1089,13 @@ function processNewNotification(
   );
 
   if (existingGroupIndex > -1) {
-    const existingGroup = groups[existingGroupIndex];
+    // 追加到现有分组
+    existingGroup.sampleAccountIds.unshift(notification.account.id);
+    if (existingGroup.sampleAccountIds.length > NOTIFICATIONS_GROUP_MAX_AVATARS)
+      existingGroup.sampleAccountIds.pop();  // 最多显示8个头像
     
-    if (!existingGroup.sampleAccountIds.includes(notification.account.id)) {
-      // 追加到现有分组
-      existingGroup.sampleAccountIds.unshift(notification.account.id);
-      if (existingGroup.sampleAccountIds.length > NOTIFICATIONS_GROUP_MAX_AVATARS)
-        existingGroup.sampleAccountIds.pop();  // 最多显示8个头像
-      
-      existingGroup.most_recent_notification_id = notification.id;
-      existingGroup.notifications_count += 1;
-      
-      // 移动到列表顶部
-      groups.splice(existingGroupIndex, 1);
-      groups.unshift(existingGroup);
-    }
+    existingGroup.most_recent_notification_id = notification.id;
+    existingGroup.notifications_count += 1;
   } else {
     // 创建新分组
     groups.unshift(createNotificationGroupFromNotificationJSON(notification));
@@ -577,82 +1103,7 @@ function processNewNotification(
 }
 ```
 
-##### 分组聚合规则
-
-| 条件 | 行为 |
-|------|------|
-| 找到相同 `group_key` 的分组 | 追加账户到 `sampleAccountIds`，增加 `notifications_count` |
-| `sampleAccountIds` > 8 | 只保留最新的 8 个账户头像 |
-| 未找到相同分组 | 创建新的 `NotificationGroup` |
-
-##### 分组数据结构
-
-```typescript
-interface NotificationGroup {
-  group_key: string;                    // 分组键
-  type: NotificationType;               // 通知类型
-  sampleAccountIds: string[];           // 示例账户 ID（最多8个）
-  notifications_count: number;          // 组内通知总数
-  most_recent_notification_id: string;  // 最新通知 ID
-  statusId?: string;                     // 关联嘟文 ID（如适用）
-  // ... 其他属性
-}
-```
-
-#### 第三部分：API V2 去重响应
-
-**入口文件**: `app/controllers/api/v2/notifications_controller.rb`
-
-```ruby
-def index
-  @notifications = load_notifications  # 已按 group_key 分组
-  @grouped_notifications = load_grouped_notifications
-  @presenter = GroupedNotificationsPresenter.new(@grouped_notifications, ...)
-  
-  render json: @presenter, serializer: REST::DedupNotificationGroupSerializer, ...
-end
-```
-
-**去重序列化器** (`app/serializers/rest/dedup_notification_group_serializer.rb`):
-
-```ruby
-class REST::DedupNotificationGroupSerializer < ActiveModel::Serializer
-  has_many :accounts, serializer: REST::AccountSerializer
-  has_many :partial_accounts, serializer: PartialAccountSerializer
-  has_many :statuses, serializer: REST::StatusSerializer
-  has_many :notification_groups, serializer: REST::NotificationGroupSerializer
-end
-```
-
-#### 对各渠道的影响
-
-- **站内通知列表**：分组展示，减少视觉噪音
-- **API V2**：返回聚合后的数据结构
-- **其他渠道**：无影响
-
-#### 时间窗口
-
-| 阶段 | 时间窗口 | 说明 |
-|------|---------|------|
-| 服务端 `group_key` 生成 | 12 小时 | 超过 12 小时创建新分组 |
-| 前端聚合 | 会话级 | 页面加载期间持续聚合 |
-| API 查询 | 实时 | 每次请求重新计算分组 |
-
-#### 设计意图
-
-1. **用户体验优化**：
-   - 100 人点赞同一嘟文 → 显示 "A、B、C 等 100 人喜欢了你的嘟文"
-   - 而不是 100 条独立通知
-
-2. **信息密度**：在有限空间展示更多信息
-
-3. **渐进式展示**：
-   - 前 8 个用户显示完整头像
-   - 超过 8 个显示 "等 N 人"
-
----
-
-### 4.4 三层去重对比总结
+### 7.4 三层去重对比总结
 
 | 维度 | 第一层：源头重复拦截 | 第二层：Web Push 客户端聚合 | 第三层：通知列表分组展示 |
 |------|---------------------|---------------------------|-------------------------|
@@ -661,121 +1112,17 @@ end
 | **触发时机** | 通知创建前 | 浏览器接收推送时 | 通知保存时 + 列表展示时 |
 | **时间窗口** | 无限制 (数据库存在性) | 实时 (通知中心生命周期) | 12 小时 (服务端) + 会话级 (前端) |
 | **作用渠道** | 全站所有渠道 | Web Push 仅 | API/前端展示仅 |
-| **去重强度** | 强 (完全阻止重复) | 弱 (仅展示合并) | 中 (数据分组，不删除) |
-| **可恢复性** | 不可恢复 (拦截即丢弃) | 可恢复 (用户点击后跳转完整列表) | 可恢复 (分组可展开查看详情) |
+| **并发安全** | ❌ 存在竞态条件 | ✅ 单线程 (浏览器) | ✅ 无并发问题 |
 
-#### 各层之间的关系
+---
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        通知事件流                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  第一层：源头重复拦截 (LocalNotificationWorker)                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐ │
-│  │ 检查是否存在 (account, activity, type) 相同的通知                    │ │
-│  │  - 存在且类型为 update/quoted_update/collection_update → 删除旧的   │ │
-│  │  - 存在且为其他类型 → 直接返回，不创建                                │ │
-│  │  - 不存在 → 继续创建通知                                             │ │
-│  └─────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼ (通知已创建)
-┌─────────────────────────────────────────────────────────────────────────┐
-│  第三层：通知列表分组展示 (并行发生)                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐ │
-│  │ 服务端：生成 group_key (如适用)                                       │ │
-│  │  - favourite/reblog: type + target_status_id + hour_bucket          │ │
-│  │  - follow/admin.sign_up: type + hour_bucket                          │ │
-│  │  - 时间窗口：12小时内复用同一分组                                      │ │
-│  └─────────────────────────────────────────────────────────────────────┘ │
-│                                    │                                        │
-│                                    ▼                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐ │
-│  │ 前端：processNewNotification                                          │ │
-│  │  - 查找相同 group_key 的现有分组                                      │ │
-│  │  - 存在：追加账户，增加计数                                            │ │
-│  │  - 不存在：创建新分组                                                  │ │
-│  └─────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼ (通知分发)
-┌─────────────────────────────────────────────────────────────────────────┐
-│  各渠道分发                                                                │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
-│  │ Streaming    │  │ Web Push     │  │ 邮件         │                  │
-│  │ API          │  │              │  │              │                  │
-│  └──────────────┘  └──────┬───────┘  └──────────────┘                  │
-│                           │                                                │
-│                           ▼                                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐ │
-│  │ 第二层：Web Push 客户端聚合 (Service Worker)                         │ │
-│  │  - 通知数 < 5：单独显示，tag = notification.id                       │ │
-│  │  - 通知数 >= 5：创建分组通知，tag = GROUP_TAG                         │ │
-│  │  - 已存在分组：追加内容                                                │ │
-│  └─────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-#### 对邮件和实时渠道的影响
-
-| 去重层级 | 对 Streaming 的影响 | 对 Web Push 的影响 | 对邮件的影响 |
-|---------|---------------------|-------------------|-------------|
-| **源头重复拦截** | ✅ 阻止重复推送 | ✅ 阻止重复推送 | ✅ 阻止重复发送 |
-| **Web Push 客户端聚合** | ❌ 无影响 | ✅ 展示合并 | ❌ 无影响 |
-| **通知列表分组展示** | ⚠️ 推送原始数据，前端分组 | ⚠️ 推送原始通知，无分组 | ❌ 无影响 |
-
-**关键观察**：
-1. **源头重复拦截**是唯一真正影响所有渠道的去重机制
-2. **Web Push 客户端聚合**是 Web Push 独有的展示优化
-3. **通知列表分组展示**主要影响 API 响应和前端展示，Streaming 推送的是原始通知，由前端自己聚合
-
-## 五、多渠道去重机制（补充）
-
-### 5.1 隐式去重：邮件 vs 实时渠道
-
-**核心逻辑** (`app/services/notify_service.rb:291-297`):
-
-```ruby
-def email_needed?
-  (!recipient_online? || always_send_emails?) && send_email_for_notification_type?
-end
-
-def recipient_online?
-  subscribed_to_streaming_api? || subscribed_to_web_push?
-end
-```
-
-**去重策略**：
-- 如果用户**在线**（订阅了 Streaming 或 Web Push），默认**不发送邮件**
-- 这是一种**隐式去重**，避免用户在实时渠道已看到通知的情况下再收到邮件
-- 用户可以通过 `always_send_emails` 设置覆盖此行为
-
-**设计意图**：
-- 实时渠道 (Streaming/Web Push) 是**即时**的
-- 邮件是**延迟**的 (2分钟)
-- 如果用户在线，优先通过实时渠道送达
-- 邮件作为**离线备份**机制
-
-### 5.2 各渠道去重总结
-
-| 去重类型 | 实现位置 | 作用范围 | 机制说明 |
-|---------|---------|---------|---------|
-| **源头重复拦截** | `LocalNotificationWorker` | 全站所有渠道 | 基于 (account, activity, type) 阻止重复创建 |
-| **隐式渠道去重** | `NotifyService#email_needed?` | 邮件 vs 实时渠道 | 在线用户不发邮件，避免重复打扰 |
-| **Web Push 客户端聚合** | `web_push_notifications.js` | Web Push 展示 | 通知过多时合并显示 |
-| **通知分组** | `Notification#set_group_key!` | 站内通知数据库 | 相同类型/目标的通知共享 group_key |
-| **API 展示去重** | `NotificationGroup` + 前端 reducer | API V2 响应/前端 | 展示时合并相同 group_key 的通知 |
-| **过滤机制** | `DropCondition` / `FilterCondition` | 全渠道 | 根据用户策略丢弃或过滤通知 |
-
-## 六、完整分发流程图
+## 八、完整分发流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                      LocalNotificationWorker.perform()                        │
 │                         【第一层：源头重复拦截】                                │
+│                         ⚠️ 存在竞态条件风险                                    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                     ┌─────────────────┴─────────────────┐
@@ -839,11 +1186,12 @@ end
 │ update_notification_  │           │ 4. push_notification!                    │
 │ request!              │           │    - push_to_streaming_api! (如订阅)    │
 │                       │           │    - push_to_web_push_subscriptions!    │
-│ 仅创建/更新           │           │                                           │
-│ NotificationRequest   │           │ 5. push_to_conversation! (如私信)       │
-│ 不推送其他渠道         │           │                                           │
+│ 【NotificationRequest】│           │                                           │
+│ 聚合：按发送者          │           │ 5. push_to_conversation! (如私信)       │
+│ 有唯一约束             │           │                                           │
 └───────────────────────┘           │ 6. send_email! (如需要)                  │
                                     │    - !recipient_online? || always_send?  │
+                                    │    - ⚠️ 心跳 TTL=18分钟，可能误判         │
                                     │    - 非 NON_EMAIL_TYPES                   │
                                     │    - 用户开启该类型邮件通知                │
                                     │                                           │
@@ -853,70 +1201,68 @@ end
                                     └─────────────────────────────────────────┘
 ```
 
-## 七、关键代码位置索引
+---
+
+## 九、关键代码位置索引
 
 | 功能 | 文件路径 | 关键方法/行号 |
 |------|---------|--------------|
-| 源头重复拦截 | `app/workers/local_notification_worker.rb` | `#perform` 完整方法 |
-| 通知分发核心 | `app/services/notify_service.rb` | `#call`, `#push_notification!`, `#send_email!` |
-| 丢弃条件检查 | `app/services/notify_service.rb:102-163` | `DropCondition#drop?` |
-| 过滤条件检查 | `app/services/notify_service.rb:165-199` | `FilterCondition#filter?` |
-| 邮件发送条件 | `app/services/notify_service.rb:291-305` | `#email_needed?`, `#recipient_online?` |
-| Streaming 推送 | `app/services/notify_service.rb:254-260` | `#push_to_streaming_api!` |
-| Web Push 推送 | `app/services/notify_service.rb:270-276` | `#push_to_web_push_subscriptions!` |
-| Web Push 偏好 | `app/models/web/push_subscription.rb:36-64` | `#pushable?`, `#policy_allows_notification?` |
-| Web Push 客户端聚合 | `app/javascript/mastodon/service_worker/web_push_notifications.js` | `notify` 函数 |
-| 通知策略 | `app/models/notification_policy.rb` | 各类 `drop_*` / `filter_*` 方法 |
-| 通知分组 (group_key) | `app/models/concerns/notification/groups.rb` | `#set_group_key!`, `#paginate_groups` |
-| 前端通知聚合 | `app/javascript/mastodon/reducers/notification_groups.ts` | `processNewNotification` 函数 |
-| 通知模型 | `app/models/notification.rb` | `PROPERTIES`, `TARGET_STATUS_INCLUDES_BY_TYPE` |
-| 用户设置 | `app/models/user_settings.rb` | `notification_emails` namespace |
-| API V2 分组 | `app/models/notification_group.rb` | `::from_notifications` |
-| 去重序列化 | `app/serializers/rest/dedup_notification_group_serializer.rb` | 完整文件 |
+| **Streaming 心跳机制** | `streaming/index.js:274-288` | `subscriptionHeartbeat` 函数 |
+| **在线状态判断** | `app/services/notify_service.rb:291-298` | `#email_needed?`, `#recipient_online?` |
+| **源头重复拦截** | `app/workers/local_notification_worker.rb` | `#perform` 完整方法 |
+| **NotificationRequest 创建** | `app/services/notify_service.rb:241-247` | `#update_notification_request!` |
+| **NotificationRequest 模型** | `app/models/notification_request.rb` | `#prepare_notifications_count` |
+| **通知分发核心** | `app/services/notify_service.rb` | `#call`, `#push_notification!` |
+| **通知分组 (group_key)** | `app/models/concerns/notification/groups.rb` | `#set_group_key!` |
+| **前端通知聚合** | `app/javascript/mastodon/reducers/notification_groups.ts` | `processNewNotification` 函数 |
 
-## 八、设计要点总结
+---
 
-### 8.1 渠道差异化设计
+## 十、设计要点总结
+
+### 10.1 渠道差异化设计
 
 | 渠道 | 实时性 | 可靠性 | 适用场景 | 去重机制 |
 |------|--------|--------|---------|---------|
 | Streaming API | 实时 | 会话级 | 用户在线时即时通知 | 前端分组展示 |
 | Web Push | 近实时 | 设备级 | 浏览器后台时推送 | 客户端聚合 + 前端分组 |
-| 邮件 | 延迟 (2min) | 持久化 | 离线备份、重要通知 | 在线状态判断 |
+| 邮件 | 延迟 (2min) | 持久化 | 离线备份、重要通知 | 在线状态判断 (⚠️ 18min 窗口) |
 | 站内通知 | 持久化 | 最高 | 历史记录、统一入口 | group_key 分组 + 前端聚合 |
+| 通知请求 | 持久化 | 最高 | 过滤后等待审核 | 数据库唯一约束 |
 
-### 8.2 三层去重设计哲学
+### 10.2 去重设计的问题与改进建议
 
-1. **分层防御**：
-   - **第一层** (源头)：阻止重复通知的产生，最严格的去重
-   - **第二层** (客户端)：优化展示体验，不影响数据
-   - **第三层** (展示)：信息聚合，提升用户体验
+#### 当前问题
 
-2. **用户控制权优先**：
-   - 每种通知类型可独立配置
-   - 可覆盖默认行为 (`always_send_emails`)
-   - Web Push 有独立的策略控制
+1. **源头去重的竞态条件**：
+   - `LocalNotificationWorker` 使用"检查后操作"模式
+   - 缺少数据库唯一约束
+   - 并发时可能产生重复通知
 
-3. **时间维度考量**：
-   - 源头去重：无时间限制 (数据完整性)
-   - 服务端分组：12 小时 (平衡新鲜度和聚合度)
-   - 客户端聚合：实时 (响应用户状态)
+2. **邮件判定的幽灵在线窗口**：
+   - Streaming 心跳 TTL = 18 分钟
+   - 用户离线后，邮件可能被错误抑制
+   - 结合 Web Push 订阅，可能被长期抑制
 
-4. **性能考虑**：
-   - 邮件延迟 2 分钟，给实时渠道预留送达时间
-   - 通知分组使用 Redis 缓存，避免复杂查询
-   - 异步处理 (Sidekiq workers) 避免阻塞主流程
-   - 前端聚合在客户端完成，减轻服务端压力
+3. **两张表的设计不一致**：
+   - `notification_requests` 有唯一约束
+   - `notifications` 没有唯一约束
 
-### 8.3 去重策略的权衡
+#### 改进建议
 
-| 策略 | 优点 | 缺点 | 适用场景 |
-|------|------|------|---------|
-| **源头拦截** | 完全避免重复，节省资源 | 可能误拦截 (竞态条件) | 确保数据一致性 |
-| **展示聚合** | 不影响数据，灵活可控 | 需要额外处理逻辑 | UI/UX 优化 |
-| **渠道互斥** | 避免打扰用户 | 可能遗漏通知 (多设备场景) | 在线状态判断 |
+1. **添加唯一约束**（推荐）：
+   - 为 `notifications` 表添加 `(account_id, activity_id, activity_type, type)` 唯一约束
+   - 这是最可靠的解决方案
+
+2. **优化邮件判定逻辑**：
+   - 考虑引入更精确的在线状态检测
+   - 或缩短心跳 TTL 时间
+
+3. **文档化已知问题**：
+   - `LocalNotificationWorker` 的竞态条件应在代码注释中明确
+   - 邮件判定的 18 分钟窗口应被文档化
 
 ---
 
-*文档版本: 2.0*
-*更新内容: 新增三层去重机制的详细分析*
+*文档版本: 3.0*
+*更新内容: 新增 Streaming 心跳机制量化分析、LocalNotificationWorker 并发风险分析、notification_requests 对照分析*
