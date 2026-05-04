@@ -730,23 +730,354 @@ const streamToWs = (req, ws, streamName) => (event, payload) => {
 | `streaming/index.js` | Node.js Streaming 服务 | 294-309 (onRedisMessage), 983-996 (streamToWs) |
 | `app/javascript/mastodon/stream.js` | 前端 WebSocket 管理 | 96-118 (sharedCallbacks.received), 251 (ws.onmessage) |
 
-## 7. 总结
+## 7. 订阅参数解析与消息回推链路详解
 
-### 7.1 核心设计原则
+这一节详细说明前端订阅参数如何被服务端解析并映射到具体 Redis 通道，以及消息回推时的对应关系。
+
+### 7.1 完整链路总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              Step 1: 前端发起订阅请求                                          │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│  前端调用 connectStream(channelName, params, callbacks)                                        │
+│  文件: app/javascript/mastodon/stream.js:153                                                 │
+│                                                                                                 │
+│  示例:                                                                                          │
+│  - connectUserStream()          → connectStream('user', {}, ...)                             │
+│  - connectHashtagStream('ruby') → connectStream('hashtag', { tag: 'ruby' }, ...)           │
+│  - connectListStream('123')     → connectStream('list', { list: '123' }, ...)              │
+│  - connectCommunityStream()     → connectStream('public:local', {}, ...)                     │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│  sharedConnection.send(JSON.stringify({                                                        │
+│    type: 'subscribe',                                                                          │
+│    stream: channelName,   // 例如: 'hashtag'                                                  │
+│    ...params               // 例如: { tag: 'ruby' }                                           │
+│  }));                                                                                           │
+│  文件: app/javascript/mastodon/stream.js:65                                                   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼ WebSocket 消息
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              Step 2: 服务端接收订阅消息                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│  ws.on('message', (data, isBinary) => {                                                       │
+│    const { type, stream, ...params } = json;                                                  │
+│                                                                                                 │
+│    if (type === 'subscribe') {                                                                 │
+│      subscribeWebsocketToChannel(                                                              │
+│        session,                                                                                 │
+│        firstParam(stream),   // 提取 channelName: 'hashtag'                                   │
+│        params                 // 参数: { tag: 'ruby' }                                         │
+│      );                                                                                         │
+│    }                                                                                            │
+│  });                                                                                             │
+│  文件: streaming/index.js:1365-1396                                                           │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              Step 3: channelNameToIds 映射到 Redis 通道                        │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│  subscribeWebsocketToChannel(session, channelName, params)                                    │
+│    ↓                                                                                            │
+│  channelNameToIds(request, channelName, params)                                                │
+│  文件: streaming/index.js:1073-1167                                                            │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 channelNameToIds 映射规则详解
+
+**函数**: `channelNameToIds(req, name, params)`  
+**文件**: `streaming/index.js:1073-1167`
+
+这个函数将前端的 `channelName` 和 `params` 映射到实际的 Redis 通道名：
+
+| 前端 channelName | 前端 params | 返回的 Redis channelIds | 说明 |
+|-----------------|-------------|-------------------------|------|
+| `'user'` | `{}` | `['timeline:${req.accountId}', 'timeline:${req.accountId}:notifications']` | 同时订阅 Home Timeline 和通知流 |
+| `'user:notification'` | `{}` | `['timeline:${req.accountId}:notifications']` | 仅订阅通知流 |
+| `'public'` | `{}` | `['timeline:public']` | 全局公共 Timeline |
+| `'public:local'` | `{}` | `['timeline:public:local']` | 本实例公共 Timeline |
+| `'public:remote'` | `{}` | `['timeline:public:remote']` | 远程实例公共 Timeline |
+| `'public:media'` | `{}` | `['timeline:public:media']` | 全局媒体 Timeline |
+| `'hashtag'` | `{ tag: 'ruby' }` | `['timeline:hashtag:ruby']` | 标签 Timeline (需要 tag 参数) |
+| `'hashtag:local'` | `{ tag: 'ruby' }` | `['timeline:hashtag:ruby:local']` | 本实例标签 Timeline |
+| `'list'` | `{ list: '123' }` | `['timeline:list:123']` | 列表 Timeline (需要 list 参数) |
+| `'direct'` | `{}` | `['timeline:direct:${req.accountId}']` | 私信 Timeline |
+
+**代码证据**: `streaming/index.js:1090-1166`
+
+```javascript
+switch (name) {
+case 'user':
+  resolve({
+    channelIds: [`timeline:${req.accountId}`, `timeline:${req.accountId}:notifications`],
+    options: { needsFiltering: false },
+  });
+  break;
+
+case 'hashtag':
+  if (!params.tag) {
+    reject(new RequestError('Missing tag name parameter'));
+    return;
+  }
+  resolveFeed('hashtag', `timeline:hashtag:${normalizeHashtag(params.tag)}`, { needsFiltering: true });
+  break;
+
+case 'list':
+  if (!params.list) {
+    reject(new RequestError('Missing list name parameter'));
+    return;
+  }
+  authorizeListAccess(params.list, req).then(() => {
+    resolve({
+      channelIds: [`timeline:list:${params.list}`],
+      options: { needsFiltering: false },
+    });
+  });
+  break;
+// ...
+}
+```
+
+### 7.3 订阅建立后的内部结构
+
+订阅建立后，服务端会维护以下结构：
+
+**代码**: `streaming/index.js:1198-1231`
+
+```javascript
+const subscribeWebsocketToChannel = ({ websocket, request, logger, subscriptions }, channelName, params) => {
+  checkScopes(request, logger, channelName)
+    .then(() => channelNameToIds(request, channelName, params))
+    .then(({ channelIds, options }) => {
+      // 1. 构建发送给前端的 streamName
+      const onSend = streamToWs(request, websocket, streamNameFromChannelName(channelName, params));
+      
+      // 2. 启动心跳 (写入 subscribed:{channel} 键)
+      const stopHeartbeat = subscriptionHeartbeat(channelIds);
+      
+      // 3. 订阅 Redis 通道
+      const listener = streamFrom(channelIds, request, logger, onSend, undefined, 'websocket', options);
+      
+      // 4. 保存订阅信息
+      subscriptions[channelIds.join(';')] = {
+        channelName,   // 前端 channelName: 'hashtag'
+        listener,      // Redis 订阅回调
+        stopHeartbeat, // 停止心跳的函数
+      };
+    });
+};
+```
+
+### 7.4 streamNameFromChannelName: 消息回推时的 stream 数组构建
+
+**函数**: `streamNameFromChannelName(channelName, params)`  
+**文件**: `streaming/index.js:1174-1182`
+
+这个函数决定了消息推送到前端时，`stream` 字段的格式：
+
+```javascript
+const streamNameFromChannelName = (channelName, params) => {
+  if (channelName === 'list' && params.list) {
+    return [channelName, params.list];           // ['list', '123']
+  } else if (['hashtag', 'hashtag:local'].includes(channelName) && params.tag) {
+    return [channelName, params.tag];             // ['hashtag', 'ruby']
+  } else {
+    return [channelName];                          // ['user'], ['public'], etc.
+  }
+};
+```
+
+**映射规则**:
+
+| 前端 channelName | 前端 params | 发送给前端的 stream 数组 |
+|-----------------|-------------|-------------------------|
+| `'user'` | `{}` | `['user']` |
+| `'user:notification'` | `{}` | `['user:notification']` |
+| `'public'` | `{}` | `['public']` |
+| `'hashtag'` | `{ tag: 'ruby' }` | `['hashtag', 'ruby']` |
+| `'hashtag:local'` | `{ tag: 'ruby' }` | `['hashtag:local', 'ruby']` |
+| `'list'` | `{ list: '123' }` | `['list', '123']` |
+
+### 7.5 前端消息分发: 如何匹配正确的订阅
+
+**函数**: `sharedCallbacks.received(data)`  
+**文件**: `app/javascript/mastodon/stream.js:96-118`
+
+前端收到 WebSocket 消息后，根据 `stream` 数组匹配对应的订阅回调：
+
+```javascript
+sharedCallbacks.received = (data) => {
+  const { stream } = data;  // 例如: ['hashtag', 'ruby']
+
+  subscriptions.filter(({ channelName, params }) => {
+    const streamChannelName = stream[0];  // 'hashtag'
+
+    if (stream.length === 1) {
+      // 简单情况: 直接比较 channelName
+      return channelName === streamChannelName;
+    }
+
+    const streamIdentifier = stream[1];  // 'ruby'
+
+    // 复杂情况: 需要比较额外参数
+    if (['hashtag', 'hashtag:local'].includes(channelName)) {
+      return channelName === streamChannelName && params.tag === streamIdentifier;
+    } else if (channelName === 'list') {
+      return channelName === streamChannelName && params.list === streamIdentifier;
+    }
+
+    return false;
+  }).forEach(subscription => {
+    subscription.onReceive(data);
+  });
+};
+```
+
+**匹配规则表**:
+
+| 服务端返回的 stream 数组 | 前端订阅的 channelName | 前端订阅的 params | 是否匹配 |
+|-------------------------|-----------------------|------------------|---------|
+| `['user']` | `'user'` | `{}` | ✓ |
+| `['user:notification']` | `'user:notification'` | `{}` | ✓ |
+| `['public']` | `'public'` | `{}` | ✓ |
+| `['hashtag', 'ruby']` | `'hashtag'` | `{ tag: 'ruby' }` | ✓ |
+| `['hashtag', 'ruby']` | `'hashtag'` | `{ tag: 'javascript' }` | ✗ (tag 不匹配) |
+| `['list', '123']` | `'list'` | `{ list: '123' }` | ✓ |
+| `['list', '123']` | `'list'` | `{ list: '456' }` | ✗ (list 不匹配) |
+
+### 7.6 完整订阅-推送链路示例
+
+以 **hashtag Timeline** 为例，展示完整的链路：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│  场景: 用户订阅 #ruby 标签 Timeline，然后收到一条带 #ruby 标签的新帖子                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+=== 订阅阶段 ===
+
+1. 前端:
+   connectHashtagStream(columnId, 'ruby', false, accept)
+   → connectStream('hashtag', { tag: 'ruby' }, callbacks)
+   → WebSocket 发送: { type: 'subscribe', stream: 'hashtag', tag: 'ruby' }
+
+2. 服务端:
+   ws.on('message') → subscribeWebsocketToChannel(session, 'hashtag', { tag: 'ruby' })
+   → channelNameToIds(req, 'hashtag', { tag: 'ruby' })
+   → 返回 channelIds: ['timeline:hashtag:ruby']
+   → streamNameFromChannelName('hashtag', { tag: 'ruby' })
+   → 返回 streamName: ['hashtag', 'ruby']
+   → 订阅 Redis 通道 'timeline:hashtag:ruby'
+   → 写入心跳键 'subscribed:timeline:hashtag:ruby' (EX 18min)
+
+=== 推送阶段 ===
+
+3. Rails 后端:
+   FanOutOnWriteService.broadcast_to_hashtag_streams!()
+   → redis.publish('timeline:hashtag:ruby', {
+       event: 'update',
+       payload: '{"id":"123456","content":"#ruby is awesome!",...}'
+     }.to_json)
+
+4. Node.js Streaming 服务:
+   onRedisMessage('timeline:hashtag:ruby', message)
+   → 找到对应的 listener
+   → streamToWs 调用: transmit('update', payload)
+   → 构建消息: {
+       stream: ['hashtag', 'ruby'],  // ← 注意这里是前端可识别的格式
+       event: 'update',
+       payload: '{"id":"123456",...}'
+     }
+   → WebSocket 发送给前端
+
+5. 前端:
+   ws.onmessage → sharedCallbacks.received(data)
+   → data = {
+       stream: ['hashtag', 'ruby'],
+       event: 'update',
+       payload: '{"id":"123456",...}'
+     }
+   → 过滤 subscriptions:
+     找到 channelName='hashtag' 且 params.tag='ruby' 的订阅
+   → 调用 subscription.onReceive(data)
+   → updateTimeline(timelineId, JSON.parse(data.payload), ...)
+   → UI 更新
+
+=== 取消订阅阶段 ===
+
+6. 前端:
+   unsubscribe()
+   → WebSocket 发送: { type: 'unsubscribe', stream: 'hashtag', tag: 'ruby' }
+
+7. 服务端:
+   unsubscribeWebsocketFromChannel(session, 'hashtag', { tag: 'ruby' })
+   → channelNameToIds → ['timeline:hashtag:ruby']
+   → removeSubscription()
+     → 取消 Redis 订阅
+     → 停止心跳 (stopHeartbeat)
+     → 从 session.subscriptions 中删除
+```
+
+### 7.7 订阅参数映射关系总表
+
+| 前端调用 | channelName | params | Redis 通道 | 前端 stream 数组 |
+|---------|-------------|--------|-----------|-----------------|
+| `connectUserStream()` | `'user'` | `{}` | `timeline:{id}`, `timeline:{id}:notifications` | `['user']`, `['user:notification']` |
+| `connectCommunityStream()` | `'public:local'` | `{}` | `timeline:public:local` | `['public:local']` |
+| `connectPublicStream()` | `'public'` | `{}` | `timeline:public` | `['public']` |
+| `connectHashtagStream('ruby')` | `'hashtag'` | `{ tag: 'ruby' }` | `timeline:hashtag:ruby` | `['hashtag', 'ruby']` |
+| `connectHashtagStream('ruby', true)` | `'hashtag:local'` | `{ tag: 'ruby' }` | `timeline:hashtag:ruby:local` | `['hashtag:local', 'ruby']` |
+| `connectListStream('123')` | `'list'` | `{ list: '123' }` | `timeline:list:123` | `['list', '123']` |
+| `connectDirectStream()` | `'direct'` | `{}` | `timeline:direct:{id}` | `['direct']` |
+
+## 8. 总结
+
+### 8.1 核心设计原则
 
 1. **写时扩散 (Fan-out on Write)**: 帖子创建时就分发给所有关注者，读取时直接获取
 2. **异步解耦**: 使用 Sidekiq Worker 链解耦耗时操作
 3. **在线感知**: 通过 Redis 心跳键只给在线用户推送实时更新
 4. **分层过滤**: Rails 端做主要过滤，Node.js 端做补充过滤
+5. **共享连接**: 前端单个 WebSocket 连接支持多个订阅
 
-### 7.2 两条主要推送路径
+### 8.2 两条主要推送路径
 
 | 路径 | 经过的 Worker | 适用场景 | 延迟 |
 |------|--------------|---------|------|
 | 公共流路径 | 0 个额外 Worker (直接 redis.publish) | 公共 Timeline、标签流 | 最低 |
 | Home Timeline 路径 | 3 个 Worker (Distribution → FeedInsert → PushUpdate) | 个人 Timeline、列表 | 较高 (依赖 Sidekiq 调度) |
 
-### 7.3 关键优化点
+### 8.3 订阅-推送关键设计要点
+
+1. **双层命名映射**:
+   - 前端使用抽象的 channelName (如 `'hashtag'`) + params
+   - 服务端映射到具体的 Redis 通道名 (如 `'timeline:hashtag:ruby'`)
+   - 推送时转换回前端可识别的 stream 数组格式
+
+2. **streamNameFromChannelName 的作用**:
+   - 确保消息能够正确匹配到前端的订阅
+   - 对于需要额外参数的订阅 (hashtag, list)，参数会包含在 stream 数组中
+
+3. **共享连接的订阅管理**:
+   - 前端使用 `subscriptionCounters` 管理多个订阅的引用计数
+   - 服务端使用 `session.subscriptions` 管理同一连接上的多个订阅
+
+### 8.4 关键优化点
 
 1. **分布式锁**: `DistributionWorker` 使用 `with_redis_lock("distribute:#{status_id}")` 防止重复分发
 2. **批量入队**: 使用 `push_bulk` + `find_in_batches` 提高大 V 粉丝分发效率
@@ -754,4 +1085,4 @@ const streamToWs = (req, ws, streamName) => (event, payload) => {
    - 只给最近登录用户更新 Feed (`signed_in_recently?`)
    - 只给在线用户推送实时更新 (`push_update_required?`)
 4. **缓存预热**: `FanOutOnWriteService.warm_payload_cache!` 避免重复渲染
-5. **共享连接**: 前端单个 WebSocket 连接支持多个订阅
+5. **共享连接**: 前端单个 WebSocket 连接支持多个订阅，减少连接开销
