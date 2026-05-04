@@ -1627,4 +1627,369 @@ function IntlProvider({ children }) {
 
 ---
 
+---
+
+## 八、前后端可用语言集合的对齐情况
+
+### 8.1 可用语言数量对比
+
+| 层级 | 数量 | 来源 |
+|------|------|------|
+| **后端 (Rails)** | 102 种 | `config/initializers/i18n.rb` 中的 `available_locales` |
+| **前端 (React)** | 110+ 种 | `app/javascript/mastodon/locales/*.json` |
+
+**关键发现**: 前端的可用语言数量比后端多约 8 种。
+
+---
+
+### 8.2 语言集合差异分析
+
+#### 8.2.1 后端独有的语言
+
+**后端有但前端没有的语言：无**
+
+后端 `available_locales` 中的所有 102 种语言，前端都有对应的 `.json` 文件。
+
+#### 8.2.2 前端独有的语言（后端没有）
+
+**前端有但后端没有的语言（9 种）：**
+
+| 语言代码 | 语言名称 | 说明 |
+|----------|----------|------|
+| `az` | 阿塞拜疆语 (Azerbaijani) | |
+| `fil` | 菲律宾语/他加禄语 (Filipino/Tagalog) | |
+| `lad` | 拉迪诺语 (Ladino) | 西班牙犹太人使用的语言 |
+| `ne` | 尼泊尔语 (Nepali) | |
+| `ry` | 鲁塞尼亚语 (Rusyn) | 喀尔巴阡鲁塞尼亚语 |
+| `tai` | 傣语 (Tai) | |
+| `tok` | 巴布亚皮钦语 (Tok Pisin) | 巴布亚新几内亚使用 |
+| `tlh` | 克林贡语 (Klingon) | **人造语言**（《星际迷航》） |
+| `uz` | 乌兹别克语 (Uzbek) | |
+
+---
+
+### 8.3 语言集合不一致的影响
+
+#### 8.3.1 用户设置语言时的回退
+
+**后端验证逻辑**:
+
+```ruby
+# app/models/user.rb:126
+normalizes :locale, with: ->(locale) { 
+  I18n.available_locales.exclude?(locale.to_sym) ? nil : locale 
+}
+```
+
+**场景分析**：
+
+假设用户的浏览器语言是 `fil`（菲律宾语），或者在请求中尝试设置 `?lang=fil`：
+
+```
+1. 用户请求 ?lang=fil 或浏览器 Accept-Language: fil
+         │
+         ▼
+2. 后端 Localized concern 调用 available_locale_or_nil('fil')
+         │
+         ▼
+3. 'fil'.to_sym = :fil 不在 I18n.available_locales 中
+         │
+         ▼
+4. available_locale_or_nil 返回 nil
+         │
+         ▼
+5. requested_locale 回退到下一个优先级：
+   - 已登录用户：回退到 current_user.locale
+   - 未登录用户：回退到 Accept-Language 的下一个选项
+         │
+         ▼
+6. 如果所有选项都不匹配，最终回退到 I18n.default_locale (:en)
+```
+
+**具体影响的页面/响应**：
+
+| 场景 | 后端行为 | 实际使用语言 |
+|------|----------|-------------|
+| 用户在设置页面尝试选择 `fil` | 下拉列表中**不显示**该选项 | 无法选择 |
+| 用户手动构造 URL `?lang=fil` | 被 `available_locale_or_nil` 忽略 | 回退到下一个优先级 |
+| 浏览器 Accept-Language 首选 `fil` | 无法匹配，尝试下一个语言 | 回退到下一个匹配项 |
+| 用户表中 `locale` 字段是 `fil` | normalization 时被转为 `nil` | 使用 default_locale |
+
+---
+
+#### 8.3.2 浏览器语言协商的回退
+
+**后端协商逻辑**:
+
+```ruby
+# app/controllers/concerns/localized.rb:23-25
+
+def http_accept_language
+  HttpAcceptLanguage::Parser
+    .new(request.headers.fetch('Accept-Language'))
+    .language_region_compatible_from(I18n.available_locales)
+end
+```
+
+**`language_region_compatible_from` 的行为**：
+
+这个方法会尝试：
+1. 精确匹配（如 `zh-CN` → `zh-CN`）
+2. 语言级别匹配（如 `zh-TW` → `zh-CN` 如果只有后者可用）
+3. 回退到 `nil`
+
+**示例场景**：
+
+```
+浏览器发送: Accept-Language: fil-PH, fil;q=0.9, en-US;q=0.8, en;q=0.7
+
+后端处理:
+1. 尝试 fil-PH → 不在 available_locales
+2. 尝试 fil → 不在 available_locales  
+3. 尝试 en-US → 不在 available_locales (后端只有 en, en-GB)
+4. 尝试 en → 在 available_locales ✅
+
+结果: 使用 :en
+```
+
+**对比：前端的行为**：
+
+如果后端 somehow 允许 `fil` 通过，前端会：
+
+```typescript
+// app/javascript/mastodon/locales/load_locale.ts:25-27
+
+const localeFile = Object.hasOwn(localeFiles, `./${locale}.json`)
+  ? localeFiles[`./${locale}.json`]
+  : localeFiles['./en.json'];
+```
+
+- 前端**有** `fil.json`，所以会成功加载
+- 但后端没有 `fil` 的翻译
+
+**这会导致什么问题？**
+
+| 组件类型 | 语言 |
+|----------|------|
+| React 组件文案 | **菲律宾语** (前端 `fil.json`) |
+| Rails Views (登录页面、设置页面) | **英语** (后端回退到 `:en`) |
+| 邮件 | **英语** (后端回退到 `:en`) |
+| Web Push 通知 | **英语** (后端回退到 `:en`) |
+| API 错误消息 | **英语** (后端回退到 `:en`) |
+
+**用户体验**: 混合语言界面，部分内容是菲律宾语，部分是英语。
+
+---
+
+#### 8.3.3 API 返回文案的回退
+
+**场景**: 用户使用前端独有的语言
+
+```
+假设:
+- 用户浏览器: Accept-Language: tlh (克林贡语)
+- 但 tlh 不在后端 available_locales
+
+后端行为:
+1. http_accept_language 尝试匹配 tlh → 失败
+2. 回退到 default_locale (:en)
+3. 所有后端翻译使用英语
+
+前端行为:
+1. 从 <html lang="en"> 读取
+2. 加载 en.json
+3. 所有 React 组件使用英语
+
+结果: 统一使用英语（因为后端回退到 en，前端跟随）
+```
+
+**另一个场景**: 后端 somehow 设置了前端独有的语言
+
+```
+假设:
+- 后端 somehow 允许 fil 通过（比如直接设置 I18n.locale）
+- 渲染 <html lang="fil">
+
+后端行为:
+1. 没有 fil.yml 翻译文件
+2. I18n.t() 会使用英语 fallback（或抛出异常）
+
+前端行为:
+1. 从 <html lang="fil"> 读取
+2. 加载 fil.json ✓（前端有这个文件）
+3. React 组件使用菲律宾语
+
+结果: 混合语言！
+- 后端渲染的内容：英语
+- 前端 React 组件：菲律宾语
+```
+
+---
+
+### 8.4 回退机制总结
+
+#### 8.4.1 回退流程图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    语言设置与回退流程                              │
+└─────────────────────────────────┬───────────────────────────────┘
+                                  │
+                    ┌─────────────┴─────────────┐
+                    ▼                           ▼
+            ┌───────────────┐           ┌───────────────┐
+            │   后端验证    │           │   前端加载    │
+            └───────┬───────┘           └───────┬───────┘
+                    │                           │
+                    ▼                           ▼
+            语言在 available_locales?    语言有对应的 .json 文件?
+                    │                           │
+          ┌─────────┴─────────┐         ┌───────┴───────┐
+          │                   │         │               │
+          ▼                   ▼         ▼               ▼
+        是 ✓                否 ✗      是 ✓            否 ✗
+          │                   │         │               │
+          ▼                   ▼         ▼               ▼
+    使用该语言         回退到下一个   使用该语言     回退到 en.json
+                    优先级或 default
+```
+
+#### 8.4.2 回退优先级详细表
+
+| 层级 | 验证/加载逻辑 | 回退路径 |
+|------|--------------|----------|
+| **后端 - 用户设置** | `normalizes :locale` 检查 `available_locales` | 无效值转为 `nil`，下次请求使用默认 |
+| **后端 - URL 参数** | `available_locale_or_nil(params[:lang])` | 无效则忽略，尝试下一个优先级 |
+| **后端 - 用户 locale** | `available_locale_or_nil(current_user.locale)` | 无效则忽略，尝试 `Accept-Language` |
+| **后端 - Accept-Language** | `language_region_compatible_from(available_locales)` | 无匹配则返回 `nil` |
+| **后端 - 最终** | `requested_locale \|\| default_locale` | 回退到 `:en` |
+| **前端 - 加载** | `Object.hasOwn(localeFiles, \`./${locale}.json\`)` | 回退到 `./en.json` |
+
+---
+
+### 8.5 影响范围对照表
+
+| 场景 | 后端行为 | 前端行为 | 最终语言 |
+|------|----------|----------|----------|
+| **用户尝试选择前端独有语言** | 下拉列表不显示 | N/A | 无法选择 |
+| **URL 参数 `?lang=fil`** | 被忽略，回退 | 跟随后端 | 回退到下一个优先级 |
+| **Accept-Language 首选 `fil`** | 无法匹配，回退 | 跟随后端 | 回退到下一个匹配项 |
+| **数据库 `locale` 是 `fil`** | normalization 转 `nil` | N/A | 使用 default_locale |
+| **后端 somehow 允许 `fil`** | 使用英语 fallback | 加载 `fil.json` | **混合语言** ⚠️ |
+| **前端独有语言，但后端回退到 `en`** | 使用英语 | 加载 `en.json` | **统一英语** |
+
+---
+
+### 8.6 为什么会有这种不一致？
+
+#### 8.6.1 可能的原因
+
+1. **贡献流程不同**
+   - 前端翻译可能通过 Crowdin/Weblate 等平台
+   - 后端翻译可能有不同的审核流程
+
+2. **测试覆盖不同**
+   - 前端独有的语言可能是"实验性"的
+   - 后端可能更谨慎，只添加经过充分测试的语言
+
+3. **人造语言**
+   - `tlh` (克林贡语) 是人造语言
+   - 这类语言通常只在前端添加，用于趣味/展示
+
+#### 8.6.2 风险评估
+
+**低风险场景**:
+- 用户浏览器语言是前端独有的，但有其他可匹配的语言
+- 例如：`Accept-Language: fil, en-US, en` → 回退到 `en`
+
+**高风险场景**:
+- 用户浏览器语言只有前端独有的语言
+- 例如：`Accept-Language: fil` → 回退到 `en`（这是预期行为）
+
+**潜在 Bug 场景**:
+- 后端某处绕过了 `available_locales` 检查
+- 直接设置 `I18n.locale = 'fil'`
+- 这会导致：
+  - 后端渲染的内容：英语（I18n fallback）
+  - 前端 React 组件：菲律宾语
+  - **混合语言界面**
+
+---
+
+### 8.7 建议
+
+#### 8.7.1 短期建议
+
+1. **保持现状**：当前设计是合理的
+   - 后端严格验证 `available_locales`
+   - 前端有额外的语言作为"友好 fallback"
+   - 实际上用户不会遇到混合语言，因为后端会先回退
+
+2. **文档化**：明确说明
+   - 哪些语言只在前端可用
+   - 回退机制的详细行为
+
+#### 8.7.2 中期建议
+
+1. **同步语言集合**
+   - 考虑将前端独有的语言添加到后端 `available_locales`
+   - 或者从前端移除这些语言（如果后端不会支持）
+
+2. **添加一致性检查**
+   - 在 CI 中添加检查，确保前后端语言集合一致
+   - 或明确记录差异的原因
+
+#### 8.7.3 长期建议
+
+1. **统一翻译管理**
+   - 使用统一的翻译管理平台
+   - 确保前后端翻译同步更新
+
+2. **语言启用机制**
+   - 实现语言的"启用/禁用"机制
+   - 区分：
+     - `available_locales`: 代码层面支持
+     - `enabled_locales`: 实例层面启用
+
+---
+
+## 九、总结
+
+### 9.1 前后端语言机制核心差异
+
+| 维度 | 后端 Rails | 前端 React |
+|------|-----------|------------|
+| **语言数量** | 102 种 | 110+ 种 |
+| **语言验证** | 严格检查 `available_locales` | 宽松，不存在则回退到 `en` |
+| **读取时机** | 每个 HTTP 请求 | 页面加载时仅一次 |
+| **热切换** | ✅ 支持（每个请求重新读取） | ❌ 需刷新页面 |
+| **回退机制** | 多层级优先级回退 | 仅回退到 `en.json` |
+
+### 9.2 语言不一致的实际影响
+
+**实际上，用户通常不会遇到混合语言**，因为：
+
+```
+用户请求 (fil)
+     │
+     ▼
+后端验证：fil 不在 available_locales
+     │
+     ▼
+回退到 default_locale (:en)
+     │
+     ▼
+渲染 <html lang="en">
+     │
+     ▼
+前端加载 en.json
+     │
+     ▼
+统一使用英语 ✓
+```
+
+**只有当后端绕过 `available_locales` 检查时，才会出现混合语言**。
+
+---
+
 *分析基于 Mastodon 代码库版本: 2024年*
