@@ -350,10 +350,15 @@ end
 
 #### 远端同步动作
 
-| 条件 | 动作 |
-|------|------|
-| 原作者是本地账户 | 不同步（本地销毁记录即可） |
-| 原作者是远程账户 + 支持 ActivityPub | 发送 `Undo Like` 活动 |
+**代码证据** (`app/services/unfavourite_service.rb:9`):
+```ruby
+create_notification(favourite) if !status.account.local? && status.account.activitypub?
+```
+
+| 条件 | 条件代码 | 动作 |
+|------|----------|------|
+| 原作者是本地账户 | `status.account.local? == true` | 不同步（本地销毁记录即可） |
+| 原作者是远程账户 + 支持 ActivityPub | `!status.account.local? && status.account.activitypub?` | 发送 `Undo Like` 活动 |
 
 `Undo Like` 活动结构：
 ```json
