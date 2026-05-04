@@ -413,7 +413,273 @@ before_action -> { doorkeeper_authorize! :write, :'write:statuses' }, only:   [:
 before_action -> { doorkeeper_authorize! :read, :'read:notifications' }
 ```
 
-### 5.3 权限校验错误处理
+### 5.3 Scope 校验完整链路
+
+Scope 校验发生在 OAuth 流程的多个阶段，从授权请求到 API 接口调用形成一条完整的校验链。
+
+#### 5.3.1 阶段一：授权请求校验
+
+**端点：** `GET /oauth/authorize`
+
+**校验内容：**
+1. **应用范围限制**：请求的 scope 必须是应用注册时允许的范围的子集
+   - 应用在 `Doorkeeper::Application` 的 `scopes` 字段定义了允许的范围
+   - 例如：应用注册时 `scopes: 'read write'`，则只能请求 `read`、`write` 或其子范围
+
+2. **配置范围强制**：请求的 scope 必须在 `doorkeeper.rb` 配置的 `default_scopes` 或 `optional_scopes` 中
+   ```ruby
+   # config/initializers/doorkeeper.rb:61
+   enforce_configured_scopes
+   ```
+
+**校验失败处理：**
+- 如果请求的 scope 不在允许范围内，Doorkeeper 会返回错误
+
+#### 5.3.2 阶段二：用户授权确认
+
+**界面：** `app/views/oauth/authorizations/new.html.haml`
+
+**流程：**
+1. 用户看到应用请求的所有 scope 列表
+2. 用户可以选择授权或拒绝
+3. 如果授权，scope 被记录到 `Doorkeeper::AccessGrant` 的 `scopes` 字段
+
+**关键点：**
+- 用户只能授权应用请求的 scope，不能增加或减少
+- 授权的 scope 会被完整记录到授权码中
+
+#### 5.3.3 阶段三：令牌签发校验
+
+**端点：** `POST /oauth/token`
+
+**校验逻辑：**
+
+**授权码模式：**
+- 令牌的 scope 来自于 `AccessGrant` 的 `scopes` 字段
+- 不能请求超出授权码范围的 scope
+
+**测试验证** (`spec/requests/oauth/token_spec.rb:32-65`)：
+```ruby
+shared_examples 'original scope request preservation' do
+  it 'returns all scopes requested for the given code' do
+    subject
+    expect(response).to have_http_status(200)
+    expect(response.parsed_body[:scope]).to eq 'read write'
+  end
+end
+
+context 'with scopes specified' do
+  context 'when the scopes were requested for this code' do
+    let(:scope) { 'write' }
+    it_behaves_like 'original scope request preservation'
+  end
+  
+  context 'when the scope was not requested for the code' do
+    let(:scope) { 'follow' }
+    it_behaves_like 'original scope request preservation'
+  end
+end
+```
+
+**关键点：**
+- 即使在令牌请求时指定了不同的 scope，返回的令牌仍然使用授权码原始的 scope
+- 这确保了令牌不会超出用户授权的范围
+
+**客户端凭证模式：**
+- 可以请求应用允许的任意 scope 子集
+- 如果请求的 scope 不属于应用，返回 400 错误
+
+**测试验证** (`spec/requests/oauth/token_spec.rb:95-104`)：
+```ruby
+context 'when some scopes do not belong to the application' do
+  let(:scope) { 'read write push' }
+  
+  it 'returns an error' do
+    subject
+    expect(response).to have_http_status(400)
+  end
+end
+```
+
+#### 5.3.4 阶段四：API 接口鉴权
+
+**位置：** 各 API 控制器的 `before_action`
+
+**校验方法：** `doorkeeper_authorize!(*scopes)`
+
+这是最终的权限校验点，在每个 API 请求时执行。
+
+### 5.4 多范围请求的匹配规则
+
+#### 5.4.1 OR 匹配规则
+
+`doorkeeper_authorize!` 方法接收多个 scope 参数，使用 **OR** 逻辑进行匹配。
+
+**示例 1：嘟文控制器** (`app/controllers/api/v1/statuses_controller.rb:8-9`)
+```ruby
+before_action -> { authorize_if_got_token! :read, :'read:statuses' }, except: [:create, :update, :destroy]
+before_action -> { doorkeeper_authorize! :write, :'write:statuses' }, only:   [:create, :update, :destroy]
+```
+
+**匹配逻辑：**
+- 对于读取操作：Token 具有 `read` **OR** `read:statuses` 即可通过
+- 对于写入操作：Token 具有 `write` **OR** `write:statuses` 即可通过
+
+**示例 2：用户凭证控制器** (`app/controllers/api/v1/accounts/credentials_controller.rb:4-5`)
+```ruby
+before_action -> { doorkeeper_authorize! :profile, :read, :'read:accounts' }, except: [:update]
+before_action -> { doorkeeper_authorize! :write, :'write:accounts' }, only: [:update]
+```
+
+**匹配逻辑：**
+- 读取用户凭证：`profile` **OR** `read` **OR** `read:accounts`
+- 更新用户凭证：`write` **OR** `write:accounts`
+
+#### 5.4.2 匹配规则详解
+
+| API 要求 | Token 具有 | 结果 |
+|---------|-----------|------|
+| `:read, :'read:statuses'` | `read` | ✅ 通过（OR 匹配） |
+| `:read, :'read:statuses'` | `read:statuses` | ✅ 通过（OR 匹配） |
+| `:read, :'read:statuses'` | `write` | ❌ 拒绝 |
+| `:write, :'write:statuses'` | `write` | ✅ 通过 |
+| `:write, :'write:statuses'` | `write:statuses` | ✅ 通过 |
+| `:write, :'write:statuses'` | `write:favourites` | ❌ 拒绝（只匹配具体列出的 scope） |
+
+### 5.5 粗粒度与细粒度的继承关系详解
+
+#### 5.5.1 Doorkeeper 的 Scope 继承机制
+
+**关键点：** `doorkeeper_authorize!` 列出的 scope 之间是 OR 关系，同时粗粒度 scope 具有继承特性。
+
+**继承规则：**
+- 粗粒度 scope（如 `write`）自动包含所有同名的细粒度子 scope（如 `write:statuses`、`write:favourites` 等）
+- 当 API 要求 `write` 时，具有 `write` **或** 任何 `write:*` 子 scope 的 token 都能通过
+- 当 API 要求 `write:statuses` 时，具有 `write:statuses` **或** `write` 的 token 都能通过
+
+#### 5.5.2 继承关系示例分析
+
+**示例分析 1：API 要求 `doorkeeper_authorize! :read, :'read:statuses'`**
+
+| Token Scope | 是否通过 | 原因 |
+|------------|---------|------|
+| `read` | ✅ | 直接匹配 `:read` |
+| `read:statuses` | ✅ | 直接匹配 `:'read:statuses'` |
+| `read:accounts` | ❌ | 不匹配任何列出的 scope |
+| `write` | ❌ | 不匹配任何列出的 scope |
+
+**示例分析 2：API 要求 `doorkeeper_authorize! :write`**
+
+| Token Scope | 是否通过 | 原因 |
+|------------|---------|------|
+| `write` | ✅ | 直接匹配 |
+| `write:statuses` | ✅ | `write` 包含所有 `write:*` 子范围 |
+| `write:favourites` | ✅ | `write` 包含所有 `write:*` 子范围 |
+| `read` | ❌ | 不匹配 |
+
+**示例分析 3：API 要求 `doorkeeper_authorize! :'write:statuses'`**
+
+| Token Scope | 是否通过 | 原因 |
+|------------|---------|------|
+| `write` | ✅ | `write` 包含 `write:statuses` |
+| `write:statuses` | ✅ | 直接匹配 |
+| `write:favourites` | ❌ | `write:favourites` 不包含 `write:statuses` |
+| `read` | ❌ | 不匹配 |
+
+#### 5.5.3 继承机制核心结论
+
+**这说明：**
+1. **粗粒度包容细粒度**：当 API 要求粗粒度 scope（如 `:write`）时，具有该粗粒度或任意细粒度子 scope 的 token 都能通过
+2. **细粒度继承父粗粒度**：当 API 要求细粒度 scope（如 `:'write:statuses'`）时，具有该细粒度或其父粗粒度 scope 的 token 能通过
+3. **细粒度之间互不包含**：细粒度 scope 之间**不**互相包含（如 `write:statuses` 不包含 `write:favourites`）
+
+### 5.6 权限校验错误处理
+
+#### 5.6.1 401 Unauthorized vs 403 Forbidden
+
+**位置：** `app/controllers/api/base_controller.rb:23-29`
+
+```ruby
+def doorkeeper_unauthorized_render_options(error: nil)
+  { json: { error: error.try(:description) || 'Not authorized' } }
+end
+
+def doorkeeper_forbidden_render_options(*)
+  { json: { error: 'This action is outside the authorized scopes' } }
+end
+```
+
+#### 5.6.2 错误场景详解
+
+| 错误类型 | HTTP 状态码 | 触发条件 | 错误消息 |
+|---------|------------|---------|---------|
+| **Unauthorized** | 401 | Token 不存在、无效、已撤销或格式错误 | `"Not authorized"` 或具体错误描述 |
+| **Forbidden** | 403 | Token 有效，但权限范围不足 | `"This action is outside the authorized scopes"` |
+
+**关键区别：**
+- **401**：认证失败 —— 系统无法识别你是谁
+- **403**：授权失败 —— 系统知道你是谁，但你没有权限执行该操作
+
+#### 5.6.3 测试验证
+
+**位置：** `spec/support/examples/api.rb:3-12`
+
+```ruby
+RSpec.shared_examples 'forbidden for wrong scope' do |wrong_scope|
+  let(:scopes) { wrong_scope }
+
+  it 'returns http forbidden' do
+    subject if request.nil?
+    expect(response).to have_http_status(403)
+  end
+end
+```
+
+**使用示例** (`spec/requests/api/v1/statuses_spec.rb:51`)：
+```ruby
+it_behaves_like 'forbidden for wrong scope', 'write write:statuses'
+```
+
+这说明：
+- 当 API 需要 `read` 或 `read:statuses` 时
+- 使用 `write` 或 `write:statuses` 的 token 会收到 **403** 错误
+- 而不是 401，因为 token 本身是有效的，只是权限不足
+
+#### 5.6.4 流式服务中的错误处理
+
+**位置：** `streaming/index.js`
+
+**Token 不存在：**
+```javascript
+if (!authorization && !accessToken) {
+  reject(new AuthenticationError('Missing access token'));
+}
+```
+
+**Token 无效：**
+```javascript
+if (result.rows.length === 0) {
+  throw new AuthenticationError('Invalid access token');
+}
+```
+
+**Scope 不足：**
+```javascript
+if (req.scopes && requiredScopes.some(requiredScope => req.scopes.includes(requiredScope))) {
+  resolve();
+} else {
+  reject(new AuthenticationError('Access token does not have the required scopes'));
+}
+```
+
+**流式服务的 HTTP 状态码：**
+- 所有认证错误都返回 **401**（WebSocket 连接的特殊处理）
+- 错误消息用于区分具体原因：
+  - `'Missing access token'`
+  - `'Invalid access token'`
+  - `'Access token does not have the required scopes'`
+
+### 5.7 原权限校验错误处理
 
 **位置：** `app/controllers/api/base_controller.rb:23-29`
 
