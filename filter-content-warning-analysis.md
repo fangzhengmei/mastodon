@@ -1149,7 +1149,465 @@ const MAX_HEIGHT = 706; // 22px * 32 (+ 2px padding at the top)
 
 ---
 
-## 八、关键文件索引
+## 八、三种场景下的行为对照（时间线 vs 详情页 vs 通知）
+
+### 8.1 场景定义与 contextType
+
+| 场景 | contextType | warnInsteadOfHide | 说明 |
+|------|-------------|------------------|------|
+| **时间线** | `home` / `public` / `list:*` | `false` | 主页时间线、公共时间线、列表 |
+| **详情页** | `thread` | `true` | 帖子详情页面 |
+| **通知** | `notifications` | `false` | 通知列表 |
+| **收藏** | `favourites` | `true` | 收藏页面 |
+| **书签** | `bookmarks` | `true` | 书签页面 |
+| **搜索** | `search` | `true` | 搜索结果页面 |
+
+### 8.2 同一帖子在三种场景下的行为对照
+
+假设存在这样一个帖子：
+- 有 `spoiler_text: "敏感内容警告"`（内容警告）
+- 匹配一个 `filter_action: "hide"` 的过滤器
+- 有媒体附件
+
+**不同场景下的行为**：
+
+| 行为维度 | 时间线 (warnInsteadOfHide=false) | 详情页 (warnInsteadOfHide=true) | 通知 (warnInsteadOfHide=false) |
+|---------|----------------------------------|---------------------------------|---------------------------------|
+| **hide 动作** | 完全隐藏，`status = null` | 显示警告横幅 | 完全隐藏，返回 `null` |
+| **内容警告** | 不显示（因为已被 hide） | 显示在过滤警告下方 | 不显示（因为已被 hide） |
+| **媒体** | 不显示 | 显示（如果展开） | 不显示 |
+| **正文内容** | 不显示 | 显示（如果展开） | 不显示 |
+
+**如果是 `filter_action: "warn"` 的过滤器**：
+
+| 行为维度 | 时间线 | 详情页 | 通知 |
+|---------|--------|--------|------|
+| **warn 动作** | 显示过滤警告横幅 | 显示过滤警告横幅 | 显示过滤警告横幅 |
+| **内容警告** | 显示在过滤警告下方（需先展开过滤） | 显示在过滤警告下方 | 显示在过滤警告下方 |
+| **媒体** | 显示（需展开两层） | 显示（需展开两层） | 显示（需展开两层） |
+| **正文内容** | 显示（需展开两层） | 显示（需展开两层） | 显示（需展开两层） |
+
+**如果是 `filter_action: "blur"` 的过滤器**：
+
+| 行为维度 | 时间线 | 详情页 | 通知 |
+|---------|--------|--------|------|
+| **blur 动作** | 正文正常显示，仅媒体模糊 | 正文正常显示，仅媒体模糊 | 正文正常显示，仅媒体模糊 |
+| **内容警告** | 不受影响，按原有逻辑 | 不受影响，按原有逻辑 | 不受影响，按原有逻辑 |
+| **媒体** | 模糊显示，可点击展开 | 模糊显示，可点击展开 | 模糊显示，可点击展开 |
+| **正文内容** | 正常显示 | 正常显示 | 正常显示 |
+
+### 8.3 通知场景的特殊处理
+
+通知有一个**额外的隐藏检查**：
+
+```typescript
+// app/javascript/mastodon/features/notifications_v2/components/notification_with_status.tsx
+const isFiltered = useAppSelector(
+  (state) =>
+    statusId &&
+    getStatusHidden(state, { id: statusId, contextType: 'notifications' }),
+);
+
+// 如果被过滤，直接返回 null
+if (!statusId || isFiltered) return null;
+```
+
+**关键点**：
+1. 通知使用 `contextType: 'notifications'`，因此 `warnInsteadOfHide = false`
+2. `getStatusHidden` 检查的是 `filter_action === 'hide'`
+3. 只要匹配 `hide` 动作的过滤器，通知就完全不渲染
+
+这意味着：
+- 通知中匹配 `hide` 过滤器的帖子：完全不显示
+- 通知中匹配 `warn` 过滤器的帖子：显示过滤警告横幅
+- 通知中匹配 `blur` 过滤器的帖子：正常显示，仅媒体模糊
+
+---
+
+## 九、多状态叠加时的触发顺序与状态流
+
+### 9.1 四种状态类型的优先级
+
+当一个帖子同时存在多种状态时，它们的**渲染顺序**和**展开逻辑**是分层的：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        渲染顺序与状态层级                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  优先级 1：hide 动作（最高）                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 条件：filter_action === 'hide' && warnInsteadOfHide === false      │  │
+│  │ 行为：status = null，完全不渲染                                       │  │
+│  │ 影响：其他所有状态都无法显示                                          │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                              │                                               │
+│                              ▼ (如果 hide 不触发)                            │
+│                                                                              │
+│  优先级 2：过滤警告 (matched_filters)                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 渲染位置：Status.jsx:613                                             │  │
+│  │ 条件：matched_filters 存在（warn 或 blur 过滤器）                   │  │
+│  │ 初始状态：showDespiteFilter = undefined（false）                     │  │
+│  │ 控制变量：this.state.showDespiteFilter                               │  │
+│  │ 点击动作：handleFilterToggle() → 切换 showDespiteFilter             │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                              │                                               │
+│                              ▼ (如果 !matchedFilters || showDespiteFilter)  │
+│                                                                              │
+│  优先级 3：内容警告 (spoiler_text)                                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 渲染位置：Status.jsx:615                                             │  │
+│  │ 条件：spoiler_text 存在                                              │  │
+│  │ 初始状态：status.hidden = true（根据 expandSpoilers 设置）         │  │
+│  │ 控制变量：status.hidden                                              │  │
+│  │ 点击动作：handleExpandedToggle() → dispatch(toggleStatusSpoilers)  │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                              │                                               │
+│                              ▼ (如果 expanded === true)                       │
+│                                                                              │
+│  优先级 4：内容显示 (正文 + 媒体)                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 渲染位置：Status.jsx:617-633                                         │  │
+│  │ 条件：expanded === true                                              │  │
+│  │                                                                       │  │
+│  │ expanded 的计算逻辑 (Status.jsx:460)：                              │  │
+│  │   expanded = (!matchedFilters || this.state.showDespiteFilter) &&   │  │
+│  │              (!status.get('hidden') || !spoiler_text)               │  │
+│  │                                                                       │  │
+│  │ 即：必须同时满足                                                       │  │
+│  │   1. 没有过滤警告，或者用户展开了过滤警告                              │  │
+│  │   2. 没有内容警告，或者用户展开了内容警告                              │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                              │                                               │
+│                              ▼                                               │
+│                                                                              │
+│  独立状态：媒体模糊 (matched_media_filters)                                  │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 特点：不影响 expanded 计算，独立于其他状态                            │  │
+│  │ 控制变量：matched_media_filters (来自 blur 过滤器)                   │  │
+│  │ 影响：                                                                 │  │
+│  │   - defaultMediaVisibility() 返回 false                               │  │
+│  │   - 传递给 MediaGallery 的 matchedFilters 属性                        │  │
+│  │   - 媒体组件显示模糊效果，用户点击后展开                               │  │
+│  │ 注意：blur 过滤器也会设置 matched_filters（因为在选择器中 blur 被  │  │
+│  │       单独处理，但 warn/hide 也会设置）                              │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 渲染代码的顺序
+
+`app/javascript/mastodon/components/status.jsx:611-633`：
+
+```javascript
+// 顺序 1：过滤警告
+{matchedFilters && <FilterWarning 
+    title={matchedFilters.join(', ')} 
+    expanded={this.state.showDespiteFilter} 
+    onClick={this.handleFilterToggle} 
+/>}
+
+// 顺序 2：内容警告（条件：没有过滤警告 或 已展开过滤警告）
+{(!matchedFilters || this.state.showDespiteFilter) && <ContentWarning 
+    status={status} 
+    expanded={expanded} 
+    onClick={this.handleExpandedToggle} 
+/>}
+
+// 顺序 3：内容（条件：expanded === true）
+{expanded && (
+  <>
+    <StatusContent ... />
+    {media}  {/* 媒体组件接收 matched_media_filters */}
+    {hashtagBar}
+    {children}
+  </>
+)}
+```
+
+### 9.3 expanded 状态的完整计算
+
+```javascript
+// Status.jsx:460
+const expanded = (!matchedFilters || this.state.showDespiteFilter) && 
+                 (!status.get('hidden') || status.get('spoiler_text').length === 0);
+```
+
+**真值表**：
+
+| matchedFilters | showDespiteFilter | status.hidden | spoiler_text | expanded | 说明 |
+|----------------|-------------------|---------------|--------------|----------|------|
+| false | - | false | - | true | 无过滤警告，无内容警告 |
+| false | - | true | 有 | false | 无过滤警告，有内容警告未展开 |
+| false | - | false | 有 | true | 无过滤警告，内容警告已展开 |
+| true | false (undefined) | - | - | false | 有过滤警告未展开 |
+| true | true | false | - | true | 过滤警告已展开，无内容警告 |
+| true | true | true | 有 | false | 过滤警告已展开，但内容警告未展开 |
+| true | true | false | 有 | true | 过滤警告已展开，内容警告已展开 |
+
+### 9.4 多状态叠加的场景示例
+
+#### 场景 A：过滤警告 + 内容警告 + 媒体模糊
+
+帖子状态：
+- 匹配 `warn` 过滤器 → `matched_filters = ["关键词过滤"]`
+- 有 `spoiler_text = "敏感内容"` → `status.hidden = true`
+- 匹配 `blur` 过滤器 → `matched_media_filters = ["媒体过滤"]`
+
+**状态流**：
+
+```
+初始状态：
+  showDespiteFilter = undefined (false)
+  status.hidden = true
+  expanded = false
+
+渲染结果：
+  ┌─────────────────────────────────────┐
+  │ [FilterWarning] 关键词过滤          │  ← 只显示过滤警告
+  │ [按钮] Show anyway                  │
+  └─────────────────────────────────────┘
+
+用户点击 "Show anyway"：
+  showDespiteFilter = true
+  expanded = (true || true) && (!true || "敏感内容")
+           = true && (false)
+           = false
+
+渲染结果：
+  ┌─────────────────────────────────────┐
+  │ [FilterWarning] 关键词过滤          │  ← 过滤警告已展开
+  │ [按钮] Hide post                    │
+  ├─────────────────────────────────────┤
+  │ [ContentWarning] 敏感内容           │  ← 内容警告显示
+  │ [按钮] Show more                    │
+  └─────────────────────────────────────┘
+
+用户点击 "Show more"：
+  dispatch(toggleStatusSpoilers)
+  status.hidden = false
+  expanded = true && (true || ...)
+           = true
+
+渲染结果：
+  ┌─────────────────────────────────────┐
+  │ [FilterWarning] 关键词过滤          │
+  │ [按钮] Hide post                    │
+  ├─────────────────────────────────────┤
+  │ [ContentWarning] 敏感内容           │
+  │ [按钮] Hide post                    │
+  ├─────────────────────────────────────┤
+  │ 正文内容...                         │  ← 正文显示
+  │ ┌─────────────────────────────────┐ │
+  │ │ [MediaGallery 模糊]            │ │  ← 媒体模糊
+  │ │ matched_media_filters 生效      │ │
+  │ └─────────────────────────────────┘ │
+  └─────────────────────────────────────┘
+
+用户点击模糊媒体：
+  媒体展开，显示真实内容
+```
+
+#### 场景 B：hide 过滤器 + 内容警告 + 媒体模糊
+
+帖子状态：
+- 匹配 `hide` 过滤器
+- 有 `spoiler_text`
+- 匹配 `blur` 过滤器
+
+**在时间线中**（`warnInsteadOfHide = false`）：
+```
+选择器检查：
+  filter_action === 'hide' && !warnInsteadOfHide → true
+
+结果：
+  return { status: null, loadingState: 'filtered' }
+  
+渲染：
+  完全不显示，其他状态都无法生效
+```
+
+**在详情页中**（`warnInsteadOfHide = true`）：
+```
+选择器检查：
+  filter_action === 'hide' && !warnInsteadOfHide → false（因为 warnInsteadOfHide = true）
+  
+处理：
+  hide 被当作 warn 处理 → matched_filters = [title]
+  blur 单独处理 → matched_media_filters = [title]
+  
+结果：
+  同场景 A（过滤警告 + 内容警告 + 媒体模糊）
+```
+
+### 9.5 快捷键切换的状态流转
+
+`handleHotkeyToggleHidden` 函数实现了智能切换逻辑：
+
+```javascript
+// Status.jsx:335-354
+handleHotkeyToggleHidden = () => {
+  const { onToggleHidden } = this.props;
+  const status = this._properStatus();
+
+  if (this.props.status.get('matched_filters')) {
+    // 有过滤警告时，智能判断切换哪个
+    const expandedBecauseOfCW = !status.get('hidden') || status.get('spoiler_text').length === 0;
+    const expandedBecauseOfFilter = this.state.showDespiteFilter;
+
+    if (expandedBecauseOfFilter && !expandedBecauseOfCW) {
+      // 过滤已展开，内容警告未展开 → 切换内容警告
+      onToggleHidden(status);
+    } else if (expandedBecauseOfFilter && expandedBecauseOfCW) {
+      // 两者都已展开 → 先切换内容警告（折叠），再切换过滤警告（折叠）
+      onToggleHidden(status);
+      this.handleFilterToggle();
+    } else {
+      // 过滤未展开 → 先切换过滤警告（展开）
+      this.handleFilterToggle();
+    }
+  } else {
+    // 没有过滤警告，直接切换内容警告
+    onToggleHidden(status);
+  }
+};
+```
+
+**快捷键状态流转图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     快捷键切换状态流转 (toggleHidden)                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  初始状态：                                                                   │
+│    showDespiteFilter = false (过滤折叠)                                      │
+│    status.hidden = true (内容警告折叠)                                       │
+│    expanded = false                                                          │
+│                                                                              │
+│  第 1 次按键：                                                                │
+│    检查：!expandedBecauseOfFilter → true                                    │
+│    动作：handleFilterToggle()                                                │
+│    结果：                                                                     │
+│      showDespiteFilter = true (过滤展开)                                     │
+│      expanded = (true) && (false) = false                                   │
+│                                                                              │
+│  第 2 次按键：                                                                │
+│    检查：expandedBecauseOfFilter && !expandedBecauseOfCW → true            │
+│    动作：onToggleHidden(status)                                              │
+│    结果：                                                                     │
+│      status.hidden = false (内容警告展开)                                    │
+│      expanded = (true) && (true) = true                                     │
+│                                                                              │
+│  第 3 次按键（折叠）：                                                        │
+│    检查：expandedBecauseOfFilter && expandedBecauseOfCW → true              │
+│    动作：                                                                     │
+│      1. onToggleHidden(status) → status.hidden = true                       │
+│      2. handleFilterToggle() → showDespiteFilter = false                    │
+│    结果：回到初始状态                                                         │
+│                                                                              │
+│  状态流转总结：                                                               │
+│                                                                              │
+│  ┌──────────────┐    按键    ┌──────────────┐    按键    ┌──────────────┐  │
+│  │  过滤折叠    │ ────────► │  过滤展开    │ ────────► │  两者展开    │  │
+│  │  内容折叠    │           │  内容折叠    │           │  内容展开    │  │
+│  │              │           │              │           │              │  │
+│  │  expanded=F  │           │  expanded=F  │           │  expanded=T  │  │
+│  └──────────────┘           └──────────────┘           └──────────────┘  │
+│         ▲                                                │                   │
+│         │                   按键（折叠）                 │                   │
+│         └────────────────────────────────────────────────┘                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.6 状态交互的边界情况
+
+#### 情况 1：只有内容警告，没有过滤警告
+
+```
+状态：
+  matched_filters = undefined
+  status.hidden = true
+  showDespiteFilter = undefined
+
+快捷键行为：
+  直接调用 onToggleHidden(status)
+  切换 status.hidden 的值
+
+状态流转：
+  expanded = true && (!hidden || !spoiler)
+  
+  第 1 次按键：hidden = false → expanded = true
+  第 2 次按键：hidden = true → expanded = false
+```
+
+#### 情况 2：只有过滤警告，没有内容警告
+
+```
+状态：
+  matched_filters = ["关键词"]
+  status.hidden = false (因为没有 spoiler_text)
+  showDespiteFilter = false
+
+快捷键行为：
+  检查：
+    expandedBecauseOfFilter = false
+    expandedBecauseOfCW = true (因为 hidden = false)
+  
+  第 1 次按键：else 分支 → handleFilterToggle()
+    showDespiteFilter = true
+    expanded = (true) && (true) = true
+  
+  第 2 次按键：
+    expandedBecauseOfFilter = true
+    expandedBecauseOfCW = true
+    动作：onToggleHidden + handleFilterToggle
+    但 onToggleHidden 对没有 spoiler_text 的帖子无效
+    实际效果：只有 handleFilterToggle 生效
+    showDespiteFilter = false
+    expanded = false
+```
+
+#### 情况 3：只有媒体模糊，没有其他警告
+
+```
+状态：
+  matched_filters = undefined (假设只有 blur 过滤器)
+  matched_media_filters = ["媒体过滤"]
+  status.hidden = false
+
+快捷键行为：
+  没有 matched_filters，直接调用 onToggleHidden
+  但没有 spoiler_text，onToggleHidden 不改变 expanded
+
+实际效果：
+  expanded 始终为 true，正文正常显示
+  媒体始终模糊，需要单独点击展开
+  快捷键 toggleHidden 对这种情况无效
+```
+
+**注意**：`blur` 过滤器的特殊性：
+- 在选择器中，`blur` 被单独处理
+- 但 `warn` 和 `hide`（在详情页）会设置 `matched_filters`
+- 纯 `blur` 过滤器**不会**设置 `matched_filters`，只设置 `matched_media_filters`
+
+验证代码（`app/javascript/mastodon/selectors/index.js`）：
+```javascript
+// blur 被单独处理，设置 matched_media_filters
+let mediaFilters = filterResults.filter(result => 
+    filters.getIn([result.get('filter'), 'filter_action']) === 'blur');
+
+// 排除 blur 后，剩下的设置 matched_filters
+filterResults = filterResults.filter(result => 
+    filters.getIn([result.get('filter'), 'filter_action']) !== 'blur');
+```
+
+---
+
+## 十、关键文件索引
 
 ### 服务端文件
 
