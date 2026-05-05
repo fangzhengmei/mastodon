@@ -1,19 +1,37 @@
 # Mastodon Filter v2 多客户端分发与同步机制
 
-本文档详细分析 Mastodon Filter v2 在 Web、移动端和第三方客户端上的 API 分发、同步机制，客户端缓存与服务端强制执行的边界，以及 v1 与 v2 的兼容路径。
+> **重要说明**：本文档基于 Mastodon 主仓库代码分析。该仓库**不包含原生移动端应用代码**（iOS/Android/React Native），仅包含：
+> - React Web 前端 (`app/javascript/mastodon/`)
+> - PWA 支持（Service Worker + Web Push 通知）
+> 
+> 对于原生移动端客户端（如官方 iOS/Android 应用或第三方客户端），请参考 [第二部分：第三方客户端开发指南](#第二部分第三方客户端开发指南)。
 
 ---
 
 ## 目录
 
+### 第一部分：项目现有实现分析
 1. [Filter v2 核心数据模型](#1-filter-v2-核心数据模型)
-2. [API 分发机制](#2-api-分发机制)
-3. [实时同步机制](#3-实时同步机制)
-4. [客户端缓存策略](#4-客户端缓存策略)
-5. [服务端强制执行逻辑](#5-服务端强制执行逻辑)
-6. [客户端与服务端边界划分](#6-客户端与服务端边界划分)
-7. [v1 与 v2 兼容路径](#7-v1-与-v2-兼容路径)
-8. [第三方客户端开发指南](#8-第三方客户端开发指南)
+2. [服务端 API 实现](#2-服务端-api-实现)
+3. [服务端强制执行逻辑](#3-服务端强制执行逻辑)
+4. [实时同步机制](#4-实时同步机制)
+5. [Web 前端实现](#5-web-前端实现)
+6. [PWA 与移动端浏览器支持](#6-pwa-与移动端浏览器支持)
+7. [v1 与 v2 兼容实现](#7-v1-与-v2-兼容实现)
+
+### 第二部分：第三方客户端开发指南
+8. [API 使用建议](#8-api-使用建议)
+9. [缓存策略设计](#9-缓存策略设计)
+10. [实时同步实现](#10-实时同步实现)
+11. [过滤行为处理](#11-过滤行为处理)
+12. [移动端特定考虑](#12-移动端特定考虑)
+13. [v1/v2 兼容策略](#13-v1v2-兼容策略)
+
+---
+
+## 第一部分：项目现有实现分析
+
+本部分分析基于 Mastodon 主仓库的实际代码实现。
 
 ---
 
@@ -30,69 +48,113 @@ CustomFilter (过滤器组)
 ├── filter_action: 过滤行为 (warn: 警告 | hide: 隐藏 | blur: 模糊)
 ├── keywords: CustomFilterKeyword[] (多关键词支持)
 └── statuses: CustomFilterStatus[] (特定状态过滤)
-
-CustomFilterKeyword (关键词规则)
-├── keyword: 关键词文本
-└── whole_word: 是否整词匹配
-
-CustomFilterStatus (特定状态过滤)
-└── status_id: 要过滤的状态 ID
 ```
 
-### 1.2 数据模型源码位置
+### 1.2 源码位置与实现
 
-| 组件 | 文件路径 |
-|------|----------|
-| 过滤器模型 | `app/models/custom_filter.rb` |
-| 关键词模型 | `app/models/custom_filter_keyword.rb` |
-| 状态过滤模型 | `app/models/custom_filter_status.rb` |
-| 缓存管理 | `app/models/concerns/custom_filter_cache.rb` |
+| 组件 | 文件路径 | 关键代码 |
+|------|----------|----------|
+| 过滤器模型 | `app/models/custom_filter.rb` | 完整模型定义 |
+| 关键词模型 | `app/models/custom_filter_keyword.rb` | 关键词规则 |
+| 状态过滤模型 | `app/models/custom_filter_status.rb` | 特定状态过滤 |
+| 缓存管理 | `app/models/concerns/custom_filter_cache.rb` | 级联缓存失效 |
+
+**核心模型实现** (`app/models/custom_filter.rb:17-43`):
+
+```ruby
+class CustomFilter < ApplicationRecord
+  self.ignored_columns += %w(whole_word irreversible)
+
+  alias_attribute :title, :phrase
+  alias_attribute :filter_action, :action
+
+  VALID_CONTEXTS = %w(home notifications public thread account).freeze
+  EXPIRATION_DURATIONS = [30.minutes, 1.hour, 6.hours, 12.hours, 1.day, 1.week].freeze
+
+  enum :action, { warn: 0, hide: 1, blur: 2 }, suffix: :action, validate: true
+
+  belongs_to :account
+  has_many :keywords, class_name: 'CustomFilterKeyword', inverse_of: :custom_filter, dependent: :destroy
+  has_many :statuses, class_name: 'CustomFilterStatus', inverse_of: :custom_filter, dependent: :destroy
+  accepts_nested_attributes_for :keywords, reject_if: :all_blank, allow_destroy: true
+end
+```
+
+**关键词正则转换** (`app/models/custom_filter_keyword.rb:26-32`):
+
+```ruby
+def to_regex
+  if whole_word?
+    /(?mix:#{to_regex_sb}#{Regexp.escape(keyword)}#{to_regex_eb})/
+  else
+    /#{Regexp.escape(keyword)}/i
+  end
+end
+```
 
 ---
 
-## 2. API 分发机制
+## 2. 服务端 API 实现
 
-### 2.1 V2 API 端点
+### 2.1 V2 API 控制器
 
-**基础路径**: `/api/v2/filters`
-
-| 方法 | 端点 | 描述 | 权限 |
-|------|------|------|------|
-| GET | `/api/v2/filters` | 获取所有过滤器 | `read:filters` |
-| GET | `/api/v2/filters/:id` | 获取单个过滤器 | `read:filters` |
-| POST | `/api/v2/filters` | 创建过滤器 | `write:filters` |
-| PUT/PATCH | `/api/v2/filters/:id` | 更新过滤器 | `write:filters` |
-| DELETE | `/api/v2/filters/:id` | 删除过滤器 | `write:filters` |
-
-### 2.2 API 控制器实现
-
-**V2 控制器**: `app/controllers/api/v2/filters_controller.rb`
+**文件**: `app/controllers/api/v2/filters_controller.rb`
 
 ```ruby
-# 索引 - 返回所有过滤器及规则
-def index
-  render json: @filters, each_serializer: REST::FilterSerializer, rules_requested: true
-end
+class Api::V2::FiltersController < Api::BaseController
+  before_action -> { doorkeeper_authorize! :read, :'read:filters' }, only: [:index, :show]
+  before_action -> { doorkeeper_authorize! :write, :'write:filters' }, except: [:index, :show]
+  before_action :require_user!
+  before_action :set_filters, only: :index
+  before_action :set_filter, only: [:show, :update, :destroy]
 
-# 创建 - 支持批量关键词
-def create
-  @filter = current_account.custom_filters.create!(resource_params)
-  render json: @filter, serializer: REST::FilterSerializer, rules_requested: true
-end
+  # 获取所有过滤器及规则
+  def index
+    render json: @filters, each_serializer: REST::FilterSerializer, rules_requested: true
+  end
 
-# 参数结构
-def resource_params
-  params.permit(
-    :title,           # 过滤器名称
-    :expires_in,      # 过期时间 (秒)
-    :filter_action,   # warn | hide | blur
-    context: [],      # 应用上下文
-    keywords_attributes: [:id, :keyword, :whole_word, :_destroy]
-  )
+  # 获取单个过滤器
+  def show
+    render json: @filter, serializer: REST::FilterSerializer, rules_requested: true
+  end
+
+  # 创建过滤器（支持多关键词）
+  def create
+    @filter = current_account.custom_filters.create!(resource_params)
+    render json: @filter, serializer: REST::FilterSerializer, rules_requested: true
+  end
+
+  # 更新过滤器
+  def update
+    @filter.update!(resource_params)
+    render json: @filter, serializer: REST::FilterSerializer, rules_requested: true
+  end
+
+  # 删除过滤器
+  def destroy
+    @filter.destroy!
+    render_empty
+  end
+
+  private
+
+  def set_filters
+    @filters = current_account.custom_filters.includes(:keywords, :statuses)
+  end
+
+  def resource_params
+    params.permit(
+      :title,
+      :expires_in,
+      :filter_action,
+      context: [],
+      keywords_attributes: [:id, :keyword, :whole_word, :_destroy]
+    )
+  end
 end
 ```
 
-### 2.3 V2 序列化器
+### 2.2 V2 序列化器
 
 **文件**: `app/serializers/rest/filter_serializer.rb`
 
@@ -101,6 +163,14 @@ class REST::FilterSerializer < ActiveModel::Serializer
   attributes :id, :title, :context, :expires_at, :filter_action
   has_many :keywords, serializer: REST::FilterKeywordSerializer, if: :rules_requested?
   has_many :statuses, serializer: REST::FilterStatusSerializer, if: :rules_requested?
+
+  def id
+    object.id.to_s
+  end
+
+  def rules_requested?
+    instance_options[:rules_requested]
+  end
 end
 ```
 
@@ -114,31 +184,393 @@ end
   "expires_at": "2024-12-31T23:59:59Z",
   "filter_action": "hide",
   "keywords": [
-    {
-      "id": "1",
-      "keyword": "crypto scam",
-      "whole_word": false
-    },
-    {
-      "id": "2",
-      "keyword": "free money",
-      "whole_word": true
-    }
+    { "id": "1", "keyword": "crypto scam", "whole_word": false },
+    { "id": "2", "keyword": "free money", "whole_word": true }
   ],
-  "statuses": [
-    {
-      "id": "1",
-      "status_id": "987654321"
-    }
-  ]
+  "statuses": []
 }
 ```
 
-### 2.4 Web 前端 API 调用
+---
+
+## 3. 服务端强制执行逻辑
+
+### 3.1 服务端缓存结构
+
+**文件**: `app/models/custom_filter.rb:70-93`
+
+```ruby
+# 获取缓存的过滤器 (v3 版本)
+def self.cached_filters_for(account_id)
+  active_filters = Rails.cache.fetch("filters:v3:#{account_id}") do
+    filters_hash = {}
+
+    # 1. 构建关键词过滤器 - 预编译为正则表达式
+    scope = CustomFilterKeyword.left_outer_joins(:custom_filter)
+                                .merge(unexpired.where(account_id: account_id))
+    
+    scope.to_a.group_by(&:custom_filter).each do |filter, keywords|
+      keywords.map!(&:to_regex)  # 转换为正则表达式
+      filters_hash[filter.id] = { 
+        keywords: Regexp.union(keywords), 
+        filter: filter 
+      }
+    end
+
+    # 2. 构建状态过滤器
+    scope = CustomFilterStatus.left_outer_joins(:custom_filter)
+                               .merge(unexpired.where(account_id: account_id))
+    
+    scope.to_a.group_by(&:custom_filter).each do |filter, statuses|
+      filters_hash[filter.id] ||= { filter: filter }
+      filters_hash[filter.id].merge!(status_ids: statuses.map(&:status_id))
+    end
+
+    filters_hash.values.map { |cache| [cache.delete(:filter), cache] }
+  end
+
+  # 二次检查过期
+  active_filters.reject { |custom_filter, _| custom_filter.expired? }
+end
+```
+
+### 3.2 过滤应用逻辑
+
+**文件**: `app/models/custom_filter.rb:95-106`
+
+```ruby
+# 应用过滤器到状态
+def self.apply_cached_filters(cached_filters, status)
+  cached_filters.filter_map do |filter, rules|
+    # 1. 关键词匹配 - 匹配状态的可搜索文本
+    match = rules[:keywords].match(status.proper.searchable_text) if rules[:keywords].present?
+    keyword_matches = [match.to_s] unless match.nil?
+
+    # 2. 状态 ID 匹配 - 匹配特定状态
+    status_matches = [status.id, status.reblog_of_id].compact & rules[:status_ids] if rules[:status_ids].present?
+
+    # 3. 返回过滤结果
+    next if keyword_matches.blank? && status_matches.blank?
+
+    FilterResultPresenter.new(
+      filter: filter,
+      keyword_matches: keyword_matches,
+      status_matches: status_matches
+    )
+  end
+end
+```
+
+### 3.3 状态序列化时的过滤计算
+
+**文件**: `app/serializers/rest/status_serializer.rb:147-153`
+
+```ruby
+class REST::StatusSerializer < ActiveModel::Serializer
+  # ...
+  has_many :filtered, serializer: REST::FilterResultSerializer, if: :current_user?
+
+  def filtered
+    if relationships
+      # 使用预计算的过滤结果 (批量查询优化)
+      relationships.filters_map[object.id] || []
+    else
+      # 实时计算
+      current_user.account.status_matches_filters(object)
+    end
+  end
+end
+```
+
+**Account 层面接口** (`app/models/concerns/account/interactions.rb:211-214`):
+
+```ruby
+def status_matches_filters(status)
+  active_filters = CustomFilter.cached_filters_for(id)
+  CustomFilter.apply_cached_filters(active_filters, status)
+end
+```
+
+### 3.4 Streaming 服务中的过滤
+
+**文件**: `streaming/index.js:768-895`
+
+Streaming 服务在两种情况下执行过滤：
+
+**情况 1: 负载已包含 filtered 属性（Rails 侧已计算）**
+```javascript
+if (Object.hasOwn(payload, "filtered")) {
+  transmit(event, payload);  // 直接透传
+  return;
+}
+```
+
+**情况 2: 需要在 Streaming 侧计算（公共时间线等）**
+```javascript
+// 1. 从数据库查询并构建过滤器缓存
+if (!req.cachedFilters) {
+  const filterRows = values[...].rows;
+  req.cachedFilters = filterRows.reduce((cache, filter) => {
+    // 构建关键词正则表达式
+    cache[filter.id].regexp = new RegExp(
+      keywords.map(([keyword, whole_word]) => {
+        let expr = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (whole_word) {
+          if (/^[\w]/.test(expr)) expr = `\\b${expr}`;
+          if (/[\w]$/.test(expr)) expr = `${expr}\\b`;
+        }
+        return expr;
+      }).join('|'), 'i'
+    );
+    return cache;
+  }, {});
+}
+
+// 2. 构建可搜索文本 (CW + 内容 + 投票选项 + 媒体描述)
+const searchableContent = ([
+  status.spoiler_text || '', 
+  status.content
+]).concat(
+  (status.poll && status.poll.options) ? 
+    status.poll.options.map(option => option.title) : []
+).concat(
+  status.media_attachments.map(att => att.description)
+).join('\n\n');
+
+const searchableTextContent = JSDOM.fragment(searchableContent).textContent;
+
+// 3. 应用过滤
+const filter_results = Object.values(req.cachedFilters).reduce((results, cachedFilter) => {
+  if (cachedFilter.expires_at !== null && cachedFilter.expires_at < now) {
+    return results;  // 已过期
+  }
+  
+  const keyword_matches = searchableTextContent.match(cachedFilter.regexp);
+  if (keyword_matches) {
+    results.push({
+      filter: cachedFilter.filter,
+      keyword_matches,
+      status_matches: null
+    });
+  }
+  return results;
+}, []);
+
+// 4. 附加过滤结果到响应
+transmit(event, {
+  ...payload,
+  filtered: filter_results
+});
+```
+
+---
+
+## 4. 实时同步机制
+
+### 4.1 同步架构
+
+```
+┌─────────────────┐     Redis Pub/Sub      ┌─────────────────┐
+│   Rails 服务    │ ──────────────────────> │  Streaming 服务 │
+│  (过滤器变更)   │  channels:              │  (实时推送)     │
+│                 │  - timeline:{accountId} │                 │
+│                 │  - timeline:system:{id} │                 │
+└─────────────────┘                         └────────┬────────┘
+                                                      │
+                                                      ▼ WebSocket/EventSource
+┌─────────────────────────────────────────────────────────────────┐
+│                        Web 前端 / PWA                             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
+│  │  接收事件     │───>│  清空 Redux   │───>│  重新获取过滤器   │  │
+│  │filters_changed│    │   缓存       │    │  GET /api/v2/filters││
+│  └──────────────┘    └──────────────┘    └──────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 服务端缓存失效
+
+**文件**: `app/models/custom_filter.rb:52-120`
+
+```ruby
+class CustomFilter < ApplicationRecord
+  # 变更前标记
+  before_save :prepare_cache_invalidation!
+  before_destroy :prepare_cache_invalidation!
+
+  # 提交后失效缓存并推送事件
+  after_commit :invalidate_cache!
+
+  def prepare_cache_invalidation!
+    @should_invalidate_cache = true
+  end
+
+  def invalidate_cache!
+    return unless @should_invalidate_cache
+    
+    @should_invalidate_cache = false
+    
+    # 1. 清除 Rails 缓存
+    Rails.cache.delete("filters:v3:#{account_id}")
+    
+    # 2. 向 Redis 发布事件
+    redis.publish("timeline:#{account_id}", { event: :filters_changed }.to_json)
+    redis.publish("timeline:system:#{account_id}", { event: :filters_changed }.to_json)
+  end
+end
+```
+
+### 4.3 级联缓存失效
+
+**文件**: `app/models/concerns/custom_filter_cache.rb`
+
+```ruby
+module CustomFilterCache
+  extend ActiveSupport::Concern
+
+  included do
+    after_commit :invalidate_cache!
+    before_destroy :prepare_cache_invalidation!
+    before_save :prepare_cache_invalidation!
+
+    # 委托给关联的过滤器
+    delegate(
+      :invalidate_cache!,
+      :prepare_cache_invalidation!,
+      to: :custom_filter
+    )
+  end
+end
+```
+
+**说明**: 当 `CustomFilterKeyword` 或 `CustomFilterStatus` 变更时，会自动触发所属 `CustomFilter` 的缓存失效。
+
+### 4.4 Streaming 服务事件处理
+
+**文件**: `streaming/index.js:499-517`
+
+```javascript
+// 系统消息监听器
+const createSystemMessageListener = (req, eventHandlers) => {
+  return message => {
+    const { event } = message;
+    
+    if (event === 'filters_changed') {
+      req.log.debug(`Invalidating filters cache for ${req.accountId}`);
+      // 清空 Streaming 服务本地的过滤器缓存
+      req.cachedFilters = null;
+    }
+  };
+};
+```
+
+**订阅系统频道** (`streaming/index.js:1281-1308`):
+
+```javascript
+const subscribeWebsocketToSystemChannel = ({ websocket, request, subscriptions }) => {
+  const accessTokenChannelId = `timeline:access_token:${request.accessTokenId}`;
+  const systemChannelId = `timeline:system:${request.accountId}`;
+  
+  const listener = createSystemMessageListener(request, {
+    onKill() {
+      websocket.close();
+    },
+  });
+
+  // 监听两个频道的 filters_changed 事件
+  subscribe(accessTokenChannelId, listener);
+  subscribe(systemChannelId, listener);
+};
+```
+
+### 4.5 Web 前端事件监听
+
+**文件**: `app/javascript/mastodon/stream.js:211-220`
+
+```javascript
+// 已知事件类型列表 - 包含 filters_changed
+const KNOWN_EVENT_TYPES = [
+  'update',
+  'delete',
+  'notification',
+  'conversation',
+  'filters_changed',  // 过滤器变更事件
+  'announcement',
+  'announcement.delete',
+  'announcement.reaction',
+];
+```
+
+---
+
+## 5. Web 前端实现
+
+### 5.1 Redux 状态管理
+
+**文件**: `app/javascript/mastodon/reducers/filters.js`
+
+```javascript
+import { Map as ImmutableMap, is, fromJS } from 'immutable';
+import { FILTERS_FETCH_SUCCESS, FILTERS_CREATE_SUCCESS } from '../actions/filters';
+import { FILTERS_IMPORT } from '../actions/importer';
+
+// 规范化单个过滤器
+const normalizeFilter = (state, filter) => {
+  const normalizedFilter = fromJS({
+    id: filter.id,
+    title: filter.title,
+    context: filter.context,
+    filter_action: filter.filter_action,
+    keywords: filter.keywords,
+    expires_at: filter.expires_at ? Date.parse(filter.expires_at) : null,
+  });
+
+  // 智能合并：不覆盖已存在的关键词
+  if (is(state.get(filter.id), normalizedFilter)) {
+    return state;
+  } else {
+    return state.update(filter.id, ImmutableMap(), (old) => (
+      old.mergeWith(
+        ((old_value, new_value) => (new_value === undefined ? old_value : new_value)),
+        normalizedFilter
+      )
+    ));
+  }
+};
+
+// 批量规范化
+const normalizeFilters = (state, filters) => {
+  filters.forEach(filter => {
+    state = normalizeFilter(state, filter);
+  });
+  return state;
+};
+
+// Reducer
+export default function filters(state = ImmutableMap(), action) {
+  switch(action.type) {
+  case FILTERS_CREATE_SUCCESS:
+    return normalizeFilter(state, action.filter);
+  case FILTERS_FETCH_SUCCESS:
+    return normalizeFilters(ImmutableMap(), action.filters);
+  case FILTERS_IMPORT:
+    return normalizeFilters(state, action.filters);
+  default:
+    return state;
+  }
+}
+```
+
+### 5.2 API 调用 Actions
 
 **文件**: `app/javascript/mastodon/actions/filters.js`
 
 ```javascript
+import api from '../api';
+
+export const FILTERS_FETCH_REQUEST = 'FILTERS_FETCH_REQUEST';
+export const FILTERS_FETCH_SUCCESS = 'FILTERS_FETCH_SUCCESS';
+export const FILTERS_FETCH_FAIL    = 'FILTERS_FETCH_FAIL';
+
 // 获取所有过滤器
 export const fetchFilters = () => (dispatch) => {
   dispatch({ type: FILTERS_FETCH_REQUEST });
@@ -157,205 +589,23 @@ export const fetchFilters = () => (dispatch) => {
 
 // 创建过滤器
 export const createFilter = (params, onSuccess, onFail) => (dispatch) => {
-  dispatch(createFilterRequest());
+  dispatch({ type: FILTERS_CREATE_REQUEST });
   api().post('/api/v2/filters', params).then(response => {
-    dispatch(createFilterSuccess(response.data));
+    dispatch({ type: FILTERS_CREATE_SUCCESS, filter: response.data });
     if (onSuccess) onSuccess(response.data);
   });
 };
 ```
 
----
-
-## 3. 实时同步机制
-
-### 3.1 同步架构概览
-
-```
-┌─────────────────┐     Redis Pub/Sub      ┌─────────────────┐
-│   Rails 服务    │ ──────────────────────> │  Streaming 服务 │
-│  (过滤器变更)   │  channel:               │  (实时推送)     │
-│                 │  - timeline:{accountId} │                 │
-│                 │  - timeline:system:{id} │                 │
-└─────────────────┘                         └────────┬────────┘
-                                                      │
-                                                      ▼ WebSocket/EventSource
-┌─────────────────────────────────────────────────────────────────┐
-│                        客户端 (Web/移动端/第三方)                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
-│  │  接收事件     │───>│  清空本地缓存 │───>│  重新获取过滤器   │  │
-│  │filters_changed│    │              │    │  GET /api/v2/filters││
-│  └──────────────┘    └──────────────┘    └──────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 3.2 服务端缓存失效机制
-
-**文件**: `app/models/custom_filter.rb`
-
-```ruby
-# 缓存键
-Rails.cache.fetch("filters:v3:#{account_id}")
-
-# 变更前标记
-before_save :prepare_cache_invalidation!
-before_destroy :prepare_cache_invalidation!
-
-# 提交后失效缓存并推送事件
-after_commit :invalidate_cache!
-
-def invalidate_cache!
-  return unless @should_invalidate_cache
-  
-  @should_invalidate_cache = false
-  
-  # 1. 清除 Rails 缓存
-  Rails.cache.delete("filters:v3:#{account_id}")
-  
-  # 2. 向 Redis 发布事件
-  redis.publish("timeline:#{account_id}", { event: :filters_changed }.to_json)
-  redis.publish("timeline:system:#{account_id}", { event: :filters_changed }.to_json)
-end
-```
-
-### 3.3 Streaming 服务事件处理
-
-**文件**: `streaming/index.js`
-
-```javascript
-// 系统消息监听器
-const createSystemMessageListener = (req, eventHandlers) => {
-  return message => {
-    const { event } = message;
-    
-    if (event === 'filters_changed') {
-      req.log.debug(`Invalidating filters cache for ${req.accountId}`);
-      // 清空 Streaming 服务本地的过滤器缓存
-      req.cachedFilters = null;
-    }
-  };
-};
-
-// 订阅系统频道
-const subscribeWebsocketToSystemChannel = ({ websocket, request, subscriptions }) => {
-  const accessTokenChannelId = `timeline:access_token:${request.accessTokenId}`;
-  const systemChannelId = `timeline:system:${request.accountId}`;
-  
-  // 监听这两个频道的 filters_changed 事件
-  subscribe(accessTokenChannelId, listener);
-  subscribe(systemChannelId, listener);
-};
-```
-
-### 3.4 前端事件处理
-
-**文件**: `app/javascript/mastodon/stream.js`
-
-```javascript
-// 已知事件类型列表
-const KNOWN_EVENT_TYPES = [
-  'update',
-  'delete',
-  'notification',
-  'conversation',
-  'filters_changed',  // 过滤器变更事件
-  'announcement',
-  // ...
-];
-```
-
-**客户端处理建议**:
-
-```javascript
-// 第三方客户端应监听 filters_changed 事件
-function handleStreamEvent(event) {
-  switch (event.type) {
-    case 'filters_changed':
-      // 1. 清空本地过滤器缓存
-      clearLocalFiltersCache();
-      // 2. 重新从服务器获取最新过滤器
-      fetchAndUpdateFilters();
-      // 3. 重新应用过滤到当前时间线
-      reapplyFiltersToCurrentTimeline();
-      break;
-    // ... 其他事件
-  }
-}
-```
-
-### 3.5 级联缓存失效
-
-**文件**: `app/models/concerns/custom_filter_cache.rb`
-
-```ruby
-module CustomFilterCache
-  extend ActiveSupport::Concern
-
-  included do
-    after_commit :invalidate_cache!
-    before_destroy :prepare_cache_invalidation!
-    before_save :prepare_cache_invalidation!
-
-    delegate(
-      :invalidate_cache!,
-      :prepare_cache_invalidation!,
-      to: :custom_filter  // 委托给关联的过滤器
-    )
-  end
-end
-```
-
-**说明**: 当 `CustomFilterKeyword` 或 `CustomFilterStatus` 变更时，会自动触发所属 `CustomFilter` 的缓存失效。
-
----
-
-## 4. 客户端缓存策略
-
-### 4.1 Web 前端状态管理
-
-**Redux 状态结构**: `app/javascript/mastodon/reducers/filters.js`
-
-```javascript
-// 状态结构 (ImmutableMap)
-{
-  "filter_id_1": {
-    id: "filter_id_1",
-    title: "Filter Title",
-    context: ["home", "notifications"],
-    filter_action: "hide",
-    keywords: [
-      { id: "kw1", keyword: "spam", whole_word: false }
-    ],
-    expires_at: 1735689599000  // Unix 时间戳 (ms)
-  }
-}
-
-// 规范化函数
-const normalizeFilter = (state, filter) => {
-  const normalizedFilter = fromJS({
-    id: filter.id,
-    title: filter.title,
-    context: filter.context,
-    filter_action: filter.filter_action,
-    keywords: filter.keywords,
-    expires_at: filter.expires_at ? Date.parse(filter.expires_at) : null,
-  });
-
-  // 智能合并：不覆盖已存在的关键词
-  return state.update(filter.id, ImmutableMap(), (old) => (
-    old.mergeWith(
-      ((old_value, new_value) => (new_value === undefined ? old_value : new_value)),
-      normalizedFilter
-    )
-  ));
-};
-```
-
-### 4.2 过滤器选择器
+### 5.3 过滤器选择器
 
 **文件**: `app/javascript/mastodon/selectors/filters.ts`
 
 ```typescript
+import { createSelector } from '@reduxjs/toolkit';
+import type { RootState } from 'mastodon/store';
+import { toServerSideType } from 'mastodon/utils/filters';
+
 // 根据上下文类型获取有效过滤器
 export const getFilters = createSelector(
   [
@@ -390,8 +640,10 @@ export const getStatusHidden = (
   const filters = getFilters(state, { contextType });
   if (filters === null) return false;
 
-  // 从状态中获取预计算的过滤结果
+  // 从状态中获取服务端预计算的过滤结果
   const filtered = state.statuses.getIn([id, 'filtered']);
+  
+  // 检查是否有 filter_action 为 'hide' 的过滤结果
   return filtered?.some(
     (result) =>
       filters.getIn([result.get('filter'), 'filter_action']) === 'hide',
@@ -399,7 +651,7 @@ export const getStatusHidden = (
 };
 ```
 
-### 4.3 上下文类型映射
+### 5.4 上下文类型映射
 
 **文件**: `app/javascript/mastodon/utils/filters.ts`
 
@@ -427,11 +679,13 @@ export const toServerSideType = (columnType: string) => {
 };
 ```
 
-### 4.4 流式数据中的过滤器同步
+### 5.5 从时间线数据增量更新过滤器
 
 **文件**: `app/javascript/mastodon/actions/importer/index.js`
 
 ```javascript
+import { importFilters, FILTERS_IMPORT } from './index';
+
 // 从状态数据中提取过滤器信息
 export function importFetchedStatuses(statuses, options = {}) {
   return (dispatch, getState) => {
@@ -450,337 +704,279 @@ export function importFetchedStatuses(statuses, options = {}) {
 
     statuses.forEach(processStatus);
     
-    // 导入到 Redux 状态
+    // 导入到 Redux 状态 - 增量更新
     dispatch(importFilters(filters));
   };
 }
-
-// Reducer 处理
-case FILTERS_IMPORT:
-  return normalizeFilters(state, action.filters);
 ```
 
-### 4.5 客户端缓存最佳实践
-
-| 缓存层级 | 存储位置 | 刷新时机 | 适用场景 |
-|---------|---------|---------|---------|
-| 内存缓存 | Redux Store | 每次 `fetchFilters`、`filters_changed` 事件 | Web 前端实时过滤 |
-| 本地存储 | localStorage/IndexedDB | 应用启动时、`filters_changed` 后 | 移动端/第三方客户端离线使用 |
-| 会话缓存 | Streaming 服务内存 | `filters_changed` 事件 | 实时流过滤 |
+**关键点**:
+- Web 前端**不独立执行过滤匹配**
+- 依赖服务端返回的 `status.filtered` 数组
+- Redux 中存储的过滤器列表主要用于：
+  1. 过滤器管理 UI 展示
+  2. 配合 `filtered` 数组判断 `filter_action`
 
 ---
 
-## 5. 服务端强制执行逻辑
+## 6. PWA 与移动端浏览器支持
 
-### 5.1 服务端缓存结构
+> **说明**: Mastodon 主仓库不包含原生 iOS/Android 应用代码，但提供了 PWA (Progressive Web App) 支持，可在移动端浏览器中获得类似原生应用的体验。
 
-**文件**: `app/models/custom_filter.rb`
+### 6.1 Service Worker 实现
 
-```ruby
-# 获取缓存的过滤器 (v3 版本)
-def self.cached_filters_for(account_id)
-  active_filters = Rails.cache.fetch("filters:v3:#{account_id}") do
-    filters_hash = {}
-
-    # 1. 构建关键词过滤器
-    scope = CustomFilterKeyword.left_outer_joins(:custom_filter)
-                                .merge(unexpired.where(account_id: account_id))
-    
-    scope.to_a.group_by(&:custom_filter).each do |filter, keywords|
-      keywords.map!(&:to_regex)  # 转换为正则表达式
-      filters_hash[filter.id] = { 
-        keywords: Regexp.union(keywords), 
-        filter: filter 
-      }
-    end
-
-    # 2. 构建状态过滤器
-    scope = CustomFilterStatus.left_outer_joins(:custom_filter)
-                               .merge(unexpired.where(account_id: account_id))
-    
-    scope.to_a.group_by(&:custom_filter).each do |filter, statuses|
-      filters_hash[filter.id] ||= { filter: filter }
-      filters_hash[filter.id].merge!(status_ids: statuses.map(&:status_id))
-    end
-
-    filters_hash.values.map { |cache| [cache.delete(:filter), cache] }
-  end
-
-  # 二次检查过期
-  active_filters.reject { |custom_filter, _| custom_filter.expired? }
-end
-```
-
-### 5.2 过滤应用逻辑
-
-```ruby
-# 应用过滤器到状态
-def self.apply_cached_filters(cached_filters, status)
-  cached_filters.filter_map do |filter, rules|
-    # 1. 关键词匹配
-    match = rules[:keywords].match(status.proper.searchable_text) if rules[:keywords].present?
-    keyword_matches = [match.to_s] unless match.nil?
-
-    # 2. 状态 ID 匹配
-    status_matches = [status.id, status.reblog_of_id].compact & rules[:status_ids] if rules[:status_ids].present?
-
-    # 3. 返回过滤结果
-    next if keyword_matches.blank? && status_matches.blank?
-
-    FilterResultPresenter.new(
-      filter: filter,
-      keyword_matches: keyword_matches,
-      status_matches: status_matches
-    )
-  end
-end
-```
-
-### 5.3 Account 层面的过滤接口
-
-**文件**: `app/models/concerns/account/interactions.rb`
-
-```ruby
-def status_matches_filters(status)
-  active_filters = CustomFilter.cached_filters_for(id)
-  CustomFilter.apply_cached_filters(active_filters, status)
-end
-```
-
-### 5.4 状态序列化时的过滤计算
-
-**文件**: `app/serializers/rest/status_serializer.rb`
-
-```ruby
-class REST::StatusSerializer < ActiveModel::Serializer
-  # ...
-  
-  has_many :filtered, serializer: REST::FilterResultSerializer, if: :current_user?
-
-  def filtered
-    if relationships
-      # 使用预计算的过滤结果 (批量查询优化)
-      relationships.filters_map[object.id] || []
-    else
-      # 实时计算
-      current_user.account.status_matches_filters(object)
-    end
-  end
-end
-```
-
-### 5.5 FilterResult 实体
-
-**文件**: `app/presenters/filter_result_presenter.rb`
-
-```ruby
-class FilterResultPresenter < ActiveModelSerializers::Model
-  attributes :filter, :keyword_matches, :status_matches
-end
-```
-
-**API 响应中的 `filtered` 字段**:
-
-```json
-{
-  "id": "123456",
-  "content": "...",
-  "filtered": [
-    {
-      "filter": {
-        "id": "filter_1",
-        "title": "Spam Filter",
-        "context": ["home"],
-        "expires_at": null,
-        "filter_action": "hide"
-      },
-      "keyword_matches": ["crypto scam"],
-      "status_matches": null
-    }
-  ]
-}
-```
-
-### 5.6 Streaming 服务中的过滤
-
-**文件**: `streaming/index.js` (关键逻辑)
+**文件**: `app/javascript/mastodon/service_worker/sw.js`
 
 ```javascript
-// Streaming 服务的过滤分两种情况：
+import { ExpirationPlugin } from 'workbox-expiration';
+import { registerRoute } from 'workbox-routing';
+import { CacheFirst } from 'workbox-strategies';
+import { handleNotificationClick, handlePush } from './web_push_notifications';
 
-// 情况 1: 负载已包含 filtered 属性 (Rails 侧已计算)
-if (Object.hasOwn(payload, "filtered")) {
-  transmit(event, payload);  // 直接透传
-  return;
-}
+const CACHE_NAME_PREFIX = 'mastodon-';
 
-// 情况 2: 需要在 Streaming 侧计算 (公共时间线等)
-if (!req.cachedFilters) {
-  // 从数据库查询并构建过滤器缓存
-  const filterRows = values[...].rows;
-  req.cachedFilters = filterRows.reduce((cache, filter) => {
-    // 构建关键词正则表达式
-    cache[filter.id].regexp = new RegExp(
-      keywords.map(([keyword, whole_word]) => {
-        let expr = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        if (whole_word) {
-          if (/^[\w]/.test(expr)) expr = `\\b${expr}`;
-          if (/[\w]$/.test(expr)) expr = `${expr}\\b`;
-        }
-        return expr;
-      }).join('|'), 'i'
-    );
-    return cache;
-  }, {});
-}
+// 缓存国际化文件 (30天)
+registerRoute(
+  /intl\/.*\.js$/,
+  new CacheFirst({
+    cacheName: `${CACHE_NAME_PREFIX}locales`,
+    plugins: [
+      new ExpirationPlugin({
+        maxAgeSeconds: 30 * 24 * 60 * 60,
+        maxEntries: 5,
+      }),
+    ],
+  }),
+);
 
-// 应用过滤
-if (req.cachedFilters) {
-  // 构建可搜索文本
-  const searchableContent = ([
-    status.spoiler_text || '', 
-    status.content
-  ]).concat(
-    (status.poll && status.poll.options) ? 
-      status.poll.options.map(option => option.title) : []
-  ).concat(
-    status.media_attachments.map(att => att.description)
-  ).join('\n\n');
-  
-  const searchableTextContent = JSDOM.fragment(searchableContent).textContent;
-  
-  // 匹配正则
-  const filter_results = Object.values(req.cachedFilters).reduce((results, cachedFilter) => {
-    if (cachedFilter.expires_at !== null && cachedFilter.expires_at < now) {
-      return results;  // 已过期
+// 缓存字体 (30天)
+registerRoute(
+  ({ request }) => request.destination === 'font',
+  new CacheFirst({
+    cacheName: `${CACHE_NAME_PREFIX}fonts`,
+    plugins: [
+      new ExpirationPlugin({
+        maxAgeSeconds: 30 * 24 * 60 * 60,
+        maxEntries: 5,
+      }),
+    ],
+  }),
+);
+
+// 缓存图片 (7天)
+registerRoute(
+  ({ request }) => request.destination === 'image',
+  new CacheFirst({
+    cacheName: `m${CACHE_NAME_PREFIX}media`,
+    plugins: [
+      new ExpirationPlugin({
+        maxAgeSeconds: 7 * 24 * 60 * 60,
+        maxEntries: 256,
+      }),
+    ],
+  }),
+);
+
+// 登出时清除缓存
+self.addEventListener('fetch', function(event) {
+  const url = new URL(event.request.url);
+
+  if (url.pathname === '/auth/sign_out') {
+    const asyncResponse = fetch(event.request);
+    const asyncCache = caches.open(`${CACHE_NAME_PREFIX}web`);
+
+    event.respondWith(asyncResponse.then(response => {
+      if (response.ok || response.type === 'opaqueredirect') {
+        return Promise.all([
+          asyncCache.then(cache => cache.delete('/')),
+          indexedDB.deleteDatabase('mastodon'),  // 清除 IndexedDB
+        ]).then(() => response);
+      }
+      return response;
+    }));
+  }
+});
+
+// Web Push 通知
+self.addEventListener('push', handlePush);
+self.addEventListener('notificationclick', handleNotificationClick);
+```
+
+### 6.2 Web Push 通知注册
+
+**文件**: `app/javascript/mastodon/actions/push_notifications/registerer.js`
+
+```javascript
+import api from '../../api';
+import { me } from '../../initial_state';
+import { pushNotificationsSetting } from '../../settings';
+
+// 检查浏览器支持
+const supportsPushNotifications = (
+  'serviceWorker' in navigator && 
+  'PushManager' in window && 
+  'getKey' in PushSubscription.prototype
+);
+
+// 注册推送通知
+export function register() {
+  return (dispatch, getState) => {
+    dispatch(setBrowserSupport(supportsPushNotifications));
+
+    if (supportsPushNotifications) {
+      getRegistration()
+        .then(getPushSubscription)
+        .then(({ registration, subscription }) => {
+          if (subscription !== null) {
+            // 检查现有订阅是否有效
+            // ...
+          }
+          // 订阅或重新订阅
+          return subscribe(registration).then(
+            subscription => sendSubscriptionToBackend(subscription));
+        })
+        .then(subscription => {
+          dispatch(setSubscription(subscription));
+        })
+        .catch(error => {
+          dispatch(clearSubscription());
+        });
     }
-    
-    const keyword_matches = searchableTextContent.match(cachedFilter.regexp);
-    if (keyword_matches) {
-      results.push({
-        filter: cachedFilter.filter,
-        keyword_matches,
-        status_matches: null
-      });
-    }
-    return results;
-  }, []);
-  
-  transmit(event, {
-    ...payload,
-    filtered: filter_results  // 添加过滤结果
-  });
+  };
 }
-```
 
-### 5.7 通知过滤
+// 发送订阅到后端
+const sendSubscriptionToBackend = (subscription) => {
+  const params = { subscription: { ...subscription.toJSON(), standard: true } };
 
-**文件**: `app/services/notify_service.rb` (隐含逻辑)
+  if (me) {
+    const data = pushNotificationsSetting.get(me);
+    if (data) {
+      params.data = data;
+    }
+  }
 
-通知的过滤在两个层面执行：
-1. **创建时**: 检查是否匹配过滤器，决定是否创建通知
-2. **传递时**: Streaming 服务和序列化器再次应用过滤
-
----
-
-## 6. 客户端与服务端边界划分
-
-### 6.1 职责划分总览
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                         服务端 (强制执行)                            │
-├────────────────────────────────────────────────────────────────────┤
-│  ✅ 决定状态是否匹配过滤器规则                                        │
-│  ✅ 计算 filtered 数组并附加到响应                                    │
-│  ✅ 维护过滤器的缓存和失效机制                                        │
-│  ✅ 通过 WebSocket 推送 filters_changed 事件                         │
-│  ✅ 对公共时间线在 Streaming 侧执行过滤计算                           │
-│  ✅ 处理 hide 动作的不可逆过滤 (通知清理等)                           │
-└────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ filtered[] 数组
-┌────────────────────────────────────────────────────────────────────┐
-│                         客户端 (表现层)                              │
-├────────────────────────────────────────────────────────────────────┤
-│  ✅ 缓存过滤器列表用于 UI 展示                                        │
-│  ✅ 根据 filtered[].filter.filter_action 决定 UI 行为               │
-│  ✅ 处理警告对话框、模糊显示等交互                                     │
-│  ✅ 监听 filters_changed 事件并刷新缓存                               │
-│  ❌ 不独立执行过滤匹配逻辑 (依赖服务端的 filtered 数组)               │
-│  ❌ 不修改过滤器的 filter_action 含义                                 │
-└────────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 详细边界表
-
-| 功能 | 服务端 | 客户端 | 说明 |
-|------|--------|--------|------|
-| **过滤规则匹配** | ✅ 负责 | ❌ 不负责 | 服务端计算 `filtered` 数组 |
-| **过滤结果传递** | ✅ 提供 | ✅ 使用 | 服务端在响应中附加 `filtered` |
-| **filter_action 语义** | ✅ 定义 | ✅ 遵循 | hide=隐藏, warn=警告, blur=模糊 |
-| **不可逆过滤** | ✅ 执行 | ❌ 不参与 | hide 动作可能触发通知清理等 |
-| **缓存维护** | ✅ 服务端缓存 | ✅ 本地缓存 | 双重缓存，通过事件同步 |
-| **变更推送** | ✅ 发起 | ✅ 接收 | `filters_changed` 事件 |
-
-### 6.3 filter_action 的语义
-
-| 值 | 服务端行为 | 客户端行为 |
-|----|-----------|-----------|
-| `warn` | 标记过滤结果 | 显示警告/折叠内容，用户可展开 |
-| `hide` | 标记过滤结果，可能触发清理逻辑 | 完全隐藏内容 |
-| `blur` | 标记过滤结果 | 模糊显示敏感媒体/内容 |
-
-**重要**: 服务端不直接执行隐藏操作，只是提供 `filter_action` 建议。客户端根据此建议决定 UI 表现。
-
-### 6.4 为什么客户端不独立过滤？
-
-**设计决策原因**:
-
-1. **一致性保证**: 所有客户端看到相同的过滤结果
-2. **计算效率**: 服务端可以批量计算、缓存优化
-3. **数据完整性**: 服务端能访问完整的搜索文本 (包括 CW、媒体描述等)
-4. **安全性**: 防止客户端绕过过滤规则
-5. **未来兼容**: 服务端过滤逻辑可独立升级
-
-### 6.5 客户端的"轻量"过滤
-
-客户端确实存在一些"轻量"过滤逻辑，但这些是**基于服务端结果的二次处理**:
-
-```typescript
-// 从 selectors/filters.ts 可以看到
-export const getStatusHidden = (state, { id, contextType }) => {
-  const filters = getFilters(state, { contextType });
-  
-  // 使用服务端提供的 filtered 数组
-  const filtered = state.statuses.getIn([id, 'filtered']);
-  
-  // 检查是否有 filter_action 为 'hide' 的过滤结果
-  return filtered?.some(
-    (result) =>
-      filters.getIn([result.get('filter'), 'filter_action']) === 'hide',
-  );
+  return api().post('/api/web/push_subscriptions', params).then(response => response.data);
 };
 ```
 
-**关键点**: 客户端只是**解释**服务端的过滤结果，而不是**重新计算**过滤匹配。
+### 6.3 localStorage 工具
+
+**文件**: `app/javascript/mastodon/hooks/useStorage.ts`
+
+```typescript
+interface StorageOptions {
+  type?: 'local' | 'session';
+  prefix?: string;
+}
+
+export function useStorage({
+  type = 'local',
+  prefix = '',
+}: StorageOptions = {}) {
+  const storageType = type === 'local' ? 'localStorage' : 'sessionStorage';
+  
+  const getItem = useCallback(
+    (key: string) => {
+      try {
+        return window[storageType].getItem(prefix ? `${prefix};${key}` : key);
+      } catch {
+        return null;
+      }
+    },
+    [storageType, prefix],
+  );
+
+  const setItem = useCallback(
+    (key: string, value: string) => {
+      try {
+        window[storageType].setItem(prefix ? `${prefix};${key}` : key, value);
+      } catch {}
+    },
+    [storageType, prefix],
+  );
+
+  const removeItem = useCallback(
+    (key: string) => {
+      try {
+        window[storageType].removeItem(prefix ? `${prefix};${key}` : key);
+      } catch {}
+    },
+    [storageType, prefix],
+  );
+
+  return { isAvailable, getItem, setItem, removeItem };
+}
+```
+
+### 6.4 IndexedDB 使用 (Emoji 缓存示例)
+
+**文件**: `app/javascript/mastodon/features/emoji/database.ts`
+
+```typescript
+// 使用 idb 库操作 IndexedDB
+import { openEmojiDB } from './db-schema';
+
+// 缓存自定义表情
+export async function putCustomEmojiData({
+  emojis,
+  clear = false,
+}: {
+  emojis: ApiCustomEmojiJSON[];
+  clear?: boolean;
+}) {
+  const db = await loadDB();
+  const trx = db.transaction('custom', 'readwrite');
+
+  if (clear) {
+    await trx.store.clear();
+  }
+
+  await Promise.all(
+    emojis.map((emoji) => trx.store.put(transformCustomEmojiData(emoji))),
+  );
+  await trx.done;
+}
+
+// 从缓存读取
+export async function loadCacheValue(key: CacheKey) {
+  const db = await loadDB();
+  const value = await db.get('etags', key);
+  return value;
+}
+```
+
+### 6.5 PWA 中过滤器缓存现状分析
+
+**当前实现的限制**:
+
+| 功能 | 实现状态 | 说明 |
+|------|---------|------|
+| Redux 内存缓存 | ✅ 已实现 | `filters` reducer |
+| localStorage 持久化 | ❌ 未实现 | 刷新页面后丢失 |
+| IndexedDB 持久化 | ❌ 未实现 | 仅用于 emoji 缓存 |
+| 后台同步 | ❌ 未实现 | 无 Background Sync |
+| 离线过滤 | ❌ 不支持 | 依赖服务端 `filtered` 数组 |
+
+**对移动端 PWA 的影响**:
+1. 每次刷新页面都需要重新调用 `GET /api/v2/filters`
+2. 离线状态下无法访问过滤器列表
+3. 离线状态下无法正确应用过滤（依赖服务端计算）
 
 ---
 
-## 7. v1 与 v2 兼容路径
+## 7. v1 与 v2 兼容实现
 
 ### 7.1 版本差异总览
 
 | 特性 | v1 (已废弃) | v2 |
 |------|------------|-----|
-| **废弃状态** | 活跃废弃 (deprecate_api '2022-11-14') | 当前版本 |
-| **数据模型** | 单关键词 = 一个 Filter | 过滤器组 = Filter + N 关键词 |
-| **API 端点** | `/api/v1/filters` | `/api/v2/filters` |
-| **序列化器** | `REST::V1::FilterSerializer` | `REST::FilterSerializer` |
-| **过滤动作** | `irreversible` (布尔) | `filter_action` (枚举: warn/hide/blur) |
-| **状态过滤** | 不支持 | 支持 (`CustomFilterStatus`) |
+| 废弃状态 | `deprecate_api '2022-11-14'` | 当前版本 |
+| 数据模型 | 单关键词 = 一个 Filter | 过滤器组 + N 关键词 |
+| 过滤动作 | `irreversible` (布尔) | `filter_action` (warn/hide/blur) |
+| 状态过滤 | 不支持 | 支持 |
 
-### 7.2 v1 API 控制器实现
+### 7.2 v1 API 控制器
 
 **文件**: `app/controllers/api/v1/filters_controller.rb`
 
@@ -843,38 +1039,28 @@ end
 
 ### 7.3 模型层面的兼容
 
-**文件**: `app/models/custom_filter.rb`
+**文件**: `app/models/custom_filter.rb:62-68`
 
 ```ruby
 class CustomFilter < ApplicationRecord
-  # 忽略旧字段 (已迁移)
-  self.ignored_columns += %w(whole_word irreversible)
-
-  # 别名兼容
-  alias_attribute :title, :phrase           # v1: phrase → v2: title
-  alias_attribute :filter_action, :action   # v2: filter_action → 内部: action
-
-  # 枚举定义
-  enum :action, { warn: 0, hide: 1, blur: 2 }, suffix: :action, validate: true
-
   # v1 irreversible 兼容性
+  
+  # 设置时：true → hide, false → warn
   def irreversible=(value)
-    # true → hide, false → warn
     self.action = ActiveModel::Type::Boolean.new.cast(value) ? :hide : :warn
   end
 
+  # 读取时：hide → true, warn → false
   def irreversible?
     hide_action?
   end
 end
 ```
 
-**CustomFilterKeyword 兼容**:
+**关键词别名** (`app/models/custom_filter_keyword.rb:24`):
 
 ```ruby
-class CustomFilterKeyword < ApplicationRecord
-  alias_attribute :phrase, :keyword  # v1: phrase → v2: keyword
-end
+alias_attribute :phrase, :keyword  # v1: phrase → v2: keyword
 ```
 
 ### 7.4 v1 序列化器
@@ -910,7 +1096,7 @@ end
 
 ### 7.5 v1 vs v2 响应对比
 
-**v1 响应 (GET /api/v1/filters)**:
+**v1 响应** (`GET /api/v1/filters`):
 
 ```json
 [
@@ -925,7 +1111,7 @@ end
   {
     "id": "keyword_id_2",
     "phrase": "scam",
-    "context": ["home", "notifications"],  // 与上面相同
+    "context": ["home", "notifications"],  // 与上面相同的上下文
     "whole_word": true,
     "expires_at": "2024-12-31T23:59:59Z",
     "irreversible": true
@@ -933,7 +1119,7 @@ end
 ]
 ```
 
-**v2 响应 (GET /api/v2/filters)**:
+**v2 响应** (`GET /api/v2/filters`):
 
 ```json
 [
@@ -952,61 +1138,72 @@ end
 ]
 ```
 
-### 7.6 迁移路径
-
-**对于服务端**:
-- 双 API 并存，v1 内部映射到 v2 数据模型
-- v1 API 返回 `Deprecation` 警告头
-- 新功能只在 v2 实现 (如状态过滤、blur 动作)
-
-**对于客户端**:
-
-| 客户端类型 | 推荐策略 |
-|-----------|---------|
-| **新开发客户端** | 直接使用 v2 API |
-| **现有 v1 客户端** | 继续使用 v1 API (兼容层会处理)，但应尽快迁移 |
-| **跨版本客户端** | 检测服务器支持，优先 v2，降级 v1 |
-
-### 7.7 v1 的局限性
+### 7.6 v1 的局限性
 
 使用 v1 API 存在以下限制：
 
-1. **多关键词限制**: 无法通过 v1 API 修改包含多个关键词的过滤器组属性
-2. **无状态过滤**: v1 不支持 `CustomFilterStatus` (特定状态过滤)
-3. **无 blur 动作**: v1 只有 `irreversible` (映射到 hide/warn)，不支持 blur
-4. **ID 混淆**: v1 返回的是关键词 ID，不是过滤器组 ID
-5. **废弃警告**: 响应包含 `Deprecation` HTTP 头
+| 限制 | 说明 |
+|------|------|
+| 多关键词限制 | 无法通过 v1 API 修改包含多个关键词的过滤器组属性 |
+| 无状态过滤 | v1 不支持 `CustomFilterStatus` |
+| 无 blur 动作 | 只有 `irreversible` (映射到 hide/warn)，不支持 blur |
+| ID 混淆 | v1 返回的是关键词 ID，不是过滤器组 ID |
+| 废弃警告 | 响应包含 `Deprecation` HTTP 头 |
 
 ---
 
-## 8. 第三方客户端开发指南
+## 第二部分：第三方客户端开发指南
 
-### 8.1 API 使用建议
+本部分为第三方客户端开发者提供建议，包括：
+- 原生 iOS/Android 应用
+- 跨平台应用 (React Native, Flutter)
+- 第三方 Web 客户端
 
-**推荐流程**:
+---
+
+## 8. API 使用建议
+
+### 8.1 端点选择
+
+**推荐**: 优先使用 v2 API
+
+| 场景 | 推荐端点 | 说明 |
+|------|---------|------|
+| 新开发客户端 | `GET /api/v2/filters` | 完整功能支持 |
+| 维护现有 v1 客户端 | `GET /api/v1/filters` | 兼容层会处理 |
+| 检测服务器版本 | `GET /api/v2/instance` | 检查 v2 API 是否可用 |
+
+### 8.2 核心 API 调用流程
 
 ```
-1. 应用启动时:
-   └── GET /api/v2/filters → 缓存到本地存储
+应用启动时:
+1. 检查 API 版本支持
+   └── 优先尝试 v2，失败则降级 v1
 
-2. 建立 WebSocket/EventSource 连接:
-   └── 订阅 timeline 和 system 频道
-   └── 监听 filters_changed 事件
+2. 获取过滤器列表
+   └── GET /api/v2/filters
+   └── 缓存到本地存储
 
-3. 收到 filters_changed 时:
-   ├── 清空本地缓存
-   ├── 重新 GET /api/v2/filters
-   └── 重新应用过滤到当前显示的时间线
+3. 建立流式连接
+   └── WebSocket: /api/v1/streaming/
+   └── 订阅: user, user:notification
+   └── 监听: filters_changed 事件
 
-4. 处理时间线/通知数据时:
-   └── 检查 status.filtered 数组
-   └── 根据 filter_result.filter.filter_action 决定 UI 行为
+运行时:
+4. 加载时间线
+   └── 检查每个 status.filtered 数组
+   └── 根据 filter_action 决定 UI 行为
+
+5. 收到 filters_changed
+   └── 清空本地缓存
+   └── 重新 GET /api/v2/filters
+   └── 重新应用过滤到当前显示的内容
 ```
 
-### 8.2 关键类型定义
+### 8.3 TypeScript 类型定义
 
 ```typescript
-// Filter v2 核心类型
+// 核心类型定义
 
 interface Filter {
   id: string;
@@ -1039,123 +1236,137 @@ interface FilterResult {
 
 interface Status {
   id: string;
+  content: string;
   // ... 其他字段
   filtered?: FilterResult[];  // 关键：服务端计算的过滤结果
 }
 ```
 
-### 8.3 上下文映射
-
-客户端需要将 UI 上下文映射到服务端上下文:
+### 8.4 v1 类型定义 (兼容用)
 
 ```typescript
-function toServerSideContext(clientContext: string): FilterContext {
-  switch (clientContext) {
-    case 'home':
-    case 'notifications':
-    case 'public':
-    case 'thread':
-    case 'account':
-      return clientContext as FilterContext;
-    case 'detailed':
-    case 'thread-view':
-      return 'thread';
-    case 'bookmarks':
-    case 'favourites':
-    case 'list':
-      return 'home';
-    default:
-      return 'public';
-  }
+interface V1Filter {
+  id: string;           // 关键词 ID，不是过滤器组 ID
+  phrase: string;       // 关键词
+  context: string[];
+  whole_word: boolean;
+  expires_at: string | null;
+  irreversible: boolean; // true=hide, false=warn
 }
 ```
 
-### 8.4 过滤器生效检查
+---
 
-```typescript
-function isFilterActiveInContext(
-  filter: Filter, 
-  context: FilterContext, 
-  now: Date = new Date()
-): boolean {
-  // 1. 检查上下文匹配
-  if (!filter.context.includes(context)) {
-    return false;
-  }
-  
-  // 2. 检查是否过期
-  if (filter.expires_at) {
-    const expireDate = new Date(filter.expires_at);
-    if (expireDate <= now) {
-      return false;
-    }
-  }
-  
-  return true;
+## 9. 缓存策略设计
+
+### 9.1 推荐缓存层级
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      缓存层级架构                              │
+├─────────────────────────────────────────────────────────────┤
+│  L1: 内存缓存                                                 │
+│  ├── Redux / MobX / ViewModel 状态                          │
+│  └── 用于 UI 实时访问和过滤决策                              │
+├─────────────────────────────────────────────────────────────┤
+│  L2: 持久化存储                                               │
+│  ├── iOS: CoreData / Realm / UserDefaults                   │
+│  ├── Android: Room / SQLite / SharedPreferences             │
+│  ├── React Native: AsyncStorage / Realm / WatermelonDB      │
+│  └── Web: IndexedDB / localStorage                          │
+├─────────────────────────────────────────────────────────────┤
+│  L3: 服务端                                                   │
+│  └── 始终作为数据真实来源                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 缓存数据结构
+
+**CoreData / Room 实体设计**:
+
+```swift
+// Swift (CoreData)
+@objc(FilterEntity)
+class FilterEntity: NSManagedObject {
+    @NSManaged var id: String
+    @NSManaged var title: String
+    @NSManaged var context: [String]  // 存储为 JSON 或 Transformable
+    @NSManaged var expiresAt: Date?
+    @NSManaged var filterAction: String  // "warn", "hide", "blur"
+    @NSManaged var keywords: Set<KeywordEntity>
+    @NSManaged var lastFetchedAt: Date  // 缓存时间戳
+}
+
+@objc(KeywordEntity)
+class KeywordEntity: NSManagedObject {
+    @NSManaged var id: String
+    @NSManaged var keyword: String
+    @NSManaged var wholeWord: Bool
+    @NSManaged var filter: FilterEntity
 }
 ```
 
-### 8.5 状态过滤行为处理
+```kotlin
+// Kotlin (Room)
+@Entity(tableName = "filters")
+data class FilterEntity(
+    @PrimaryKey val id: String,
+    val title: String,
+    val context: String,  // JSON 数组字符串
+    val expiresAt: Long?,  // 时间戳
+    val filterAction: String,
+    val lastFetchedAt: Long
+)
+
+@Entity(
+    tableName = "filter_keywords",
+    foreignKeys = [ForeignKey(
+        entity = FilterEntity::class,
+        parentColumns = ["id"],
+        childColumns = ["filterId"],
+        onDelete = CASCADE
+    )]
+)
+data class FilterKeywordEntity(
+    @PrimaryKey val id: String,
+    val filterId: String,
+    val keyword: String,
+    val wholeWord: Boolean
+)
+```
+
+### 9.3 缓存更新策略
+
+| 触发时机 | 操作 |
+|---------|------|
+| 应用启动 | 调用 `GET /api/v2/filters` 并更新缓存 |
+| 收到 `filters_changed` 事件 | 清空缓存，重新获取 |
+| 用户修改过滤器 | 立即同步到服务端，成功后更新缓存 |
+| 缓存过期 (如 24 小时) | 后台刷新 |
+
+### 9.4 缓存过期处理
 
 ```typescript
-function determineFilterBehavior(
-  status: Status,
-  filters: Map<string, Filter>,
-  context: FilterContext
-): { 
-  shouldHide: boolean; 
-  shouldWarn: boolean; 
-  shouldBlur: boolean;
-  activeFilters: FilterResult[];
-} {
-  const result = {
-    shouldHide: false,
-    shouldWarn: false,
-    shouldBlur: false,
-    activeFilters: [] as FilterResult[],
-  };
-
-  if (!status.filtered || status.filtered.length === 0) {
-    return result;
-  }
-
+// 示例：缓存有效性检查
+function isCacheValid(lastFetchedAt: Date, maxAge: number = 24 * 60 * 60 * 1000): boolean {
   const now = new Date();
+  return (now.getTime() - lastFetchedAt.getTime()) < maxAge;
+}
 
-  for (const filterResult of status.filtered) {
-    const filter = filterResult.filter;
-    
-    // 检查过滤器在当前上下文中是否生效
-    if (!isFilterActiveInContext(filter, context, now)) {
-      continue;
-    }
-
-    result.activeFilters.push(filterResult);
-
-    // 根据 filter_action 决定行为
-    switch (filter.filter_action) {
-      case 'hide':
-        result.shouldHide = true;
-        break;
-      case 'warn':
-        result.shouldWarn = true;
-        break;
-      case 'blur':
-        result.shouldBlur = true;
-        break;
-    }
-  }
-
-  // 优先级: hide > warn/blur
-  if (result.shouldHide) {
-    result.shouldWarn = false;
-    result.shouldBlur = false;
-  }
-
-  return result;
+// 过滤器过期检查
+function isFilterExpired(filter: Filter): boolean {
+  if (!filter.expires_at) return false;
+  return new Date(filter.expires_at) < new Date();
 }
 ```
 
-### 8.6 WebSocket 事件处理
+---
+
+## 10. 实时同步实现
+
+### 10.1 WebSocket 连接管理
+
+**事件监听**:
 
 ```typescript
 interface StreamEvent {
@@ -1166,126 +1377,575 @@ interface StreamEvent {
 
 class FilterSyncManager {
   private filters: Map<string, Filter> = new Map();
-  private onFiltersChanged?: () => void;
+  private ws: WebSocket | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
 
-  constructor(onFiltersChanged?: () => void) {
-    this.onFiltersChanged = onFiltersChanged;
+  // 连接流式 API
+  connect(accessToken: string, streamingUrl: string) {
+    const url = `${streamingUrl}/api/v1/streaming/?access_token=${accessToken}&stream=user`;
+    this.ws = new WebSocket(url);
+
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      this.handleStreamEvent(data);
+    };
+
+    this.ws.onclose = () => {
+      this.handleDisconnect();
+    };
   }
 
-  // 处理 WebSocket 消息
-  handleStreamEvent(event: StreamEvent): void {
-    if (event.event === 'filters_changed') {
-      this.handleFiltersChanged();
+  // 处理流式事件
+  private handleStreamEvent(data: StreamEvent) {
+    switch (data.event) {
+      case 'filters_changed':
+        this.handleFiltersChanged();
+        break;
+      case 'update':
+        // 新状态，检查 data.payload.filtered
+        this.handleStatusUpdate(JSON.parse(data.payload!));
+        break;
+      // ... 其他事件
     }
   }
 
-  private async handleFiltersChanged(): Promise<void> {
-    // 1. 触发 UI 更新前的准备
+  // 处理过滤器变更
+  private async handleFiltersChanged() {
+    console.log('Filters changed, refreshing...');
+    
+    // 1. 通知 UI 显示加载状态
+    this.onFiltersUpdating?.();
+    
     // 2. 重新获取过滤器
-    await this.fetchFilters();
-    // 3. 通知 UI 更新
-    this.onFiltersChanged?.();
-  }
-
-  // 从服务器获取最新过滤器
-  async fetchFilters(): Promise<void> {
-    const response = await fetch('/api/v2/filters', {
-      headers: {
-        'Authorization': `Bearer ${this.accessToken}`,
-      },
-    });
-    
-    const filters: Filter[] = await response.json();
-    this.filters = new Map(filters.map(f => [f.id, f]));
-    
-    // 持久化到本地存储
-    this.persistToStorage();
-  }
-
-  // 获取过滤器
-  getFilter(id: string): Filter | undefined {
-    return this.filters.get(id);
-  }
-
-  // 获取指定上下文的有效过滤器
-  getActiveFilters(context: FilterContext): Filter[] {
-    const now = new Date();
-    return Array.from(this.filters.values()).filter(f => 
-      isFilterActiveInContext(f, context, now)
-    );
+    try {
+      const filters = await this.fetchFilters();
+      this.filters = new Map(filters.map(f => [f.id, f]));
+      
+      // 3. 持久化到本地存储
+      await this.persistFilters(filters);
+      
+      // 4. 通知 UI 更新
+      this.onFiltersChanged?.(filters);
+      
+      // 5. 重新应用过滤到当前时间线
+      this.reapplyFiltersToCurrentTimeline();
+    } catch (error) {
+      console.error('Failed to refresh filters:', error);
+    }
   }
 }
 ```
 
-### 8.7 错误处理和降级策略
+### 10.2 重连策略
 
 ```typescript
-class FilterManager {
-  // 获取过滤器时的降级策略
-  async getFiltersWithFallback(): Promise<Filter[]> {
-    try {
-      // 尝试 v2 API
-      return await this.fetchV2Filters();
-    } catch (v2Error) {
-      // v2 失败，尝试 v1
-      try {
-        const v1Filters = await this.fetchV1Filters();
-        return this.convertV1ToV2(v1Filters);
-      } catch (v1Error) {
-        // 都失败，使用本地缓存
-        return this.getCachedFilters() || [];
-      }
-    }
-  }
-
-  // v1 到 v2 的转换 (用于降级)
-  private convertV1ToV2(v1Filters: V1Filter[]): Filter[] {
-    // 注意：v1 每个关键词都是独立的"过滤器"
-    // 转换时可以将它们分组或保持独立
+private handleDisconnect() {
+  if (this.reconnectAttempts < this.maxReconnectAttempts) {
+    const delay = Math.pow(2, this.reconnectAttempts) * 1000;  // 指数退避
+    this.reconnectAttempts++;
     
-    return v1Filters.map((v1, index) => ({
-      id: `v1-converted-${v1.id}`,
-      title: v1.phrase,  // v1 没有 title，用 phrase 代替
-      context: v1.context,
-      expires_at: v1.expires_at,
-      filter_action: v1.irreversible ? 'hide' : 'warn',
-      keywords: [{
-        id: v1.id,
-        keyword: v1.phrase,
-        whole_word: v1.whole_word,
-      }],
-      statuses: [],  // v1 不支持状态过滤
-    }));
+    setTimeout(() => {
+      this.connect(this.accessToken!, this.streamingUrl!);
+    }, delay);
   }
 }
 ```
 
-### 8.8 测试建议
+### 10.3 多设备同步场景
 
-**测试场景**:
+```
+场景：用户在设备 A 上修改过滤器
 
-1. **基本过滤**:
-   - 创建包含多个关键词的过滤器
-   - 发布包含关键词的状态
-   - 验证时间线中状态的 `filtered` 数组
+1. 设备 A:
+   └── PATCH /api/v2/filters/:id
+   └── 成功后更新本地缓存
 
-2. **不同 filter_action**:
-   - 测试 `warn`：状态应显示警告但可展开
-   - 测试 `hide`：状态应完全隐藏
-   - 测试 `blur`：媒体应模糊显示
+2. 服务端:
+   └── 更新数据库
+   └── 失效 Rails.cache("filters:v3:{account_id}")
+   └── Redis.publish("timeline:{account_id}", {event: "filters_changed"})
+   └── Redis.publish("timeline:system:{account_id}", {event: "filters_changed"})
 
-3. **上下文过滤**:
-   - 过滤器只在 `notifications` 上下文生效
-   - 验证主页不应用此过滤
+3. Streaming 服务:
+   └── 收到 filters_changed 事件
+   └── 清空 req.cachedFilters
+   └── 向所有已连接的 WebSocket 客户端推送 filters_changed
 
-4. **实时同步**:
-   - 客户端 A 创建过滤器
-   - 客户端 B 应收到 `filters_changed` 事件
-   - 客户端 B 应刷新过滤器列表
+4. 设备 B (已连接):
+   └── 收到 WebSocket 消息: {event: "filters_changed"}
+   └── 清空本地缓存
+   └── GET /api/v2/filters
+   └── 更新 UI
 
-5. **过期处理**:
-   - 创建有过期时间的过滤器
-   - 等待过期后验证过滤器不再生效
+5. 设备 C (后台/未连接):
+   └── 下次启动或恢复连接时
+   └── GET /api/v2/filters 获取最新状态
+```
+
+---
+
+## 11. 过滤行为处理
+
+### 11.1 核心原则
+
+**重要**: 客户端**不应该**独立执行过滤匹配逻辑。
+
+| 职责 | 服务端 | 客户端 |
+|------|--------|--------|
+| 计算 `status.filtered` 数组 | ✅ 负责 | ❌ 不负责 |
+| 决定过滤匹配 | ✅ 负责 | ❌ 不负责 |
+| 解释 `filter_action` | ❌ 不负责 | ✅ 负责 |
+| UI 表现 (隐藏/警告/模糊) | ❌ 不负责 | ✅ 负责 |
+
+### 11.2 上下文映射
+
+客户端需要将 UI 上下文映射到服务端上下文:
+
+```typescript
+type ClientContext = 
+  | 'home' 
+  | 'notifications' 
+  | 'public' 
+  | 'thread' 
+  | 'account'
+  | 'detailed'      // 详情页
+  | 'bookmarks'     // 书签
+  | 'favourites'    // 收藏
+  | `list:${string}` // 列表
+  | string;          // 其他
+
+function toServerSideContext(clientContext: ClientContext): FilterContext {
+  switch (clientContext) {
+    case 'home':
+    case 'notifications':
+    case 'public':
+    case 'thread':
+    case 'account':
+      return clientContext as FilterContext;
+    case 'detailed':
+      return 'thread';
+    case 'bookmarks':
+    case 'favourites':
+      return 'home';
+    default:
+      if (clientContext.startsWith('list:')) {
+        return 'home';
+      }
+      return 'public';
+  }
+}
+```
+
+### 11.3 过滤行为判断
+
+```typescript
+interface FilterBehavior {
+  shouldHide: boolean;      // 完全隐藏
+  shouldWarn: boolean;      // 显示警告
+  shouldBlur: boolean;      // 模糊显示
+  activeFilters: FilterResult[];
+}
+
+function determineFilterBehavior(
+  status: Status,
+  filtersCache: Map<string, Filter>,
+  context: ClientContext
+): FilterBehavior {
+  const result: FilterBehavior = {
+    shouldHide: false,
+    shouldWarn: false,
+    shouldBlur: false,
+    activeFilters: [],
+  };
+
+  // 1. 没有过滤结果，直接返回
+  if (!status.filtered || status.filtered.length === 0) {
+    return result;
+  }
+
+  const now = new Date();
+  const serverContext = toServerSideContext(context);
+
+  // 2. 检查每个过滤结果
+  for (const filterResult of status.filtered) {
+    const filter = filtersCache.get(filterResult.filter.id);
+    
+    // 3. 验证过滤器在当前上下文中是否有效
+    if (!filter) continue;
+    if (!filter.context.includes(serverContext)) continue;
+    if (filter.expires_at && new Date(filter.expires_at) < now) continue;
+
+    // 4. 收集有效过滤结果
+    result.activeFilters.push(filterResult);
+
+    // 5. 确定行为 (hide 优先级最高)
+    switch (filter.filter_action) {
+      case 'hide':
+        result.shouldHide = true;
+        break;
+      case 'warn':
+        if (!result.shouldHide) result.shouldWarn = true;
+        break;
+      case 'blur':
+        if (!result.shouldHide && !result.shouldWarn) result.shouldBlur = true;
+        break;
+    }
+  }
+
+  // 6. 互斥处理
+  if (result.shouldHide) {
+    result.shouldWarn = false;
+    result.shouldBlur = false;
+  }
+
+  return result;
+}
+```
+
+### 11.4 UI 表现建议
+
+| filter_action | 推荐 UI 行为 |
+|---------------|-------------|
+| `hide` | 从时间线中完全移除状态，不显示任何痕迹 |
+| `warn` | 显示警告横幅，用户可点击展开查看内容 |
+| `blur` | 模糊显示媒体内容，文字可能显示警告或模糊 |
+
+**iOS/SwiftUI 示例**:
+
+```swift
+struct StatusRow: View {
+    let status: Status
+    let filters: [Filter]
+    let context: ClientContext
+    
+    var body: some View {
+        let behavior = determineFilterBehavior(status: status, filters: filters, context: context)
+        
+        Group {
+            if behavior.shouldHide {
+                // 不渲染任何内容
+                EmptyView()
+            } else if behavior.shouldWarn {
+                // 警告横幅
+                VStack(alignment: .leading) {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle")
+                            .foregroundColor(.orange)
+                        Text("包含过滤内容")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    .onTapGesture {
+                        // 展开显示内容
+                    }
+                    
+                    // 可选：模糊显示预览
+                    StatusContent(status: status)
+                        .blur(radius: 8)
+                }
+            } else if behavior.shouldBlur {
+                // 模糊显示
+                StatusContent(status: status)
+                    .blur(radius: 10)
+                    .onTapGesture {
+                        // 点击取消模糊
+                    }
+            } else {
+                // 正常显示
+                StatusContent(status: status)
+            }
+        }
+    }
+}
+```
+
+---
+
+## 12. 移动端特定考虑
+
+### 12.1 后台刷新
+
+**iOS**: 使用 Background App Refresh
+
+```swift
+// AppDelegate 或 SceneDelegate
+func application(_ application: UIApplication, 
+                 didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+    
+    // 注册后台刷新
+    application.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
+    
+    return true
+}
+
+func application(_ application: UIApplication, 
+                 performFetchWithCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+    
+    // 后台刷新过滤器
+    filterManager.refreshFilters { result in
+        switch result {
+        case .newData:
+            completionHandler(.newData)
+        case .noData:
+            completionHandler(.noData)
+        case .failed:
+            completionHandler(.failed)
+        }
+    }
+}
+```
+
+**Android**: 使用 WorkManager
+
+```kotlin
+// 定义刷新任务
+class FilterRefreshWorker(
+    context: Context,
+    params: WorkerParameters
+) : CoroutineWorker(context, params) {
+    
+    override suspend fun doWork(): Result {
+        return try {
+            filterRepository.refreshFilters()
+            Result.success()
+        } catch (e: Exception) {
+            Result.retry()
+        }
+    }
+    
+    companion object {
+        fun schedulePeriodic(context: Context) {
+            val request = PeriodicWorkRequestBuilder<FilterRefreshWorker>(
+                repeatInterval = 12,
+                repeatIntervalTimeUnit = TimeUnit.HOURS
+            ).build()
+            
+            WorkManager.getInstance(context)
+                .enqueueUniquePeriodicWork(
+                    "FilterRefresh",
+                    ExistingPeriodicWorkPolicy.UPDATE,
+                    request
+                )
+        }
+    }
+}
+```
+
+### 12.2 推送通知过滤
+
+**重要**: 推送通知在到达客户端之前，服务端已应用过滤。
+
+但客户端仍需处理：
+1. 通知点击时的过滤检查
+2. 本地通知的过滤
+
+```typescript
+// 处理通知点击
+function handleNotificationClick(notification: PushNotification) {
+  const statusId = notification.data.statusId;
+  
+  // 导航到状态前，检查过滤状态
+  fetchStatus(statusId).then(status => {
+    if (status.filtered) {
+      const behavior = determineFilterBehavior(
+        status, 
+        filtersCache, 
+        'notifications'
+      );
+      
+      if (behavior.shouldHide) {
+        // 显示提示：该状态已被过滤
+        showToast('此状态已被您的过滤器隐藏');
+        return;
+      }
+    }
+    
+    // 正常导航
+    navigateToStatus(statusId);
+  });
+}
+```
+
+### 12.3 网络优化
+
+**移动端网络条件较差，建议**:
+
+1. **使用 ETag 缓存**:
+```typescript
+// 请求时发送 If-None-Match
+async function fetchFilters(etag?: string): Promise<Filter[]> {
+  const headers: Record<string, string> = {};
+  if (etag) {
+    headers['If-None-Match'] = etag;
+  }
+  
+  const response = await api.get('/api/v2/filters', { headers });
+  
+  if (response.status === 304) {
+    // 缓存未修改，使用本地缓存
+    return getCachedFilters();
+  }
+  
+  // 保存新的 ETag
+  saveETag(response.headers.etag);
+  return response.data;
+}
+```
+
+2. **批量请求**: 合并相关 API 调用
+3. **响应缓存**: 使用 HTTP 缓存或本地持久化
+
+### 12.4 低内存处理
+
+**移动端内存有限，建议**:
+
+1. **过滤器数据保持轻量**: 只缓存必要字段
+2. **收到内存警告时清理**:
+```swift
+// iOS
+func applicationDidReceiveMemoryWarning(_ application: UIApplication) {
+    // 清理内存缓存，但保留持久化存储
+    filterManager.clearMemoryCache()
+}
+```
+
+```kotlin
+// Android
+override fun onTrimMemory(level: Int) {
+    super.onTrimMemory(level)
+    if (level >= TRIM_MEMORY_RUNNING_LOW) {
+        filterManager.clearMemoryCache()
+    }
+}
+```
+
+---
+
+## 13. v1/v2 兼容策略
+
+### 13.1 版本检测
+
+```typescript
+async function detectAPIVersion(): Promise<'v2' | 'v1'> {
+  try {
+    // 尝试 v2 API
+    const response = await api.get('/api/v2/filters');
+    return 'v2';
+  } catch (error) {
+    // v2 失败，尝试 v1
+    try {
+      await api.get('/api/v1/filters');
+      return 'v1';
+    } catch {
+      throw new Error('Filter API not available');
+    }
+  }
+}
+```
+
+### 13.2 v1 到 v2 数据转换
+
+```typescript
+function convertV1ToV2(v1Filters: V1Filter[]): Filter[] {
+  // v1 每个关键词都是独立的"过滤器"
+  // 转换策略：将相同 context 和 irreversible 的关键词合并
+  
+  const groups = new Map<string, {
+    context: string[];
+    filterAction: 'warn' | 'hide';
+    keywords: { keyword: string; wholeWord: boolean }[];
+  }>();
+
+  v1Filters.forEach(v1 => {
+    const key = JSON.stringify({
+      context: v1.context.sort(),
+      irreversible: v1.irreversible
+    });
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        context: v1.context,
+        filterAction: v1.irreversible ? 'hide' : 'warn',
+        keywords: []
+      });
+    }
+
+    groups.get(key)!.keywords.push({
+      keyword: v1.phrase,
+      wholeWord: v1.whole_word
+    });
+  });
+
+  return Array.from(groups.entries()).map(([key, group], index) => ({
+    id: `v1-converted-${index}`,
+    title: group.keywords[0]?.keyword || 'Imported Filter',
+    context: group.context as FilterContext[],
+    expires_at: v1Filters.find(f => 
+      JSON.stringify({ context: f.context.sort(), irreversible: f.irreversible }) === key
+    )?.expires_at || null,
+    filter_action: group.filterAction,
+    keywords: group.keywords.map((kw, i) => ({
+      id: `v1-kw-${index}-${i}`,
+      keyword: kw.keyword,
+      whole_word: kw.wholeWord
+    })),
+    statuses: []
+  }));
+}
+```
+
+### 13.3 统一接口封装
+
+```typescript
+interface FilterAPI {
+  getFilters(): Promise<Filter[]>;
+  createFilter(params: CreateFilterParams): Promise<Filter>;
+  updateFilter(id: string, params: UpdateFilterParams): Promise<Filter>;
+  deleteFilter(id: string): Promise<void>;
+}
+
+// V2 实现
+class V2FilterAPI implements FilterAPI {
+  async getFilters(): Promise<Filter[]> {
+    const response = await api.get('/api/v2/filters');
+    return response.data;
+  }
+  // ... 其他方法
+}
+
+// V1 兼容实现
+class V1FilterAPI implements FilterAPI {
+  async getFilters(): Promise<Filter[]> {
+    const response = await api.get('/api/v1/filters');
+    return convertV1ToV2(response.data);
+  }
+
+  async createFilter(params: CreateFilterParams): Promise<Filter> {
+    // v1 只能创建单关键词过滤器
+    if (params.keywords.length > 1) {
+      throw new Error('V1 API does not support multiple keywords');
+    }
+
+    const v1Params = {
+      phrase: params.keywords[0].keyword,
+      whole_word: params.keywords[0].whole_word,
+      context: params.context,
+      irreversible: params.filter_action === 'hide',
+      expires_in: params.expires_in
+    };
+
+    const response = await api.post('/api/v1/filters', v1Params);
+    return convertV1ToV2([response.data])[0];
+  }
+  // ... 其他方法
+}
+
+// 工厂函数
+function createFilterAPI(version: 'v1' | 'v2'): FilterAPI {
+  return version === 'v2' ? new V2FilterAPI() : new V1FilterAPI();
+}
+```
 
 ---
 
@@ -1293,24 +1953,21 @@ class FilterManager {
 
 ### A. 关键文件索引
 
-| 功能 | 文件路径 |
+| 组件 | 文件路径 |
 |------|----------|
 | V2 API 控制器 | `app/controllers/api/v2/filters_controller.rb` |
 | V1 API 控制器 | `app/controllers/api/v1/filters_controller.rb` |
 | 过滤器模型 | `app/models/custom_filter.rb` |
 | 关键词模型 | `app/models/custom_filter_keyword.rb` |
 | 状态过滤模型 | `app/models/custom_filter_status.rb` |
-| 缓存管理 | `app/models/concerns/custom_filter_cache.rb` |
 | V2 序列化器 | `app/serializers/rest/filter_serializer.rb` |
 | V1 序列化器 | `app/serializers/rest/v1/filter_serializer.rb` |
-| 过滤结果呈现器 | `app/presenters/filter_result_presenter.rb` |
 | 前端过滤器 Actions | `app/javascript/mastodon/actions/filters.js` |
 | 前端过滤器 Reducer | `app/javascript/mastodon/reducers/filters.js` |
 | 前端过滤器选择器 | `app/javascript/mastodon/selectors/filters.ts` |
-| 前端工具函数 | `app/javascript/mastodon/utils/filters.ts` |
-| 流式连接管理 | `app/javascript/mastodon/stream.js` |
+| Service Worker | `app/javascript/mastodon/service_worker/sw.js` |
+| 推送通知注册 | `app/javascript/mastodon/actions/push_notifications/registerer.js` |
 | Streaming 服务 | `streaming/index.js` |
-| Account 交互模块 | `app/models/concerns/account/interactions.rb` |
 
 ### B. API 端点速查
 
@@ -1321,32 +1978,7 @@ class FilterManager {
 - `PUT /api/v2/filters/:id` - 更新过滤器
 - `DELETE /api/v2/filters/:id` - 删除过滤器
 
-**V2 关键词管理** (嵌套在过滤器下):
+**V2 关键词管理**:
 - `POST /api/v2/filters/:filter_id/keywords` - 添加关键词
 - `PUT /api/v2/filters/:filter_id/keywords/:id` - 更新关键词
-- `DELETE /api/v2/filters/:filter_id/keywords/:id` - 删除关键词
-
-**V2 状态过滤管理**:
-- `POST /api/v2/filters/:filter_id/statuses` - 添加状态过滤
-- `DELETE /api/v2/filters/:filter_id/statuses/:id` - 移除状态过滤
-
-**V1 (已废弃)**:
-- `GET /api/v1/filters`
-- `GET /api/v1/filters/:id`
-- `POST /api/v1/filters`
-- `PUT /api/v1/filters/:id`
-- `DELETE /api/v1/filters/:id`
-
-### C. 变更历史
-
-| 版本 | 变更内容 |
-|------|---------|
-| v1 引入 | 初始版本，单关键词模型 |
-| v2 引入 | 过滤器组模型，多关键词支持，状态过滤，filter_action 枚举 |
-| 2022-11-14 | v1 API 标记废弃 |
-
----
-
-**文档版本**: 1.0  
-**基于代码版本**: Mastodon (当前仓库状态)  
-**生成日期**: 2026-05-05
+- `DELETE /api/v2/filters/:filter
