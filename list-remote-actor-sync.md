@@ -1139,7 +1139,7 @@ const authorizeListAccess = async (listId, req) => {
 | 取消关注 | `UnfollowService` | `Follow.destroy!` 触发 `ON DELETE CASCADE`，ListAccount 被级联删除 | `UnmergeWorker` 移除时间线状态 |
 | 关注请求被拒绝 | `FollowRequest#destroy!` | 触发 `ON DELETE CASCADE`，ListAccount 被级联删除 | 无变化（本来就不参与） |
 | 显式从列表移除 | `RemoveAccountsFromListService` | `ListAccount.destroy_all` 直接删除 | `UnmergeWorker` 移除时间线状态 |
-| 列表被删除 | `List#destroy` | `dependent: :destroy` 级联删除 | 无（时间线数据保留在 Redis，可能过期） |
+| 列表被删除 | `List#destroy` | `dependent: :destroy` 级联删除 | `before_destroy :clean_feed_manager` 回调调用 `FeedManager.clean_feeds!` 清理 Redis 时间线 |
 
 ### 6.3 常见问题解答
 
