@@ -1,183 +1,714 @@
-# Mastodon 账号迁移机制完整分析
+# Mastodon 账号迁移机制完整分析（角色边界版）
 
 ## 目录
 
 1. [概述](#概述)
-2. [前端引导流程](#前端引导流程)
-3. [旧实例发出 Move 信号机制](#旧实例发出-move-信号机制)
-4. [新实例验证并接收 Follower 转移](#新实例验证并接收-follower-转移)
-5. [后台任务批量重写关注关系](#后台任务批量重写关注关系)
-6. [跨实例协议校验配合](#跨实例协议校验配合)
-7. [关键数据结构](#关键数据结构)
-8. [流程图总结](#流程图总结)
+2. [角色边界与职责划分](#角色边界与职责划分)
+3. [前端引导流程与失败反馈闭环](#前端引导流程与失败反馈闭环)
+4. [旧实例：发起迁移与分发 Move 信号](#旧实例发起迁移与分发-move-信号)
+5. [新实例：维护别名与验证认领](#新实例维护别名与验证认领)
+6. [关注者实例：接收 Move 与重写关注关系](#关注者实例接收-move-与重写关注关系)
+7. [三方协同时序总结](#三方协同时序总结)
+8. [关键数据结构](#关键数据结构)
+9. [安全机制与错误处理](#安全机制与错误处理)
+10. [相关文件索引](#相关文件索引)
 
 ---
 
 ## 概述
 
-Mastodon 的账号迁移是基于 ActivityPub 协议的 `Move` 活动实现的。整个流程涉及三个核心角色：
+Mastodon 的账号迁移是基于 ActivityPub 协议的 `Move` 活动实现的分布式协作流程。整个流程涉及**三个核心角色**的紧密配合：
 
-- **源账号（旧实例）**：发起迁移，发出 Move 信号
-- **目标账号（新实例）**：验证迁移合法性，接收 follower
-- **关注者实例**：接收 Move 活动，重写关注关系
+| 角色 | 定义 | 核心职责 |
+|------|------|----------|
+| **旧实例** | 源账号所在的实例 | 发起迁移请求、验证前置条件、分发 Move 活动、处理本地关注关系 |
+| **新实例** | 目标账号所在的实例 | 维护 `also_known_as` 别名、通过 Update 活动宣告认领关系、被动验证 |
+| **关注者实例** | 关注者所在的实例 | 接收 Move 活动、执行协议验证、重写本地关注关系 |
 
-迁移的核心安全机制是 **双向引用验证**：
-- 目标账号的 `also_known_as` 必须包含源账号的 URI
-- 源账号的 `moved_to_account` 指向目标账号
+**核心安全机制：双向引用验证**
 
----
-
-## 前端引导流程
-
-### 1. 前置条件：新账号添加别名
-
-在发起迁移之前，用户需要在**新账号**的设置中添加旧账号作为别名：
-
-**页面路径**：`/settings/aliases`
-
-**控制器**：`app/controllers/settings/aliases_controller.rb`
-
-**流程**：
-1. 用户输入旧账号地址（如 `olduser@oldinstance.com`）
-2. `AccountAlias` 模型验证：
-   - 通过 WebFinger 解析目标账号
-   - 验证不是自己指向自己
-   - `app/models/account_alias.rb:50-56`
-3. 保存后触发回调：
-   ```ruby
-   # app/models/account_alias.rb:42-44
-   after_create :add_to_account
-   
-   def add_to_account
-     account.update(also_known_as: account.also_known_as + [uri])
-   end
-   ```
-4. 分发 Update 活动让全网知晓：
-   ```ruby
-   # app/controllers/settings/aliases_controller.rb:17-18
-   ActivityPub::UpdateDistributionWorker.perform_async(current_account.id)
-   ```
-
-**关键**：这一步将旧账号的 URI 添加到新账号的 `also_known_as` 数组中，为后续的迁移验证做准备。
-
-### 2. 发起迁移
-
-在**旧账号**的设置中发起迁移：
-
-**页面路径**：`/settings/migration`
-
-**控制器**：`app/controllers/settings/migrations_controller.rb`
-
-**前端视图**：`app/views/settings/migrations/show.html.haml`
-
-**用户输入**：
-- 目标账号地址（新账号）
-- 当前密码验证（或用户名验证，取决于登录方式）
-
-**表单字段**（`app/views/settings/migrations/show.html.haml:45-53`）：
-```haml
-.fields-row
-  .fields-row__column.fields-group.fields-row__column-6
-    = f.input :acct, wrapper: :with_block_label, ...
-  .fields-row__column.fields-group.fields-row__column-6
-    - if current_user.encrypted_password.present?
-      = f.input :current_password, ...
-    - else
-      = f.input :current_username, ...
+```
+新账号 ──alsoKnownAs──► 旧账号 URI (主动认领)
+旧账号 ──movedTo───────► 新账号 URI (被动指向)
 ```
 
-### 3. 仅设置重定向（不转移 Follower）
-
-还有一个轻量级选项：仅设置重定向，不触发 follower 转移。
-
-**页面路径**：`/settings/migration/redirects/new`
-
-**控制器**：`app/controllers/settings/migration/redirects_controller.rb`
-
-**适用场景**：账号被盗、紧急转移等情况
-
-**区别**：
-- 只设置 `moved_to_account`
-- 只分发 Update 活动
-- **不**触发 Move 活动和 follower 转移
+只有当双向引用同时满足时，迁移才会被执行。
 
 ---
 
-## 旧实例发出 Move 信号机制
+## 角色边界与职责划分
 
-### 1. 迁移验证（AccountMigration 模型）
+### 1. 旧实例（Source Instance）
 
-**文件**：`app/models/account_migration.rb`
+#### 1.1 核心职责
 
-当用户提交迁移表单时，`AccountMigration` 模型执行以下验证：
+| 职责类型 | 具体动作 | 代码位置 |
+|----------|----------|----------|
+| **用户交互** | 提供迁移表单页面 | `app/views/settings/migrations/show.html.haml` |
+| **请求接收** | 处理迁移 POST 请求 | `app/controllers/settings/migrations_controller.rb` |
+| **前置验证** | 验证密码/用户名、目标账号存在性、冷却期、also_known_as | `app/models/account_migration.rb` |
+| **状态更新** | 设置 `moved_to_account` 重定向 | `app/services/move_service.rb:17-19` |
+| **活动分发** | 分发 Update 活动（宣告迁移） | `app/services/move_service.rb:25-27` |
+| **活动分发** | 分发 Move 活动（触发 follower 转移） | `app/services/move_service.rb:29-31` |
+| **本地处理** | 处理同实例内的关注关系转移 | `app/workers/move_worker.rb:10-16` |
 
-#### 1.1 目标账号解析
+#### 1.2 不负责的事项
+
+- ❌ 不验证新实例的真实意愿（通过 also_known_as 间接验证）
+- ❌ 不处理跨实例的关注关系转移（由关注者实例处理）
+- ❌ 不确保所有关注者都成功转移（异步、分布式、最终一致）
+
+---
+
+### 2. 新实例（Target Instance）
+
+#### 2.1 核心职责
+
+| 职责类型 | 具体动作 | 代码位置 |
+|----------|----------|----------|
+| **用户交互** | 提供别名管理页面 | `app/views/settings/aliases/index.html.haml` |
+| **请求接收** | 处理别名添加/删除请求 | `app/controllers/settings/aliases_controller.rb` |
+| **别名验证** | 验证目标账号存在、不是自己 | `app/models/account_alias.rb:50-56` |
+| **状态更新** | 更新 `also_known_as` 数组 | `app/models/account_alias.rb:42-48` |
+| **活动分发** | 分发 Update 活动（宣告别名关系） | `app/controllers/settings/aliases_controller.rb:17-18` |
+
+#### 2.2 不负责的事项
+
+- ❌ 不主动发起迁移（仅被动认领）
+- ❌ 不处理关注关系转移（由关注者实例处理）
+- ❌ 不知道哪些关注者会转移（分布式、无全局视图）
+
+---
+
+### 3. 关注者实例（Follower Instance）
+
+#### 3.1 核心职责
+
+| 职责类型 | 具体动作 | 代码位置 |
+|----------|----------|----------|
+| **活动接收** | 接收并解析 Move 活动 | `app/lib/activitypub/activity/move.rb` |
+| **协议验证** | 验证 object==actor、7天冷却期、also_known_as 双向引用 | `app/lib/activitypub/activity/move.rb:6-25` |
+| **状态更新** | 更新本地缓存的 `moved_to_account` | `app/lib/activitypub/activity/move.rb:18` |
+| **关系转移** | 重写本地关注关系 | `app/workers/move_worker.rb` |
+| **数据迁移** | 迁移列表成员、备注、屏蔽、静音 | `app/workers/move_worker.rb:96-156` |
+
+#### 3.2 不负责的事项
+
+- ❌ 不验证用户身份（仅验证协议签名和内容）
+- ❌ 不回滚失败的迁移（原子性由单条操作保证）
+- ❌ 不通知源实例转移结果（单向、最终一致）
+
+---
+
+### 4. 角色边界可视化
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           账号迁移角色边界图                                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              新实例 (Target Instance)                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐          │
+│   │   用户操作层     │────►│   控制器层       │────►│    模型层        │          │
+│   │  /settings/     │     │  Aliases-       │     │  AccountAlias   │          │
+│   │    aliases      │     │  Controller     │     │                 │          │
+│   └─────────────────┘     └─────────────────┘     └─────────────────┘          │
+│                                                        │                          │
+│                                                        ▼                          │
+│   ┌─────────────────────────────────────────────────────────────────────┐        │
+│   │                    新实例专属职责边界                                  │        │
+│   ├─────────────────────────────────────────────────────────────────────┤        │
+│   │ ✓ 维护 also_known_as 数组                                            │        │
+│   │ ✓ 通过 AccountAlias 模型验证别名合法性                                │        │
+│   │ ✓ 分发 Update 活动宣告别名关系                                        │        │
+│   │ ✓ Actor 文档中包含 alsoKnownAs 字段                                   │        │
+│   │                                                                       │        │
+│   │ ✗ 不发起迁移（仅被动认领）                                            │        │
+│   │ ✗ 不处理关注关系转移                                                  │        │
+│   │ ✗ 不知道哪些关注者会转移                                              │        │
+│   └─────────────────────────────────────────────────────────────────────┘        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                      ▲
+                                      │ Update 活动 (alsoKnownAs)
+                                      │
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              旧实例 (Source Instance)                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐          │
+│   │   用户操作层     │────►│   控制器层       │────►│    模型层        │          │
+│   │  /settings/     │     │ Migrations-     │     │AccountMigration │          │
+│   │   migration     │     │  Controller     │     │                 │          │
+│   └─────────────────┘     └─────────────────┘     └─────────────────┘          │
+│                                                        │                          │
+│                                                        ▼                          │
+│   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐          │
+│   │   分发层         │◄────│    服务层       │◄────│    验证层        │          │
+│   │ MoveDistribution│     │  MoveService    │     │  模型验证         │          │
+│   │ Worker          │     │                 │     │                 │          │
+│   └─────────────────┘     └─────────────────┘     └─────────────────┘          │
+│                                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐        │
+│   │                    旧实例专属职责边界                                  │        │
+│   ├─────────────────────────────────────────────────────────────────────┤        │
+│   │ ✓ 提供迁移表单和用户交互                                              │        │
+│   │ ✓ 验证密码/用户名身份                                                 │        │
+│   │ ✓ 验证目标账号 also_known_as 包含源账号 URI                          │        │
+│   │ ✓ 验证 30 天冷却期                                                   │        │
+│   │ ✓ 设置 moved_to_account 重定向                                       │        │
+│   │ ✓ 分发 Update 活动宣告迁移                                            │        │
+│   │ ✓ 分发 Move 活动触发 follower 转移                                    │        │
+│   │ ✓ 处理同实例内的关注关系转移                                          │        │
+│   │                                                                       │        │
+│   │ ✗ 不验证新实例的"真实"意愿（通过 also_known_as 间接验证）             │        │
+│   │ ✗ 不处理跨实例的关注关系转移（由关注者实例处理）                       │        │
+│   │ ✗ 不确保所有关注者都成功转移（异步、分布式、最终一致）                  │        │
+│   └─────────────────────────────────────────────────────────────────────┘        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      │ Move 活动 (actor, object, target)
+                                      │ Update 活动 (movedTo)
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           关注者实例 (Follower Instance)                           │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐          │
+│   │   协议层         │────►│   验证层         │────►│    执行层        │          │
+│   │  ActivityPub    │     │  Activity::Move │     │   MoveWorker    │          │
+│   │  Inbox 端点      │     │                 │     │                 │          │
+│   └─────────────────┘     └─────────────────┘     └─────────────────┘          │
+│                                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐        │
+│   │                   关注者实例专属职责边界                               │        │
+│   ├─────────────────────────────────────────────────────────────────────┤        │
+│   │ ✓ 接收并解析 Move 活动                                               │        │
+│   │ ✓ 验证 object == actor（防止假冒迁移）                               │        │
+│   │ ✓ 验证 7 天处理冷却期                                                │        │
+│   │ ✓ 验证目标账号 also_known_as 包含源账号 URI（核心验证）              │        │
+│   │ ✓ 更新本地缓存的 moved_to_account                                    │        │
+│   │ ✓ 重写本地关注关系（旧→新）                                          │        │
+│   │ ✓ 迁移列表成员、账号备注、屏蔽、静音关系                               │        │
+│   │                                                                       │        │
+│   │ ✗ 不验证用户身份（仅验证协议签名和内容）                              │        │
+│   │ ✗ 不回滚失败的迁移（原子性由单条操作保证）                            │        │
+│   │ ✗ 不通知源实例转移结果（单向、最终一致）                              │        │
+│   └─────────────────────────────────────────────────────────────────────┘        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 前端引导流程与失败反馈闭环
+
+### 1. 第一阶段：新账号添加别名（新实例）
+
+#### 1.1 成功路径
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        新实例添加别名成功流程                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+用户操作                          前端反馈                          后端处理
+─────────                        ─────────                        ─────────
+     │                                │                                │
+     │  1. 访问 /settings/aliases     │                                │
+     │ ───────────────────────────►  │  显示别名列表和添加表单           │
+     │                                │                                │
+     │                                │                                │
+     │  2. 输入旧账号地址              │                                │
+     │     (如: olduser@old.com)     │                                │
+     │ ───────────────────────────►  │                                │
+     │                                │                                │
+     │                                │  3. 提交表单                    │
+     │ ◄───────────────────────────  │ ───────────────────────────►  │
+     │                                │                                │
+     │                                │                                │  4. AccountAlias 验证
+     │                                │                                │     - WebFinger 解析
+     │                                │                                │     - 目标账号存在?
+     │                                │                                │     - 不是自己?
+     │                                │                                │
+     │                                │                                │  5. 更新 also_known_as
+     │                                │                                │  6. 分发 Update 活动
+     │                                │                                │
+     │  7. 显示成功消息               │                                │
+     │    "Alias created successfully"│                                │
+     │ ◄───────────────────────────  │ ◄───────────────────────────  │
+     │                                │                                │
+     ▼                                ▼                                ▼
+```
+
+#### 1.2 失败路径与反馈闭环
+
+| 失败场景 | 触发条件 | 前端反馈 | 代码位置 | 用户修复建议 |
+|----------|----------|----------|----------|--------------|
+| **账号不存在** | WebFinger 解析失败 | `could not be found` | `app/models/account_alias.rb:51-52` | 检查账号地址拼写、确认目标实例可访问 |
+| **指向自己** | 别名是当前账号 | `cannot be current account` | `app/models/account_alias.rb:53-54` | 确保输入的是旧账号，不是新账号 |
+| **网络错误** | 目标实例无法连接 | `could not be found` | `app/models/account_alias.rb:36-40` | 稍后重试、检查网络连接、确认目标实例在线 |
+| **重复添加** | 别名已存在 | 数据库唯一约束错误 | `app/models/account_alias.rb:19` | 该别名已添加，无需重复操作 |
+
+**错误处理流程**：
 ```ruby
-# app/models/account_migration.rb:69-73
-def set_target_account
-  self.target_account = ResolveAccountService.new.call(acct, skip_cache: true)
-rescue Webfinger::Error, *Mastodon::HTTP_CONNECTION_ERRORS, ...
-  # Validation will take care of it
+# app/models/account_alias.rb:35-40
+def set_uri
+  target_account = ResolveAccountService.new.call(acct)
+  self.uri = ActivityPub::TagManager.instance.uri_for(target_account) unless target_account.nil?
+rescue Webfinger::Error, *Mastodon::HTTP_CONNECTION_ERRORS, Mastodon::Error
+  # 异常被捕获，由后续验证逻辑添加错误信息
+end
+
+# app/models/account_alias.rb:50-56
+def validate_target_account
+  if uri.blank?
+    errors.add(:acct, I18n.t('migrations.errors.not_found'))  # "could not be found"
+  elsif ActivityPub::TagManager.instance.uri_for(account) == uri
+    errors.add(:acct, I18n.t('migrations.errors.move_to_self'))  # "cannot be current account"
+  end
 end
 ```
 
-#### 1.2 核心验证逻辑
+---
+
+### 2. 第二阶段：旧账号发起迁移（旧实例）
+
+#### 2.1 成功路径
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        旧实例发起迁移成功流程                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+用户操作                          前端反馈                          后端处理
+─────────                        ─────────                        ─────────
+     │                                │                                │
+     │  1. 访问 /settings/migration   │                                │
+     │ ───────────────────────────►  │                                │
+     │                                │  2. 检查状态                    │
+     │                                │     - 是否已设置重定向?         │
+     │                                │     - 是否在冷却期?             │
+     │                                │                                │
+     │                                │  3. 显示表单                    │
+     │                                │     - 目标账号输入框            │
+     │                                │     - 密码/用户名输入框         │
+     │                                │     - 风险提示列表              │
+     │ ◄───────────────────────────  │                                │
+     │                                │                                │
+     │                                │                                │
+     │  4. 输入新账号地址和密码        │                                │
+     │ ───────────────────────────►  │                                │
+     │                                │                                │
+     │                                │  5. 提交表单                    │
+     │ ◄───────────────────────────  │ ───────────────────────────►  │
+     │                                │                                │
+     │                                │                                │  6. AccountMigration 验证
+     │                                │                                │     - 密码/用户名正确?
+     │                                │                                │     - 目标账号存在?
+     │                                │                                │     - also_known_as 包含源账号?
+     │                                │                                │     - 30天冷却期?
+     │                                │                                │     - 不是迁移到自己?
+     │                                │                                │
+     │                                │                                │  7. MoveService 执行
+     │                                │                                │     - 设置 moved_to_account
+     │                                │                                │     - 异步处理本地关注
+     │                                │                                │     - 分发 Update + Move 活动
+     │                                │                                │
+     │  8. 显示成功消息               │                                │
+     │    "Your account is now       │                                │
+     │     redirecting to ..."       │                                │
+     │ ◄───────────────────────────  │ ◄───────────────────────────  │
+     │                                │                                │
+     ▼                                ▼                                ▼
+```
+
+#### 2.2 失败路径与反馈闭环
+
+| 失败场景 | 触发条件 | 前端反馈 | 代码位置 | 用户修复建议 |
+|----------|----------|----------|----------|--------------|
+| **密码错误** | 密码验证失败 | 密码字段显示错误 | `app/models/account_migration.rb:46-47` | 检查密码是否正确 |
+| **用户名错误** | OAuth 用户用户名验证失败 | 用户名字段显示错误 | `app/models/account_migration.rb:48-50` | 确认当前账号的用户名 |
+| **目标账号不存在** | WebFinger 解析失败 | `could not be found` | `app/models/account_migration.rb:80-81` | 检查新账号地址、确认新实例可访问 |
+| **缺少 also_known_as** | 新账号未添加旧账号为别名 | `is not an alias of this account` | `app/models/account_migration.rb:82-83` | **关键错误**：需要先在新账号添加旧账号为别名 |
+| **已迁移过** | 已迁移到同一个账号 | `is the same account you have already moved to` | `app/models/account_migration.rb:84-85` | 无需重复操作 |
+| **迁移到自己** | 目标账号是当前账号 | `cannot be current account` | `app/models/account_migration.rb:86` | 确保输入的是新账号地址 |
+| **冷却期** | 30天内已迁移过 | `You are on cooldown. Available again in X days` | `app/models/account_migration.rb:89-91` + 视图 | 等待冷却期结束，页面会显示剩余天数 |
+
+**核心验证逻辑**（`app/models/account_migration.rb`）：
 ```ruby
-# app/models/account_migration.rb:79-91
 def validate_target_account
   if target_account.nil?
     errors.add(:acct, I18n.t('migrations.errors.not_found'))
   else
-    # 关键验证：目标账号的 also_known_as 必须包含源账号 URI
+    # 核心验证：新账号的 also_known_as 必须包含旧账号 URI
     errors.add(:acct, I18n.t('migrations.errors.missing_also_known_as')) 
       unless target_account.also_known_as.include?(ActivityPub::TagManager.instance.uri_for(account))
     
-    # 不能重复迁移到同一个账号
     errors.add(:acct, I18n.t('migrations.errors.already_moved')) 
       if account.moved? && account.moved_to_account_id == target_account.id
     
-    # 不能迁移到自己
     errors.add(:acct, I18n.t('migrations.errors.move_to_self')) 
       if account.id == target_account.id
   end
 end
+```
 
-def validate_migration_cooldown
-  # 30天冷却期
-  errors.add(:base, I18n.t('migrations.errors.on_cooldown')) 
-    if account.migrations.within_cooldown.exists?
+**前端预提示机制**（`app/views/settings/migrations/show.html.haml`）：
+
+```haml
+- unless on_cooldown?
+  %p.hint= t('migrations.warning.before')  # "Before proceeding, please read these notes carefully:"
+
+  %ul.hint
+    %li.warning-hint= t('migrations.warning.followers')      # 粉丝会被转移
+    %li.warning-hint= t('migrations.warning.other_data')     # 其他数据不会自动转移
+    %li.warning-hint= t('migrations.warning.redirect')        # 个人资料会显示重定向
+    %li.warning-hint= t('migrations.warning.backreference_required')  # 关键：新账号必须先配置反向引用
+    %li.warning-hint= t('migrations.warning.cooldown')       # 迁移后有等待期
+    %li.warning-hint= t('migrations.warning.disabled_account') # 当前账号之后不可完全使用
+```
+
+**关键提示翻译**：
+- `backreference_required`: "The new account must first be configured to back-reference this one"
+- 含义：新账号必须先配置反向引用（即添加旧账号为别名）
+
+#### 2.3 冷却期状态展示
+
+当用户处于冷却期时，前端会：
+
+1. **禁用表单**：所有输入框和提交按钮变灰不可点击
+2. **显示提示**：`"You have recently migrated your account. This function will become available again in X days."`
+3. **显示历史**：展示过去的迁移记录
+
+```haml
+- if on_cooldown?
+  %p.hint
+    %span.warning-hint= t('migrations.on_cooldown', count: @cooldown.remaining_cooldown_days)
+- else
+  # 显示正常表单...
+
+.actions
+  = f.button :button, ..., disabled: on_cooldown?  # 冷却期禁用按钮
+```
+
+---
+
+### 3. 第三阶段：异步任务执行（分布式）
+
+#### 3.1 最终一致性模型
+
+迁移的关注关系转移是**异步、分布式、最终一致**的：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         迁移的最终一致性模型                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+时间轴
+──────►
+
+T0: 用户在旧实例提交迁移表单
+     │
+     ▼
+T1: 旧实例同步响应
+     ✓ 前端显示成功消息
+     ✓ moved_to_account 已设置
+     ✓ Update 活动已分发
+     ✓ Move 活动已入队
+     ✗ 关注关系尚未转移（异步）
+     │
+     ▼
+T2: 后台任务执行（旧实例）
+     ✓ MoveWorker 处理本地关注关系
+     ✓ 同实例内的关注已转移
+     │
+     ▼
+T3: Move 活动分发（异步）
+     ├──► 关注者实例 A 接收并处理
+     │       ✓ 关注关系已转移
+     │
+     ├──► 关注者实例 B 接收并处理
+     │       ✓ 关注关系已转移
+     │
+     └──► 关注者实例 C 暂时离线
+             ✗ 活动丢失或延迟
+             （依赖实例重试或后续刷新）
+     │
+     ▼
+T4: 最终状态（时间不确定）
+     ✓ 大部分关注关系已转移
+     ✗ 少数可能因实例离线而延迟
+     （用户可通过导出/导入手动补充）
+```
+
+#### 3.2 失败场景与不可见错误
+
+这一阶段的错误**不会直接反馈给用户**，因为是异步分布式操作：
+
+| 失败场景 | 影响范围 | 处理机制 | 用户感知 |
+|----------|----------|----------|----------|
+| **Sidekiq 任务失败** | 单条任务 | Sidekiq 自动重试 | 无感知，最终成功 |
+| **关注者实例离线** | 该实例的所有关注者 | 依赖：1) 旧实例重试投递 2) 关注者实例后续刷新 | 无感知，可能延迟 |
+| **协议验证失败** | 该关注者实例 | 活动被静默忽略 | **无感知，永远不会转移** |
+| **数据库操作失败** | 单条关注关系 | 事务回滚、Sidekiq 重试 | 无感知，最终成功 |
+
+**关键：协议验证失败是静默的**
+
+当关注者实例收到 Move 活动，但验证失败时（如 `also_known_as` 不匹配），活动会被**静默忽略**，不会产生任何错误通知。
+
+```ruby
+# app/lib/activitypub/activity/move.rb:6-25
+def perform
+  return if origin_account.uri != object_uri           # 静默返回
+  return unless mark_as_processing!                    # 静默返回
+  
+  target_account = ActivityPub::FetchRemoteAccountService.new.call(target_uri)
+  
+  if target_account.nil? || target_account.unavailable? || 
+     !target_account.also_known_as.include?(origin_account.uri)
+    unmark_as_processing!
+    return                                              # 静默返回，无日志、无通知
+  end
+  
+  # ... 执行迁移
 end
 ```
 
-#### 1.3 密码/用户名验证
+**为什么这样设计？**
+
+1. **安全**：防止恶意实例发送伪造的 Move 活动
+2. **隐私**：不暴露内部验证逻辑给外部实例
+3. **简洁**：失败的活动就是"不执行"，无需复杂的错误反馈协议
+
+**用户如何发现问题？**
+
+1. **观察粉丝数**：迁移后新旧账号的粉丝数变化是否符合预期
+2. **手动抽查**：让几个好友确认是否已自动关注新账号
+3. **手动补救**：导出旧账号的关注列表，在新账号导入
+
+---
+
+### 4. 失败反馈闭环总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         失败反馈闭环总览                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 阶段1: 新实例添加别名                                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   用户输入 ──────►  WebFinger 解析 ──────►  验证 ──────►  结果             │
+│   (old@old.com)      (跨实例网络请求)         (本地)                         │
+│                                                                              │
+│   可能的错误:                                                                 │
+│   ✓ 账号不存在 ────────► 前端显示 "could not be found"                      │
+│   ✓ 指向自己 ──────────► 前端显示 "cannot be current account"               │
+│   ✓ 网络错误 ──────────► 前端显示 "could not be found"                      │
+│   ✓ 重复添加 ──────────► 前端显示唯一约束错误                                │
+│                                                                              │
+│   反馈闭环: 同步、可见、可修复                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 阶段2: 旧实例发起迁移                                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   用户输入 ──────►  身份验证 ──────►  协议验证 ──────►  结果               │
+│   (new@new.com)      (密码/用户名)           (also_known_as)                 │
+│                              │                      │                        │
+│                              │                      │  关键: 通过 WebFinger  │
+│                              │                      │  获取新账号信息，验证  │
+│                              │                      │  also_known_as 包含     │
+│                              │                      │  旧账号 URI              │
+│                                                                              │
+│   可能的错误:                                                                 │
+│   ✓ 密码错误 ──────────► 前端显示密码字段错误                                │
+│   ✓ 目标不存在 ────────► 前端显示 "could not be found"                      │
+│   ✓ 缺少别名 ──────────► 前端显示 "is not an alias of this account"         │
+│   ✓ 已迁移过 ──────────► 前端显示 "is the same account you have already..."  │
+│   ✓ 冷却期 ────────────► 前端禁用表单，显示剩余天数                          │
+│                                                                              │
+│   反馈闭环: 同步、可见、可修复                                                │
+│                                                                              │
+│   关键提示: 页面提前显示 "backreference_required" 警告                       │
+│            引导用户先在新账号添加别名                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 阶段3: 异步任务执行（分布式）                                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   旧实例              网络                  关注者实例                        │
+│   ────────            ────                  ──────────                        │
+│                                                                              │
+│   Move 活动 ─────────► HTTP POST ─────────► Inbox 端点                      │
+│   (异步分发)                                 (ActivityPub)                   │
+│                                                      │                        │
+│                                                      ▼                        │
+│                                                协议验证                       │
+│                                                - object == actor?            │
+│                                                - 7天冷却期?                  │
+│                                                - also_known_as?              │
+│                                                      │                        │
+│                              ┌───────────────────────┼───────────────────────┐
+│                              │                       │                       │
+│                              ▼                       ▼                       ▼
+│                         验证成功               验证失败               实例离线
+│                              │                       │                       │
+│                              ▼                       ▼                       ▼
+│                         执行迁移              静默忽略                活动丢失
+│                         (MoveWorker)          (无反馈)              (无反馈)
+│                                                                              │
+│   可能的错误:                                                                 │
+│   ✗ 协议验证失败 ──────► 静默忽略，无任何反馈                                │
+│   ✗ 实例离线 ──────────► 活动丢失，依赖重试或后续刷新                        │
+│   ✗ 数据库错误 ────────► Sidekiq 重试，最终成功                            │
+│                                                                              │
+│   反馈闭环: 异步、不可见、依赖最终一致性                                      │
+│                                                                              │
+│   用户补救:                                                                   │
+│   - 观察粉丝数变化                                                            │
+│   - 手动抽查好友是否已关注新账号                                              │
+│   - 导出/导入关注列表作为补充                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 旧实例：发起迁移与分发 Move 信号
+
+### 1. 迁移验证流程（旧实例专属）
+
+旧实例是迁移的**发起者和协调者**，负责执行最严格的前置验证。
+
+#### 1.1 验证层级
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        旧实例迁移验证层级                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Layer 5: 业务规则验证
+┌─────────────────────────────────────────────────────────────────────────┐
+│  validate_migration_cooldown                                              │
+│  - 30天内是否已迁移过?                                                    │
+│  - @cooldown.remaining_cooldown_days 显示剩余天数                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                      ▲
+                                      │
+Layer 4: 目标关系验证
+┌─────────────────────────────────────────────────────────────────────────┐
+│  validate_target_account (核心)                                          │
+│  ├──► target_account.nil? ────────► "could not be found"               │
+│  ├──► also_known_as 验证 ────────► "is not an alias of this account"   │
+│  ├──► already_moved? ────────────► "is the same account..."             │
+│  └──► move_to_self? ────────────► "cannot be current account"          │
+└─────────────────────────────────────────────────────────────────────────┘
+                                      ▲
+                                      │
+Layer 3: 目标账号解析
+┌─────────────────────────────────────────────────────────────────────────┐
+│  set_target_account                                                       │
+│  - ResolveAccountService.new.call(acct, skip_cache: true)              │
+│  - 跳过缓存，强制获取最新状态                                              │
+│  - 捕获 Webfinger/网络异常，由验证层处理                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                      ▲
+                                      │
+Layer 2: 身份验证
+┌─────────────────────────────────────────────────────────────────────────┐
+│  save_with_challenge                                                     │
+│  ├──► 有密码? ──► current_user.valid_password?(current_password)        │
+│  └──► 无密码? ──► account.username == current_username                  │
+│         (OAuth 登录用户用用户名验证)                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                      ▲
+                                      │
+Layer 1: 并发控制
+┌─────────────────────────────────────────────────────────────────────────┐
+│  with_redis_lock("account_migration:#{account.id}")                     │
+│  - 防止同一账号并发发起迁移                                                │
+│  - Redis 分布式锁                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.2 关键验证代码
+
 ```ruby
 # app/models/account_migration.rb:45-57
 def save_with_challenge(current_user)
+  # Layer 2: 身份验证
   if current_user.encrypted_password.present?
     errors.add(:current_password, :invalid) unless current_user.valid_password?(current_password)
   else
     errors.add(:current_username, :invalid) unless account.username == current_username
   end
-  # ...
+
+  return false unless errors.empty?
+
+  # Layer 1: 并发控制
   with_redis_lock("account_migration:#{account.id}") do
-    save
+    save  # 触发 Layer 3-5 验证
   end
+end
+
+# app/models/account_migration.rb:69-73
+def set_target_account
+  # Layer 3: 目标账号解析（跳过缓存）
+  self.target_account = ResolveAccountService.new.call(acct, skip_cache: true)
+rescue Webfinger::Error, *Mastodon::HTTP_CONNECTION_ERRORS, Mastodon::Error, Addressable::URI::InvalidURIError
+  # 异常静默捕获，由 Layer 4 添加错误信息
+end
+
+# app/models/account_migration.rb:79-91
+def validate_target_account
+  # Layer 4: 目标关系验证
+  if target_account.nil?
+    errors.add(:acct, I18n.t('migrations.errors.not_found'))
+  else
+    # 核心：通过新账号的 also_known_as 验证"认领"关系
+    errors.add(:acct, I18n.t('migrations.errors.missing_also_known_as')) 
+      unless target_account.also_known_as.include?(ActivityPub::TagManager.instance.uri_for(account))
+    
+    errors.add(:acct, I18n.t('migrations.errors.already_moved')) 
+      if account.moved? && account.moved_to_account_id == target_account.id
+    
+    errors.add(:acct, I18n.t('migrations.errors.move_to_self')) 
+      if account.id == target_account.id
+  end
+end
+
+# app/models/account_migration.rb:89-91
+def validate_migration_cooldown
+  # Layer 5: 冷却期验证
+  errors.add(:base, I18n.t('migrations.errors.on_cooldown')) 
+    if account.migrations.within_cooldown.exists?
 end
 ```
 
-### 2. MoveService 执行迁移
+### 2. MoveService 执行流程
 
-**文件**：`app/services/move_service.rb`
-
-验证通过后，`MigrationsController` 调用 `MoveService`：
+验证通过后，`MigrationsController` 调用 `MoveService` 执行实际迁移：
 
 ```ruby
 # app/controllers/settings/migrations_controller.rb:14-22
 def create
   @migration = current_account.migrations.build(resource_params)
+  
   if @migration.save_with_challenge(current_user)
     MoveService.new.call(@migration)
-    # ...
+    redirect_to settings_migration_path, notice: I18n.t('migrations.moved_msg', ...)
+  else
+    render :show
   end
 end
 ```
@@ -192,43 +723,93 @@ class MoveService < BaseService
     @source_account = migration.account
     @target_account = migration.target_account
 
-    update_redirect!           # 步骤1：设置重定向
-    process_local_relationships!  # 步骤2：处理本地关注关系
-    distribute_update!         # 步骤3：分发 Update 活动
-    distribute_move!           # 步骤4：分发 Move 活动
+    # 步骤1: 设置重定向（同步）
+    update_redirect!
+    
+    # 步骤2: 处理本地关注关系（异步）
+    process_local_relationships!
+    
+    # 步骤3: 分发 Update 活动（异步）
+    distribute_update!
+    
+    # 步骤4: 分发 Move 活动（异步）
+    distribute_move!
   end
 
   private
 
   def update_redirect!
+    # 同步更新数据库：设置 moved_to_account
     @source_account.update!(moved_to_account: @target_account)
   end
 
   def process_local_relationships!
+    # 异步处理同实例内的关注关系
     MoveWorker.perform_async(@source_account.id, @target_account.id)
   end
 
   def distribute_update!
+    # 分发 Update 活动：宣告账号已迁移
+    # Actor 文档中包含 movedTo 字段
     ActivityPub::UpdateDistributionWorker.perform_async(@source_account.id)
   end
 
   def distribute_move!
+    # 分发 Move 活动：触发关注者实例重写关注关系
     ActivityPub::MoveDistributionWorker.perform_async(@migration.id)
   end
 end
 ```
 
-### 3. MoveDistributionWorker 分发 Move 活动
+### 3. MoveDistributionWorker 分发机制
 
-**文件**：`app/workers/activitypub/move_distribution_worker.rb`
-
-#### 3.1 序列化 Move 活动
-
-使用 `ActivityPub::MoveSerializer` 序列化：
-
-**文件**：`app/serializers/activitypub/move_serializer.rb`
+`MoveDistributionWorker` 负责将 Move 活动分发给所有相关方：
 
 ```ruby
+# app/workers/activitypub/move_distribution_worker.rb:9-22
+def perform(migration_id)
+  @migration = AccountMigration.find(migration_id)
+  @account   = @migration.account
+
+  # 目标1: 所有关注者的 inbox
+  ActivityPub::DeliveryWorker.push_bulk(inboxes, limit: 1_000) do |inbox_url|
+    [signed_payload, @account.id, inbox_url]
+  end
+
+  # 目标2: 中继服务器（Relay）
+  # 确保更广泛的传播
+  ActivityPub::DeliveryWorker.push_bulk(Relay.enabled.pluck(:inbox_url)) do |inbox_url|
+    [signed_payload, @account.id, inbox_url]
+  end
+end
+
+private
+
+def inboxes
+  # 收集所有需要通知的 inbox:
+  # 1. 关注者的 inbox
+  # 2. 被屏蔽者的 inbox（让他们也知道迁移）
+  @inboxes ||= (@migration.account.followers.inboxes + @migration.account.blocked_by.inboxes).uniq
+end
+
+def signed_payload
+  # 使用 MoveSerializer 序列化
+  @signed_payload ||= serialize_payload(@migration, ActivityPub::MoveSerializer, signer: @account).to_json
+end
+```
+
+**为什么分发给被屏蔽者？**
+
+- 被屏蔽者也可能是"关注者"（单向关注）
+- 他们有权知道自己关注的账号已迁移
+- 由他们自己决定是否关注新账号
+
+### 4. Move 活动格式
+
+`MoveSerializer` 生成标准的 ActivityPub Move 活动：
+
+```ruby
+# app/serializers/activitypub/move_serializer.rb
 class ActivityPub::MoveSerializer < ActivityPub::Serializer
   attributes :id, :type, :target, :actor
   attribute :virtual_object, key: :object
@@ -255,86 +836,206 @@ class ActivityPub::MoveSerializer < ActivityPub::Serializer
 end
 ```
 
-生成的 ActivityPub 活动格式：
+**生成的 JSON**：
 ```json
 {
   "@context": "https://www.w3.org/ns/activitystreams",
-  "id": "https://oldinstance.com/users/olduser#moves/123",
+  "id": "https://old.example.com/users/olduser#moves/123",
   "type": "Move",
-  "actor": "https://oldinstance.com/users/olduser",
-  "object": "https://oldinstance.com/users/olduser",
-  "target": "https://newinstance.com/users/newuser"
+  "actor": "https://old.example.com/users/olduser",
+  "object": "https://old.example.com/users/olduser",
+  "target": "https://new.example.com/users/newuser"
 }
 ```
 
-#### 3.2 分发到目标 Inbox
+**关键字段含义**：
 
-```ruby
-# app/workers/activitypub/move_distribution_worker.rb:9-22
-def perform(migration_id)
-  @migration = AccountMigration.find(migration_id)
-  @account   = @migration.account
+| 字段 | 值 | 含义 |
+|------|-----|------|
+| `actor` | 旧账号 URI | 活动发起者 |
+| `object` | 旧账号 URI | 被迁移的对象（必须等于 actor） |
+| `target` | 新账号 URI | 迁移目标 |
 
-  # 分发给所有关注者的 inbox
-  ActivityPub::DeliveryWorker.push_bulk(inboxes, limit: 1_000) do |inbox_url|
-    [signed_payload, @account.id, inbox_url]
-  end
+**为什么 `object` 必须等于 `actor`？**
 
-  # 分发给中继服务器
-  ActivityPub::DeliveryWorker.push_bulk(Relay.enabled.pluck(:inbox_url)) do |inbox_url|
-    [signed_payload, @account.id, inbox_url]
-  end
-end
-
-private
-
-def inboxes
-  @inboxes ||= (@migration.account.followers.inboxes + @migration.account.blocked_by.inboxes).uniq
-end
-```
-
-**注意**：
-- 分发给**所有关注者**的 inbox
-- 分发给**被屏蔽者**的 inbox（让他们也知道迁移）
-- 分发给**中继服务器**（Relay）
+- 防止恶意实例发送 `{actor: 攻击者, object: 受害者, target: 攻击者}` 这样的伪造活动
+- 只有账号所有者才能迁移自己的账号
+- 这是 `ActivityPub::Activity::Move` 的第一个验证点
 
 ---
 
-## 新实例验证并接收 Follower 转移
+## 新实例：维护别名与验证认领
 
-当关注者所在的实例接收到 Move 活动时，由 `ActivityPub::Activity::Move` 处理。
+### 1. 新实例的被动角色
 
-### 1. ActivityPub::Activity::Move 处理器
+新实例在迁移流程中是**被动的**：
 
-**文件**：`app/lib/activitypub/activity/move.rb`
+- ❌ 不主动发起迁移
+- ❌ 不处理关注关系转移
+- ✓ 仅维护 `also_known_as` 别名关系
+- ✓ 通过 Update 活动宣告别名关系
+- ✓ 被其他实例查询时提供验证信息
+
+### 2. 别名管理流程
+
+#### 2.1 成功路径
 
 ```ruby
+# app/controllers/settings/aliases_controller.rb:10-23
+def index
+  @alias = current_account.aliases.build
+end
+
+def create
+  @alias = current_account.aliases.build(resource_params)
+
+  if @alias.save
+    # 保存成功后，分发 Update 活动
+    ActivityPub::UpdateDistributionWorker.perform_async(current_account.id)
+    redirect_to settings_aliases_path, notice: I18n.t('aliases.created_msg')
+  else
+    render :index
+  end
+end
+
+def destroy
+  @alias.destroy!
+  redirect_to settings_aliases_path, notice: I18n.t('aliases.deleted_msg')
+end
+```
+
+#### 2.2 AccountAlias 模型验证
+
+```ruby
+# app/models/account_alias.rb:15-56
+class AccountAlias < ApplicationRecord
+  belongs_to :account
+
+  validates :acct, presence: true, domain: { acct: true }
+  validates :uri, uniqueness: { scope: :account_id }  # 同一账号不能重复添加同一别名
+  validate :validate_target_account
+
+  before_validation :set_uri
+  after_create :add_to_account      # 添加到 also_known_as
+  after_destroy :remove_from_account # 从 also_known_as 移除
+
+  private
+
+  def set_uri
+    # 解析目标账号，获取其 URI
+    target_account = ResolveAccountService.new.call(acct)
+    self.uri = ActivityPub::TagManager.instance.uri_for(target_account) unless target_account.nil?
+  rescue Webfinger::Error, *Mastodon::HTTP_CONNECTION_ERRORS, Mastodon::Error
+    # 异常由验证层处理
+  end
+
+  def add_to_account
+    # 关键：将旧账号 URI 添加到新账号的 also_known_as
+    account.update(also_known_as: account.also_known_as + [uri])
+  end
+
+  def remove_from_account
+    # 移除时从 also_known_as 删除
+    account.update(also_known_as: account.also_known_as.reject { |x| x == uri })
+  end
+
+  def validate_target_account
+    if uri.blank?
+      errors.add(:acct, I18n.t('migrations.errors.not_found'))
+    elsif ActivityPub::TagManager.instance.uri_for(account) == uri
+      errors.add(:acct, I18n.t('migrations.errors.move_to_self'))
+    end
+  end
+end
+```
+
+### 3. also_known_as 的传播
+
+当新账号添加别名后，会分发 Update 活动：
+
+```ruby
+# app/controllers/settings/aliases_controller.rb:17-18
+ActivityPub::UpdateDistributionWorker.perform_async(current_account.id)
+```
+
+这使得全网实例可以在刷新新账号信息时获取最新的 `also_known_as`。
+
+**Actor 文档中的表示**：
+```json
+{
+  "type": "Person",
+  "id": "https://new.example.com/users/newuser",
+  "alsoKnownAs": [
+    "https://old.example.com/users/olduser"
+  ],
+  "inbox": "https://new.example.com/users/newuser/inbox",
+  "outbox": "https://new.example.com/users/newuser/outbox",
+  // ... 其他字段
+}
+```
+
+### 4. 新实例与旧实例的验证配合
+
+| 验证时机 | 执行方 | 验证内容 | 数据来源 |
+|----------|--------|----------|----------|
+| 迁移发起时 | 旧实例 | `target_account.also_known_as.include?(源账号 URI)` | 旧实例通过 WebFinger + ActivityPub  fetch 获取新账号信息 |
+| Move 处理时 | 关注者实例 | `target_account.also_known_as.include?(源账号 URI)` | 关注者实例通过 ActivityPub fetch 获取新账号信息 |
+
+**关键**：新实例不需要"主动"做任何验证，它只需要：
+1. 维护 `also_known_as` 数组
+2. 在 Actor 文档中正确返回 `alsoKnownAs` 字段
+
+验证逻辑由**旧实例**和**关注者实例**执行。
+
+---
+
+## 关注者实例：接收 Move 与重写关注关系
+
+### 1. 关注者实例的核心角色
+
+关注者实例是迁移的**实际执行者**：
+
+- ✓ 接收 Move 活动
+- ✓ 执行协议验证（最后一道防线）
+- ✓ 重写本地关注关系
+- ✓ 迁移相关数据（列表、备注、屏蔽、静音）
+
+### 2. ActivityPub::Activity::Move 处理器
+
+这是**最后一道验证防线**，也是最关键的安全验证：
+
+```ruby
+# app/lib/activitypub/activity/move.rb:1-44
 class ActivityPub::Activity::Move < ActivityPub::Activity
-  PROCESSING_COOLDOWN = 7.days.seconds  # 7天冷却期
+  PROCESSING_COOLDOWN = 7.days.seconds  # 7天处理冷却期
 
   def perform
-    # 验证1：object 必须是 actor 自己（防止假冒迁移）
+    # 验证1: object 必须等于 actor
+    # 防止: {actor: 攻击者, object: 受害者, target: 攻击者}
     return if origin_account.uri != object_uri
     
-    # 验证2：7天内不能重复处理
+    # 验证2: 7天内不能重复处理
+    # 防止: 重复处理或攻击
     return unless mark_as_processing!
 
-    # 解析目标账号
+    # 获取目标账号信息
     target_account = ActivityPub::FetchRemoteAccountService.new.call(target_uri)
 
-    # 验证3：核心安全验证
+    # 验证3: 核心安全验证
     # - 目标账号存在且可用
-    # - 目标账号的 also_known_as 包含源账号 URI（双向验证）
+    # - 目标账号的 also_known_as 包含源账号 URI
+    # 这确保: 新账号"认领"了旧账号
     if target_account.nil? || target_account.unavailable? || 
        !target_account.also_known_as.include?(origin_account.uri)
       unmark_as_processing!
-      return
+      return  # 静默失败，无错误通知
     end
 
-    # 设置源账号的 moved_to_account（本地缓存）
+    # 验证全部通过，执行迁移
+    # 步骤1: 更新本地缓存的 moved_to_account
     origin_account.update(moved_to_account: target_account)
 
-    # 触发关注关系转移
+    # 步骤2: 异步处理关注关系转移
     MoveWorker.perform_async(origin_account.id, target_account.id)
   rescue
     unmark_as_processing!
@@ -343,77 +1044,133 @@ class ActivityPub::Activity::Move < ActivityPub::Activity
 
   private
 
+  def origin_account
+    @account  # Move 活动的 actor
+  end
+
+  def target_uri
+    value_or_id(@json['target'])  # Move 活动的 target 字段
+  end
+
   def mark_as_processing!
+    # Redis 锁: 7天内不能重复处理
     redis.set("move_in_progress:#{@account.id}", true, nx: true, ex: PROCESSING_COOLDOWN)
   end
-end
-```
 
-### 2. 验证流程详解
-
-| 验证项 | 代码位置 | 目的 |
-|--------|----------|------|
-| `origin_account.uri == object_uri` | 第7行 | 确保 Move 活动的 object 是 actor 自己，防止恶意迁移他人账号 |
-| 7天冷却期 | 第8行、37-42行 | 防止频繁迁移或重复处理 |
-| `target_account.also_known_as.include?(origin_account.uri)` | 第12行 | **核心安全验证**：目标账号必须"认领"源账号 |
-
-**关键验证逻辑**：
-```ruby
-# 目标账号的 also_known_as 必须包含源账号 URI
-!target_account.also_known_as.include?(origin_account.uri)
-```
-
-这确保了：
-1. 新账号的持有者必须主动添加旧账号到别名（`also_known_as`）
-2. 证明新账号持有者拥有旧账号的控制权（或至少知道迁移意图）
-3. 防止恶意账号"偷走"他人的 follower
-
----
-
-## 后台任务批量重写关注关系
-
-### 1. MoveWorker 主入口
-
-**文件**：`app/workers/move_worker.rb`
-
-`MoveWorker` 处理两种场景：
-
-```ruby
-def perform(source_account_id, target_account_id)
-  @source_account = Account.find(source_account_id)
-  @target_account = Account.find(target_account_id)
-
-  if @target_account.local? && @source_account.local?
-    # 场景1：本地账号之间迁移 → 直接批量更新数据库
-    num_moved = rewrite_follows!
-    @source_account.update_count!(:followers_count, -num_moved)
-    @target_account.update_count!(:followers_count, num_moved)
-  else
-    # 场景2：跨实例迁移 → 异步队列处理
-    queue_follow_unfollows!
+  def unmark_as_processing!
+    redis.del("move_in_progress:#{@account.id}")
   end
-
-  # 其他数据迁移
-  copy_account_notes!    # 复制账号备注
-  carry_blocks_over!     # 迁移屏蔽关系
-  carry_mutes_over!      # 迁移静音关系
 end
 ```
 
-### 2. 场景1：本地账号迁移（rewrite_follows!）
+### 3. 验证逻辑详解
 
-**文件**：`app/workers/move_worker.rb:31-78`
+#### 3.1 为什么需要三层验证？
 
-本地迁移采用**批量数据库更新**，效率最高。
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    关注者实例的三层验证逻辑                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-#### 2.1 三阶段处理逻辑
+验证层1: object == actor
+┌─────────────────────────────────────────────────────────────────────────┐
+│  攻击场景:                                                                 │
+│  攻击者控制实例 evil.com，发送:                                            │
+│  {                                                                         │
+│    "actor": "https://evil.com/users/attacker",                           │
+│    "object": "https://good.com/users/victim",  ← 不等于 actor            │
+│    "target": "https://evil.com/users/attacker"                           │
+│  }                                                                         │
+│                                                                           │
+│  目的: 尝试"偷走"受害者的粉丝                                              │
+│                                                                           │
+│  防御: return if origin_account.uri != object_uri                         │
+│                                                                           │
+│  结果: 活动被静默忽略                                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+
+验证层2: 7天冷却期
+┌─────────────────────────────────────────────────────────────────────────┐
+│  攻击场景:                                                                 │
+│  攻击者控制实例，反复发送 Move 活动进行拒绝服务攻击                         │
+│                                                                           │
+│  或者:                                                                     │
+│  正常用户在短时间内多次迁移（误操作）                                       │
+│                                                                           │
+│  防御: Redis 锁 "move_in_progress:{account_id}" 7天过期                  │
+│                                                                           │
+│  结果: 7天内同一账号的 Move 只处理一次                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+
+验证层3: also_known_as 双向引用（核心）
+┌─────────────────────────────────────────────────────────────────────────┐
+│  攻击场景:                                                                 │
+│  攻击者控制实例 old.com，发送:                                            │
+│  {                                                                         │
+│    "actor": "https://old.com/users/legit_user",                          │
+│    "object": "https://old.com/users/legit_user",  ✓ 通过验证1           │
+│    "target": "https://evil.com/users/attacker"                           │
+│  }                                                                         │
+│                                                                           │
+│  目的: 攻击者控制了旧实例（或旧实例被攻破），想把合法用户的粉丝            │
+│        转移到攻击者账号                                                    │
+│                                                                           │
+│  防御: 验证 target_account.also_known_as.include?(origin_account.uri)   │
+│                                                                           │
+│  关键: 攻击者控制了 old.com，但不控制 new.com                             │
+│        无法在 new.com 的账号上添加 also_known_as                          │
+│                                                                           │
+│  结果: 活动被静默忽略                                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4. MoveWorker：关注关系转移执行
+
+验证通过后，`MoveWorker` 执行实际的关注关系转移：
 
 ```ruby
+# app/workers/move_worker.rb:3-400+
+class MoveWorker
+  include Sidekiq::Worker
+
+  def perform(source_account_id, target_account_id)
+    @source_account = Account.find(source_account_id)
+    @target_account = Account.find(target_account_id)
+
+    if @target_account.local? && @source_account.local?
+      # 场景A: 源和目标都是本地账号
+      # → 直接批量更新数据库（最高效）
+      num_moved = rewrite_follows!
+      @source_account.update_count!(:followers_count, -num_moved)
+      @target_account.update_count!(:followers_count, num_moved)
+    else
+      # 场景B: 跨实例迁移
+      # → 异步队列处理（需要与远程实例交互）
+      queue_follow_unfollows!
+    end
+
+    # 其他数据迁移（两种场景都执行）
+    copy_account_notes!    # 复制账号备注
+    carry_blocks_over!     # 迁移屏蔽关系
+    carry_mutes_over!      # 迁移静音关系
+
+    raise @deferred_error unless @deferred_error.nil?
+  rescue ActiveRecord::RecordNotFound
+    true  # 账号已删除，静默处理
+  end
+```
+
+#### 4.1 场景A：本地→本地迁移（rewrite_follows!）
+
+**最高效的场景**：源账号和目标账号都在同一实例
+
+```ruby
+# app/workers/move_worker.rb:31-78
 def rewrite_follows!
   num_moved = 0
 
-  # 阶段1：处理待处理的关注请求
-  # 先批准新账号的待处理请求，确保列表成员关系正确处理
+  # 阶段1: 处理待处理的关注请求
+  # 这些关注者已经请求关注新账号，先批准他们
   FollowRequest.where(account: @source_account.followers, target_account_id: @target_account.id).find_each do |follow_request|
     # 处理列表成员关系
     ListAccount.where(follow_id: follow_request.id).includes(:list).find_each do |list_account|
@@ -424,11 +1181,11 @@ def rewrite_follows!
     follow_request.authorize!
   end
 
-  # 阶段2：处理同时关注新旧账号的情况
+  # 阶段2: 处理同时关注新旧账号的情况
+  # 这些关注者已经关注了新账号，只需处理列表
   source_local_followers
     .where(account: @target_account.followers.local)
     .in_batches do |follows|
-      # 只需要处理列表成员关系（已经关注了新账号）
       ListAccount.where(follow: follows).includes(:list).find_each do |list_account|
         list_account.list.accounts << @target_account
       rescue ActiveRecord::RecordInvalid
@@ -436,18 +1193,19 @@ def rewrite_follows!
       end
     end
 
-  # 阶段3：处理只关注旧账号的情况（最常见）
+  # 阶段3: 处理只关注旧账号的情况（最常见）
+  # 批量更新数据库
   source_local_followers
     .where.not(account: @target_account.followers.local)
     .where.not(account_id: @target_account.id)
     .in_batches do |follows|
-      # 批量更新列表成员关系
+      # 批量更新列表成员
       ListAccount.where(follow: follows).in_batches.update_all(account_id: @target_account.id)
       
-      # 批量更新关注关系：将 target_account_id 从旧账号改为新账号
+      # 批量更新关注关系：旧→新
       num_moved += follows.update_all(target_account_id: @target_account.id)
 
-      # 清除关系缓存（update_all 不触发回调）
+      # 手动清理缓存（update_all 不触发回调）
       Rails.cache.delete_multi(follows.flat_map do |follow|
         [
           ['relationships', follow.account_id, follow.target_account_id],
@@ -462,22 +1220,22 @@ def rewrite_follows!
 end
 ```
 
-#### 2.2 本地迁移优化点
+**为什么分三个阶段？**
 
-1. **批量操作**：使用 `in_batches` 和 `update_all`，避免逐行操作
-2. **分阶段处理**：
-   - 待处理请求 → 同时关注 → 仅关注旧账号
-3. **缓存清理**：`update_all` 不触发 ActiveRecord 回调，需手动清理缓存
-4. **列表迁移**：`ListAccount` 记录的 `account_id` 同步更新
+| 阶段 | 场景 | 处理方式 | 原因 |
+|------|------|----------|------|
+| 1 | 待处理请求 | 先批准，再迁移列表 | 确保列表成员关系正确 |
+| 2 | 同时关注 | 只迁移列表 | 已经关注了新账号，无需重复关注 |
+| 3 | 仅关注旧账号 | 批量更新 | 最常见场景，最高效 |
 
-### 3. 场景2：跨实例迁移（queue_follow_unfollows!）
+#### 4.2 场景B：跨实例迁移（queue_follow_unfollows!）
 
-**文件**：`app/workers/move_worker.rb:86-94`
-
-跨实例迁移需要通过 ActivityPub 协议与远程实例交互，因此采用异步队列处理。
+**需要与远程实例交互**的场景
 
 ```ruby
+# app/workers/move_worker.rb:86-94
 def queue_follow_unfollows!
+  # bypass_locked: 如果新账号是本地账号，可以绕过锁定限制
   bypass_locked = @target_account.local?
 
   # 批量推送 UnfollowFollowWorker 任务
@@ -491,17 +1249,12 @@ def queue_follow_unfollows!
 end
 ```
 
-**参数说明**：
-- `follower_id`：关注者账号 ID
-- `@source_account.id`：旧账号 ID
-- `@target_account.id`：新账号 ID
-- `bypass_locked`：是否绕过新账号的锁（仅当新账号是本地账号时为 true）
+#### 4.3 UnfollowFollowWorker + FollowMigrationService
 
-### 4. UnfollowFollowWorker 单条处理
-
-**文件**：`app/workers/unfollow_follow_worker.rb`
+单条关注关系的迁移逻辑：
 
 ```ruby
+# app/workers/unfollow_follow_worker.rb:3-17
 class UnfollowFollowWorker
   include Sidekiq::Worker
 
@@ -522,18 +1275,9 @@ class UnfollowFollowWorker
 end
 ```
 
-### 5. FollowMigrationService 核心逻辑
-
-**文件**：`app/services/follow_migration_service.rb`
-
-继承自 `FollowService`，保留原有关注设置。
-
 ```ruby
+# app/services/follow_migration_service.rb:3-62
 class FollowMigrationService < FollowService
-  # @param [Account] source_account 关注者账号
-  # @param [Account] target_account 新目标账号
-  # @param [Account] old_target_account 旧目标账号
-  # @option [Boolean] bypass_locked 是否绕过锁定账号限制
   def call(source_account, target_account, old_target_account, bypass_locked: false)
     @old_target_account = old_target_account
 
@@ -548,77 +1292,69 @@ class FollowMigrationService < FollowService
           reblogs: reblogs, notify: notify, languages: languages, 
           bypass_locked: bypass_locked, bypass_limit: true)
   end
-```
 
-#### 5.1 三种关注场景处理
+  private
 
-根据新账号的状态，有三种处理方式：
+  # 场景A: 新账号锁定 → 创建关注请求
+  def request_follow!
+    follow_request = @source_account.request_follow!(@target_account, **follow_options)
+    migrate_list_accounts!  # 迁移列表成员
 
-```ruby
-private
+    if @target_account.local?
+      # 本地账号：发送通知，立即取消关注旧账号
+      LocalNotificationWorker.perform_async(@target_account.id, follow_request.id, ...)
+      UnfollowService.new.call(@source_account, @old_target_account, skip_unmerge: true)
+    elsif @target_account.activitypub?
+      # 远程账号：发送 ActivityPub Follow 活动
+      ActivityPub::MigratedFollowDeliveryWorker.perform_async(
+        build_json(follow_request), 
+        @source_account.id, 
+        @target_account.inbox_url, 
+        @old_target_account.id
+      )
+    end
 
-# 场景A：新账号需要审核（locked）→ 创建关注请求
-def request_follow!
-  follow_request = @source_account.request_follow!(@target_account, **follow_options)
-  migrate_list_accounts!  # 迁移列表成员
+    follow_request
+  end
 
-  if @target_account.local?
-    # 本地账号：发送通知，立即取消关注旧账号
-    LocalNotificationWorker.perform_async(@target_account.id, follow_request.id, ...)
+  # 场景B: 直接关注（新账号未锁定或 bypass_locked）
+  def direct_follow!
+    follow = super
+    migrate_list_accounts!
+    # 立即取消关注旧账号
     UnfollowService.new.call(@source_account, @old_target_account, skip_unmerge: true)
-  elsif @target_account.activitypub?
-    # 远程账号：发送 ActivityPub Follow 活动，携带旧账号信息
-    ActivityPub::MigratedFollowDeliveryWorker.perform_async(
-      build_json(follow_request), 
-      @source_account.id, 
-      @target_account.inbox_url, 
-      @old_target_account.id
-    )
+    follow
   end
 
-  follow_request
-end
-
-# 场景B：已有关注请求，更新选项
-def change_follow_request_options!
-  migrate_list_accounts!
-  super
-end
-
-# 场景C：直接关注（新账号未锁定或 bypass_locked）
-def direct_follow!
-  follow = super
-  migrate_list_accounts!
-  # 立即取消关注旧账号
-  UnfollowService.new.call(@source_account, @old_target_account, skip_unmerge: true)
-  follow
-end
-
-# 迁移列表成员关系
-def migrate_list_accounts!
-  ListAccount.where(follow_id: @original_follow.id).includes(:list).find_each do |list_account|
-    list_account.list.accounts << @target_account
-  rescue ActiveRecord::RecordInvalid
-    nil
+  # 迁移列表成员关系
+  def migrate_list_accounts!
+    ListAccount.where(follow_id: @original_follow.id).includes(:list).find_each do |list_account|
+      list_account.list.accounts << @target_account
+    rescue ActiveRecord::RecordInvalid
+      nil
+    end
   end
 end
 ```
 
-### 6. 其他数据迁移
+#### 4.4 其他数据迁移
 
 `MoveWorker` 还处理以下数据迁移：
 
-#### 6.1 复制账号备注
 ```ruby
+# app/workers/move_worker.rb:96-156
+
+# 复制账号备注
 def copy_account_notes!
   @source_account.targeted_account_notes.find_each do |note|
+    # 添加迁移提示前缀
     text = I18n.with_locale(note.account.user_locale.presence || I18n.default_locale) do
       I18n.t('move_handler.copy_account_note_text', acct: @source_account.acct)
     end
 
     new_note = @target_account.targeted_account_notes.find_by(account: note.account)
     if new_note.nil?
-      # 新建备注，前缀迁移提示
+      # 新建备注
       @target_account.targeted_account_notes.create!(
         account: note.account, 
         comment: [text, note.comment].join("\n")
@@ -629,10 +1365,8 @@ def copy_account_notes!
     end
   end
 end
-```
 
-#### 6.2 迁移屏蔽关系
-```ruby
+# 迁移屏蔽关系
 def carry_blocks_over!
   @source_account.blocked_by_relationships.where(account: Account.local).find_each do |block|
     unless skip_block_move?(block)
@@ -643,13 +1377,11 @@ def carry_blocks_over!
 end
 
 def skip_block_move?(block)
-  # 如果已经屏蔽了新账号，或者正在关注新账号，则跳过
+  # 跳过条件：已屏蔽新账号 或 正在关注新账号
   block.account.blocking?(@target_account) || block.account.following?(@target_account)
 end
-```
 
-#### 6.3 迁移静音关系
-```ruby
+# 迁移静音关系（类似屏蔽）
 def carry_mutes_over!
   @source_account.muted_by_relationships.where(account: Account.local).find_each do |mute|
     unless skip_mute_move?(mute)
@@ -662,499 +1394,98 @@ end
 
 ---
 
-## 跨实例协议校验配合
+## 三方协同时序总结
 
-### 1. 双向引用验证机制
-
-整个迁移流程的核心安全机制是**双向引用**：
-
-| 方向 | 字段 | 设置时机 | 验证位置 |
-|------|------|----------|----------|
-| 新 → 旧 | `also_known_as` | 新账号添加别名时 | `AccountMigration.validate_target_account` + `ActivityPub::Activity::Move.perform` |
-| 旧 → 新 | `moved_to_account_id` | 旧账号发起迁移时 | `ActivityPub::ProcessAccountService` 解析 actor 时 |
-
-### 2. 验证时机
-
-#### 2.1 旧实例发起时验证
-```ruby
-# app/models/account_migration.rb:83
-errors.add(:acct, I18n.t('migrations.errors.missing_also_known_as')) 
-  unless target_account.also_known_as.include?(ActivityPub::TagManager.instance.uri_for(account))
-```
-
-**目的**：在用户发起迁移时就提示错误，避免无效的 Move 活动。
-
-#### 2.2 接收方验证（最重要）
-```ruby
-# app/lib/activitypub/activity/move.rb:12
-if target_account.nil? || target_account.unavailable? || 
-   !target_account.also_known_as.include?(origin_account.uri)
-  unmark_as_processing!
-  return
-end
-```
-
-**目的**：防止恶意实例伪造 Move 活动。即使旧实例被攻破，没有新账号的 `also_known_as` 配合，迁移也无法完成。
-
-### 3. ActivityPub 协议层面
-
-#### 3.1 Move 活动结构
-```json
-{
-  "type": "Move",
-  "actor": "https://old.example.com/users/olduser",   // 迁移发起人
-  "object": "https://old.example.com/users/olduser",  // 被迁移的账号（必须等于 actor）
-  "target": "https://new.example.com/users/newuser"   // 目标账号
-}
-```
-
-#### 3.2 alsoKnownAs 在 Actor 中的表示
-当新账号添加了旧账号作为别名后，其 ActivityPub Actor 文档中会包含：
-```json
-{
-  "type": "Person",
-  "id": "https://new.example.com/users/newuser",
-  "alsoKnownAs": [
-    "https://old.example.com/users/olduser"
-  ],
-  // ... 其他字段
-}
-```
-
-#### 3.3 movedTo 在 Actor 中的表示
-当旧账号设置了迁移后，其 ActivityPub Actor 文档中会包含：
-```json
-{
-  "type": "Person",
-  "id": "https://old.example.com/users/olduser",
-  "movedTo": "https://new.example.com/users/newuser",
-  // ... 其他字段
-}
-```
-
-### 4. 流程中的协议交互
+### 1. 完整时序图
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   新账号实例     │     │   旧账号实例     │     │  关注者实例      │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                         │                         │
-         │  1. 用户添加别名         │                         │
-         │  (POST /settings/aliases)│                         │
-         │◄─────────────────────────│                         │
-         │                         │                         │
-         │  2. 分发 Update 活动     │                         │
-         │  (Actor 包含 alsoKnownAs) │                         │
-         │─────────────────────────►│────────────────────────►│
-         │                         │                         │
-         │                         │  3. 用户发起迁移          │
-         │                         │  (POST /settings/migration)│
-         │◄─────────────────────────│                         │
-         │  WebFinger 解析新账号     │                         │
-         │                         │                         │
-         │  4. 验证 alsoKnownAs     │                         │
-         │  (目标账号是否认领源账号)  │                         │
-         │─────────────────────────►│                         │
-         │                         │                         │
-         │                         │  5. 分发 Update 活动      │
-         │                         │  (Actor 包含 movedTo)    │
-         │◄─────────────────────────│────────────────────────►│
-         │                         │                         │
-         │                         │  6. 分发 Move 活动        │
-         │◄─────────────────────────│────────────────────────►│
-         │                         │                         │
-         │                         │                         │  7. 接收方验证
-         │                         │                         │  - object == actor?
-         │                         │                         │  - 7天冷却期?
-         │                         │                         │  - alsoKnownAs 验证?
-         │                         │                         │
-         │                         │                         │  8. 处理关注关系转移
-         │                         │                         │  - MoveWorker
-         │                         │                         │  - UnfollowFollowWorker
-         │                         │                         │  - FollowMigrationService
-```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        Mastodon 账号迁移三方协同时序图                                 │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 
----
-
-## 关键数据结构
-
-### 1. Account 模型关键字段
-
-| 字段 | 类型 | 用途 |
-|------|------|------|
-| `also_known_as` | string[] | 存储别名账号 URI，用于迁移验证 |
-| `moved_to_account_id` | bigint | 指向迁移目标账号 |
-| `uri` | string | ActivityPub Actor ID，用于协议验证 |
-
-**代码位置**：`app/models/account.rb:9`
-
-```ruby
-# Schema 片段
-#  also_known_as                 :string           is an Array
-#  moved_to_account_id           :bigint(8)
-#  uri                           :string           default(""), not null
-```
-
-### 2. AccountMigration 模型
-
-**文件**：`app/models/account_migration.rb`
-
-| 字段 | 类型 | 用途 |
-|------|------|------|
-| `account_id` | bigint | 源账号 ID |
-| `target_account_id` | bigint | 目标账号 ID |
-| `acct` | string | 目标账号地址（用于表单输入） |
-| `followers_count` | bigint | 迁移时的粉丝数（记录用） |
-
-**常量**：
-- `COOLDOWN_PERIOD = 30.days.freeze`：迁移冷却期
-
-### 3. AccountAlias 模型
-
-**文件**：`app/models/account_alias.rb`
-
-| 字段 | 类型 | 用途 |
-|------|------|------|
-| `account_id` | bigint | 所属账号 ID |
-| `acct` | string | 别名账号地址 |
-| `uri` | string | 别名账号的 URI |
-
-**回调**：
-- `after_create :add_to_account`：添加到 `also_known_as`
-- `after_destroy :remove_from_account`：从 `also_known_as` 移除
-
-### 4. Redis 键
-
-| 键模式 | 用途 | 过期时间 |
-|--------|------|----------|
-| `account_migration:{account_id}` | 迁移操作锁 | - |
-| `move_in_progress:{account_id}` | Move 处理冷却标记 | 7天 |
-
----
-
-## 流程图总结
-
-### 完整迁移流程图
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           账号迁移完整流程                                      │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌──────────────┐
-│  用户操作阶段  │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 1. 新账号添加别名 (新实例)                                      │
-│    ┌─────────────────┐                                         │
-│    │ 页面: /settings/aliases                                   │
-│    │ 控制器: Settings::AliasesController                       │
-│    │ 模型: AccountAlias                                         │
-│    │                                                             │
-│    │ 流程:                                                       │
-│    │   输入旧账号地址 → WebFinger 解析 → 验证 →                  │
-│    │   更新 also_known_as → 分发 Update 活动                   │
-└──────────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 2. 旧账号发起迁移 (旧实例)                                      │
-│    ┌─────────────────┐                                         │
-│    │ 页面: /settings/migration                                 │
-│    │ 控制器: Settings::MigrationsController                    │
-│    │ 模型: AccountMigration                                     │
-│    │                                                             │
-│    │ 验证:                                                       │
-│    │   - 密码/用户名验证                                         │
-│    │   - 目标账号 also_known_as 包含源账号 URI (核心验证)       │
-│    │   - 30天冷却期                                             │
-│    │   - 不是迁移到自己                                          │
-└──────────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────┐
-│  协议分发阶段  │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 3. MoveService 执行 (旧实例)                                   │
-│    ┌─────────────────┐                                         │
-│    │ 文件: app/services/move_service.rb                       │
-│    │                                                             │
-│    │ 步骤:                                                       │
-│    │   1. update_redirect!                                      │
-│    │      → 设置 source_account.moved_to_account               │
-│    │                                                             │
-│    │   2. process_local_relationships!                          │
-│    │      → MoveWorker.perform_async (处理本地关注)             │
-│    │                                                             │
-│    │   3. distribute_update!                                    │
-│    │      → ActivityPub::UpdateDistributionWorker              │
-│    │      (通知全网账号已迁移)                                    │
-│    │                                                             │
-│    │   4. distribute_move!                                      │
-│    │      → ActivityPub::MoveDistributionWorker                │
-│    │      (发送 Move 活动给所有关注者)                            │
-└──────────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 4. MoveDistributionWorker 分发 (旧实例)                        │
-│    ┌─────────────────┐                                         │
-│    │ 文件: app/workers/activitypub/move_distribution_worker.rb│
-│    │                                                             │
-│    │ 序列化: ActivityPub::MoveSerializer                       │
-│    │                                                             │
-│    │ 目标:                                                       │
-│    │   - 所有关注者的 inbox                                      │
-│    │   - 所有被屏蔽者的 inbox                                    │
-│    │   - 中继服务器 (Relay)                                      │
-│    │                                                             │
-│    │ Activity 格式:                                              │
-│    │   {                                                         │
-│    │     "type": "Move",                                         │
-│    │     "actor": "https://old/users/old",                      │
-│    │     "object": "https://old/users/old",  ← 必须等于 actor  │
-│    │     "target": "https://new/users/new"                      │
-│    │   }                                                         │
-└──────────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────┐
-│  接收处理阶段  │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 5. ActivityPub::Activity::Move 处理 (关注者实例)              │
-│    ┌─────────────────┐                                         │
-│    │ 文件: app/lib/activitypub/activity/move.rb              │
-│    │                                                             │
-│    │ 验证 (任意失败则中止):                                       │
-│    │   1. origin_account.uri == object_uri                     │
-│    │      → 防止假冒迁移                                         │
-│    │                                                             │
-│    │   2. mark_as_processing! (7天冷却期)                      │
-│    │      → Redis: move_in_progress:{account_id}               │
-│    │                                                             │
-│    │   3. 目标账号验证 (核心):                                   │
-│    │      - target_account 存在且可用                            │
-│    │      - target_account.also_known_as.include?(源账号 URI)  │
-│    │      → 双向引用验证，确保新账号"认领"了旧账号               │
-│    │                                                             │
-│    │ 通过后执行:                                                 │
-│    │   - 更新本地缓存: origin_account.moved_to_account          │
-│    │   - MoveWorker.perform_async (处理关注关系转移)             │
-└──────────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────┐
-│  关系转移阶段  │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 6. MoveWorker 处理 (关注者实例)                                │
-│    ┌─────────────────┐                                         │
-│    │ 文件: app/workers/move_worker.rb                         │
-│    │                                                             │
-│    │ 分支:                                                       │
-│    │   ┌─────────────────────────────────────────────────┐    │
-│    │   │ 场景A: 源账号和目标账号都是本地账号                 │    │
-│    │   │ → rewrite_follows! (批量数据库更新)               │    │
-│    │   │                                                    │    │
-│    │   │ 三阶段处理:                                         │    │
-│    │   │   1. 处理待处理的关注请求                           │    │
-│    │   │   2. 处理同时关注新旧账号的情况                      │    │
-│    │   │   3. 处理只关注旧账号的情况 (批量 update_all)       │    │
-│    │   │                                                    │    │
-│    │   │ 同时处理:                                           │    │
-│    │   │   - ListAccount 列表成员迁移                        │    │
-│    │   │   - 缓存清理 (update_all 不触发回调)                │    │
-│    │   └─────────────────────────────────────────────────┘    │
-│    │                                                             │
-│    │   ┌─────────────────────────────────────────────────┐    │
-│    │   │ 场景B: 跨实例迁移                                 │    │
-│    │   │ → queue_follow_unfollows!                        │    │
-│    │   │                                                    │    │
-│    │   │ 批量推送:                                          │    │
-│    │   │   UnfollowFollowWorker.push_bulk                  │    │
-│    │   │                                                    │    │
-│    │   │ 参数: [follower_id, old_id, new_id, bypass_locked]│
-│    │   └─────────────────────────────────────────────────┘    │
-│    │                                                             │
-│    │ 其他数据迁移:                                               │
-│    │   - copy_account_notes!  (复制账号备注)                   │
-│    │   - carry_blocks_over!    (迁移屏蔽关系)                  │
-│    │   - carry_mutes_over!     (迁移静音关系)                  │
-└──────────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 7. UnfollowFollowWorker + FollowMigrationService              │
-│    ┌─────────────────┐                                         │
-│    │ 文件: app/workers/unfollow_follow_worker.rb             │
-│    │       app/services/follow_migration_service.rb          │
-│    │                                                             │
-│    │ 流程:                                                       │
-│    │   1. 读取原有关注设置 (reblogs, notify, languages)        │
-│    │   2. 根据新账号状态选择处理方式:                            │
-│    │                                                             │
-│    │      ┌──────────────┬────────────────────────────┐       │
-│    │      │ 场景         │ 处理方式                     │       │
-│    │      ├──────────────┼────────────────────────────┤       │
-│    │      │ 新账号锁定   │ request_follow!            │       │
-│    │      │              │ → 创建关注请求              │       │
-│    │      │              │ → 发送通知/ActivityPub 活动 │       │
-│    │      ├──────────────┼────────────────────────────┤       │
-│    │      │ 已有请求     │ change_follow_request_     │       │
-│    │      │              │ options!                   │       │
-│    │      │              │ → 更新请求选项              │       │
-│    │      ├──────────────┼────────────────────────────┤       │
-│    │      │ 可直接关注   │ direct_follow!             │       │
-│    │      │              │ → 立即创建关注关系          │       │
-│    │      │              │ → 立即取消关注旧账号        │       │
-│    │      └──────────────┴────────────────────────────┘       │
-│    │                                                             │
-│    │   3. 迁移列表成员关系 (migrate_list_accounts!)            │
-│    │   4. 取消关注旧账号 (UnfollowService)                      │
-└──────────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────┐
-│   完成状态    │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│ 最终状态:                                                       │
-│   ✓ 旧账号: moved_to_account 指向新账号                        │
-│   ✓ 新账号: also_known_as 包含旧账号 URI                       │
-│   ✓ 关注者: 关注关系从旧账号转移到新账号                        │
-│   ✓ 列表: 列表成员关系同步更新                                  │
-│   ✓ 备注/屏蔽/静音: 同步迁移                                    │
-└──────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 关键安全机制总结
-
-### 1. 双向引用验证（核心）
-
-```
-新账号 ──alsoKnownAs──► 旧账号 URI (认领)
-旧账号 ──movedTo───────► 新账号 URI (指向)
-```
-
-**验证位置**：
-1. 旧实例发起时：`AccountMigration.validate_target_account`
-2. 接收方处理时：`ActivityPub::Activity::Move.perform`
-
-### 2. 冷却期机制
-
-| 冷却期 | 时长 | 用途 | 实现 |
-|--------|------|------|------|
-| 迁移冷却期 | 30天 | 防止频繁发起迁移 | `AccountMigration.within_cooldown` |
-| 处理冷却期 | 7天 | 防止重复处理 Move 活动 | Redis `move_in_progress:{id}` |
-
-### 3. 操作锁
-
-```ruby
-# app/models/account_migration.rb:54-56
-with_redis_lock("account_migration:#{account.id}") do
-  save
-end
-```
-
-防止并发迁移操作。
-
-### 4. 身份验证
-
-- 密码验证（有密码的账号）
-- 用户名验证（无密码的账号，如 OAuth 登录）
-
----
-
-## 错误处理
-
-### 1. 验证错误
-
-| 错误类型 | 错误信息 Key | 触发条件 |
-|----------|-------------|----------|
-| 目标账号不存在 | `migrations.errors.not_found` | WebFinger 解析失败 |
-| 缺少 also_known_as | `migrations.errors.missing_also_known_as` | 目标账号未认领源账号 |
-| 已迁移过 | `migrations.errors.already_moved` | 重复迁移到同一账号 |
-| 迁移到自己 | `migrations.errors.move_to_self` | 目标是自己 |
-| 冷却期 | `migrations.errors.on_cooldown` | 30天内已迁移过 |
-
-### 2. 运行时错误
-
-- `ActiveRecord::RecordNotFound`：账号已删除 → 静默失败
-- `Mastodon::NotPermittedError`：无权限 → 静默失败
-- 其他异常 → 记录错误，重试机制由 Sidekiq 处理
-
----
-
-## 性能优化
-
-### 1. 批量操作
-
-- `find_in_batches` + `push_bulk`：批量推送 Sidekiq 任务
-- `in_batches` + `update_all`：批量更新数据库（不实例化对象）
-- 限制每批 1000 条（`ActivityPub::DeliveryWorker.push_bulk(..., limit: 1_000)`）
-
-### 2. 异步处理
-
-所有耗时操作都通过 Sidekiq 异步处理：
-- `MoveWorker`：主迁移任务
-- `UnfollowFollowWorker`：单条关注关系处理
-- `ActivityPub::DeliveryWorker`：协议分发
-
-### 3. 缓存策略
-
-- `update_all` 后手动清理缓存（`Rails.cache.delete_multi`）
-- `ResolveAccountService` 支持 `skip_cache: true`（迁移时强制刷新）
-
----
-
-## 相关文件索引
-
-| 功能 | 文件路径 |
-|------|----------|
-| 迁移模型 | `app/models/account_migration.rb` |
-| 别名模型 | `app/models/account_alias.rb` |
-| 迁移服务 | `app/services/move_service.rb` |
-| 关注迁移服务 | `app/services/follow_migration_service.rb` |
-| 主迁移 Worker | `app/workers/move_worker.rb` |
-| 单条关注迁移 Worker | `app/workers/unfollow_follow_worker.rb` |
-| Move 活动分发 | `app/workers/activitypub/move_distribution_worker.rb` |
-| Move 活动处理 | `app/lib/activitypub/activity/move.rb` |
-| Move 序列化器 | `app/serializers/activitypub/move_serializer.rb` |
-| 迁移控制器 | `app/controllers/settings/migrations_controller.rb` |
-| 别名控制器 | `app/controllers/settings/aliases_controller.rb` |
-| 重定向控制器 | `app/controllers/settings/migration/redirects_controller.rb` |
-| 迁移页面视图 | `app/views/settings/migrations/show.html.haml` |
-| 别名页面视图 | `app/views/settings/aliases/index.html.haml` |
-| 重定向页面视图 | `app/views/settings/migration/redirects/new.html.haml` |
-
----
-
-## 测试文件索引
-
-| 测试对象 | 文件路径 |
-|----------|----------|
-| MoveService | `spec/services/move_service_spec.rb` |
-| Move 活动处理 | `spec/lib/activitypub/activity/move_spec.rb` |
-| 迁移系统测试 | `spec/system/settings/migrations_spec.rb` |
-| 重定向系统测试 | `spec/system/settings/migration/redirects_spec.rb` |
-| 重定向请求测试 | `spec/requests/settings/migration/redirects_spec.rb` |
-| Move 序列化器 | `spec/serializers/activitypub/move_serializer_spec.rb` |
-| UnfollowFollowWorker | `spec/workers/unfollow_follow_worker_spec.rb` |
-
----
-
-*文档生成日期: 2026-05-05*
+时间轴
+──────►
+  │
+  │   ┌──────────┐         ┌──────────┐         ┌──────────┐
+  │   │  用户    │         │  新实例   │         │  旧实例   │
+  │   └────┬─────┘         └────┬─────┘         └────┬─────┘
+  │        │                    │                    │
+  │        │ 1. 登录新账号        │                    │
+  │        │───────────────────►│                    │
+  │        │                    │                    │
+  │        │ 2. 访问 /settings/aliases                │
+  │        │───────────────────►│                    │
+  │        │                    │                    │
+  │        │ 3. 输入旧账号地址   │                    │
+  │        │    (old@old.com)   │                    │
+  │        │───────────────────►│                    │
+  │        │                    │                    │
+  │        │                    │ 4. WebFinger 解析  │
+  │        │                    │    旧账号信息       │
+  │        │                    │◄───────────────────│ (跨实例)
+  │        │                    │                    │
+  │        │                    │ 5. 验证通过         │
+  │        │                    │    - 账号存在        │
+  │        │                    │    - 不是自己        │
+  │        │                    │                    │
+  │        │                    │ 6. 更新 also_known_as│
+  │        │                    │    + [旧账号 URI]    │
+  │        │                    │                    │
+  │        │                    │ 7. 分发 Update 活动  │
+  │        │                    │    (Actor 包含       │
+  │        │                    │     alsoKnownAs)     │
+  │        │◄───────────────────│                    │
+  │        │    "Alias created"  │                    │
+  │        │                    │                    │
+  ▼        │                    │                    │
+           │ 8. 登录旧账号        │                    │
+           │────────────────────────────────────────►│
+           │                    │                    │
+           │ 9. 访问 /settings/migration             │
+           │────────────────────────────────────────►│
+           │                    │                    │
+           │                    │                    │ 10. 检查状态
+           │                    │                    │     - 冷却期?
+           │                    │                    │     - 已迁移?
+           │◄────────────────────────────────────────│
+           │    显示迁移表单      │                    │
+           │    + 风险提示        │                    │
+           │    + "backreference  │                    │
+           │      required" 提示   │                    │
+           │                    │                    │
+           │ 11. 输入新账号地址    │                    │
+           │     + 密码           │                    │
+           │────────────────────────────────────────►│
+           │                    │                    │
+           │                    │                    │ 12. 身份验证
+           │                    │                    │     - 密码/用户名
+           │                    │                    │
+           │                    │                    │ 13. WebFinger 解析
+           │                    │                    │     新账号信息
+           │                    │◄───────────────────│ (跨实例)
+           │                    │                    │
+           │                    │                    │ 14. 核心验证
+           │                    │                    │     - also_known_as
+           │                    │                    │       包含旧账号 URI?
+           │                    │                    │     - 冷却期?
+           │                    │                    │     - 不是自己?
+           │                    │                    │
+           │◄────────────────────────────────────────│ 15a. 验证失败
+           │    显示错误消息      │                    │
+           │    (如 "is not an   │                    │
+           │     alias of this   │                    │
+           │     account")       │                    │
+           │                    │                    │
+           │                    │                    │ 15b. 验证成功
+           │                    │                    │
+           │                    │                    │ 16. MoveService 执行
+           │                    │                    │     - 设置 moved_to_account
+           │                    │                    │     - MoveWorker 入队
+           │                    │                    │     - UpdateDistributionWorker 入队
+           │                    │                    │     - MoveDistributionWorker 入队
+           │                    │                    │
+           │◄────────────────────────────────────────│ 17. 同步响应
+           │    "Your account is  │                    │
+           │     now redirecting  │                    │
+           │     to ..."          │                    │
+           │                    │
