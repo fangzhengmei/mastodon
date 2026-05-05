@@ -9,6 +9,7 @@
 1. [用户导出存档](#用户导出存档)
 2. [导入关注/屏蔽列表](#导入关注屏蔽列表)
 3. [联邦协议同步边界与隐私约束](#联邦协议同步边界与隐私约束)
+4. [关注/屏蔽操作的跨实例同步链路](#关注屏蔽操作的跨实例同步链路)
 
 ---
 
@@ -696,6 +697,768 @@ end
 
 ---
 
+## 关注/屏蔽操作的跨实例同步链路
+
+当用户导入关注/屏蔽列表或直接执行关注/屏蔽操作时，系统会通过 ActivityPub 协议与远程实例进行同步。本节详细描述这个同步链路的技术细节。
+
+### 1. 投递对象选择机制
+
+#### 1.1 关注操作的投递目标选择
+
+**FollowService** (`app/services/follow_service.rb`)
+
+关注操作的投递逻辑区分本地账户和远程账户：
+
+```ruby
+def call(source_account, target_account, options = {})
+  @source_account = source_account
+  @target_account = target_account
+  @options        = { bypass_locked: false, bypass_limit: false, with_rate_limit: false }.merge(options)
+
+  # 前置检查：是否允许关注
+  raise ActiveRecord::RecordNotFound if following_not_possible?
+  raise Mastodon::NotPermittedError  if following_not_allowed?
+
+  # ... 处理已有关注或请求 ...
+
+  # 根据目标账户类型选择不同的处理方式
+  if (@target_account.locked? && !@options[:bypass_locked]) || @source_account.silenced? || @target_account.activitypub?
+    request_follow!  # 发送关注请求
+  elsif @target_account.local?
+    direct_follow!   # 直接关注（本地账户）
+  end
+end
+```
+
+**投递条件判断** (`following_not_allowed?`)：
+
+```ruby
+def following_not_allowed?
+  domain_not_allowed?(@target_account.domain) ||           # 域名被限制
+    @target_account.blocking?(@source_account) ||          # 目标屏蔽了源
+    @source_account.blocking?(@target_account) ||          # 源屏蔽了目标
+    @target_account.moved? ||                               # 目标账户已迁移
+    (!@target_account.local? && @target_account.ostatus?) || # 远程账户使用旧协议
+    @source_account.domain_blocking?(@target_account.domain) # 源实例屏蔽了目标域名
+end
+```
+
+**远程账户的关注请求投递**：
+
+```ruby
+def request_follow!
+  follow_request = @source_account.request_follow!(@target_account, **follow_options.merge(rate_limit: @options[:with_rate_limit], bypass_limit: @options[:bypass_limit]))
+
+  if @target_account.local?
+    # 本地账户：发送本地通知
+    LocalNotificationWorker.perform_async(@target_account.id, follow_request.id, follow_request.class.name, 'follow_request')
+  elsif @target_account.activitypub?
+    # 远程账户：通过 ActivityPub 投递
+    ActivityPub::DeliveryWorker.perform_async(
+      build_json(follow_request), 
+      @source_account.id, 
+      @target_account.inbox_url, 
+      { 'bypass_availability' => true }
+    )
+  end
+
+  follow_request
+end
+```
+
+#### 1.2 屏蔽操作的投递目标选择
+
+**BlockService** (`app/services/block_service.rb`)
+
+屏蔽操作同样区分本地和远程账户：
+
+```ruby
+def call(account, target_account)
+  return if account.id == target_account.id
+
+  @account = account
+  @target_account = target_account
+
+  # 处理已有的关注关系
+  handle_following_relationships
+  handle_collections
+
+  # 创建屏蔽关系
+  NotificationPermission.where(account: account, from_account: target_account).destroy_all
+  block = account.block!(target_account)
+
+  # 异步处理（清理时间线等）
+  BlockWorker.perform_async(account.id, target_account.id)
+  
+  # 远程账户：通过 ActivityPub 投递
+  create_notification(block) if !target_account.local? && target_account.activitypub?
+  
+  block
+end
+
+def create_notification(block)
+  ActivityPub::DeliveryWorker.perform_async(
+    build_json(block), 
+    block.account_id, 
+    block.target_account.inbox_url
+  )
+end
+```
+
+#### 1.3 投递目标确定规则
+
+| 目标账户类型 | 投递方式 | 目标地址 |
+|-------------|----------|----------|
+| **本地账户** | 本地通知 | 无网络投递，直接处理 |
+| **远程 ActivityPub 账户** | ActivityPub::DeliveryWorker | `target_account.inbox_url` |
+| **远程 OStatus 账户** | 不投递（已废弃） | 无 |
+
+**关键决策点**：
+1. **域名检查**：`domain_not_allowed?` 检查目标域名是否被屏蔽
+2. **协议检查**：`activitypub?` 确认目标账户支持 ActivityPub 协议
+3. **可用性检查**：`unavailable?` 确认账户未被暂停或删除
+
+### 2. 字段最小化策略
+
+关注/屏蔽操作的 ActivityPub 消息采用极端的字段最小化策略，只包含完成功能所需的最少信息。
+
+#### 2.1 Follow 活动序列化器
+
+**ActivityPub::FollowSerializer** (`app/serializers/activitypub/follow_serializer.rb`)
+
+```ruby
+class ActivityPub::FollowSerializer < ActivityPub::Serializer
+  attributes :id, :type, :actor
+  attribute :virtual_object, key: :object
+
+  def id
+    ActivityPub::TagManager.instance.uri_for(object) || [ActivityPub::TagManager.instance.uri_for(object.account), '#follows/', object.id].join
+  end
+
+  def type
+    'Follow'
+  end
+
+  def actor
+    ActivityPub::TagManager.instance.uri_for(object.account)
+  end
+
+  def virtual_object
+    ActivityPub::TagManager.instance.uri_for(object.target_account)
+  end
+end
+```
+
+**序列化字段**（仅 4 个字段）：
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| `id` | 关注请求的唯一 URI | 用于后续的 Accept/Reject 响应 |
+| `type` | `"Follow"` | 活动类型标识 |
+| `actor` | 发起者账户 URI | 谁发起的关注 |
+| `object` | 目标账户 URI | 关注谁 |
+
+**不包含的信息**：
+- 关注设置（是否显示转嘟、是否通知、语言过滤）
+- 发起者的完整账户信息
+- 目标的完整账户信息
+- 任何内部数据库 ID
+- 时间戳（由 HTTP 签名或接收方记录）
+
+#### 2.2 Block 活动序列化器
+
+**ActivityPub::BlockSerializer** (`app/serializers/activitypub/block_serializer.rb`)
+
+```ruby
+class ActivityPub::BlockSerializer < ActivityPub::Serializer
+  attributes :id, :type, :actor
+  attribute :virtual_object, key: :object
+
+  def id
+    ActivityPub::TagManager.instance.uri_for(object) || [ActivityPub::TagManager.instance.uri_for(object.account), '#blocks/', object.id].join
+  end
+
+  def type
+    'Block'
+  end
+
+  def actor
+    ActivityPub::TagManager.instance.uri_for(object.account)
+  end
+
+  def virtual_object
+    ActivityPub::TagManager.instance.uri_for(object.target_account)
+  end
+end
+```
+
+**序列化字段**（与 Follow 相同，仅 4 个字段）：
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| `id` | 屏蔽的唯一 URI | 用于后续的 Undo 响应 |
+| `type` | `"Block"` | 活动类型标识 |
+| `actor` | 发起者账户 URI | 谁发起的屏蔽 |
+| `object` | 目标账户 URI | 屏蔽谁 |
+
+**不包含的信息**：
+- 屏蔽原因
+- 发起者的完整账户信息
+- 任何内部元数据
+
+#### 2.3 为什么这样设计？
+
+**安全和隐私考虑**：
+
+1. **防止信息泄露**：
+   - 不暴露关注设置（如"不显示转嘟"可能暗示对目标的负面看法）
+   - 不暴露发起者的私有信息
+   - 最小化可用于追踪或分析的数据
+
+2. **协议兼容性**：
+   - 遵循 ActivityPub 规范的最小要求
+   - 确保与其他实现（如 Pleroma、Misskey）的互操作性
+
+3. **可验证性**：
+   - 使用 URI 引用而非嵌入对象，接收方可以独立验证
+   - HTTP 签名提供完整性和身份验证
+
+### 3. 远端验签失败处理边界
+
+所有入站的 ActivityPub 请求都必须通过 HTTP 签名验证。验证失败时，系统有明确的处理边界和降级策略。
+
+#### 3.1 签名验证流程
+
+**SignatureVerification** (`app/controllers/concerns/signature_verification.rb`)
+
+```ruby
+def signed_request_actor
+  return @signed_request_actor if defined?(@signed_request_actor)
+
+  raise Mastodon::SignatureVerificationError, 'Request not signed' unless signed_request?
+
+  # 1. 从 keyId 获取公钥
+  keypair = keypair_from_key_id
+
+  raise Mastodon::SignatureVerificationError, "Public key not found for key #{signature_key_id}" if keypair.nil?
+
+  # 2. 检查密钥有效性
+  check_keypair_validity!(keypair)
+  
+  # 3. 尝试验证签名
+  return (@signed_request_actor = keypair.actor) if signed_request.verified?(keypair)
+
+  # 4. 验证失败，尝试刷新密钥（可能密钥已轮换）
+  keypair = stoplight_wrapper.run { keypair_refresh_key!(keypair) }
+
+  raise Mastodon::SignatureVerificationError, "Could not refresh public key #{signature_key_id}" if keypair.nil?
+
+  # 5. 再次检查密钥有效性
+  check_keypair_validity!(keypair)
+  
+  # 6. 再次尝试验证
+  return (@signed_request_actor = keypair.actor) if signed_request.verified?(keypair)
+
+  # 7. 所有尝试都失败
+  fail_with! "Verification failed for #{keypair.actor.to_log_human_identifier} #{keypair.actor.uri} #{keypair.uri}"
+end
+```
+
+#### 3.2 时间约束
+
+**签名过期和时钟偏差容忍**：
+
+```ruby
+EXPIRATION_WINDOW_LIMIT = 12.hours  # 签名最大有效期
+CLOCK_SKEW_MARGIN       = 1.hour     # 时钟偏差容忍
+```
+
+**处理逻辑**：
+1. **签名时间戳检查**：请求的 `Date` 头部必须在合理时间范围内
+2. **过期时间**：超过 12 小时的签名被视为无效
+3. **时钟偏差**：允许最多 1 小时的时钟偏差
+
+#### 3.3 密钥有效性检查
+
+```ruby
+def check_keypair_validity!(keypair)
+  raise Mastodon::SignatureVerification, "Key #{signature_key_id} is revoked" if keypair.revoked?
+  raise Mastodon::SignatureVerification, "Key #{signature_key_id} has expired" if keypair.expired?
+end
+```
+
+**密钥状态**：
+- `revoked?`：密钥已被撤销
+- `expired?`：密钥已过期
+
+#### 3.4 域名限制在验签阶段的应用
+
+域名限制检查在验签的早期阶段就会执行：
+
+```ruby
+def keypair_from_key_id
+  key_id = signed_request.key_id
+  domain = key_id.start_with?('acct:') ? key_id.split('@').last : key_id
+
+  # 域名限制检查
+  if domain_not_allowed?(domain)
+    @signature_verification_failure_code = 403
+    return
+  end
+
+  # ... 继续获取密钥
+end
+```
+
+这意味着：
+1. **受限联邦模式**：只有 `DomainAllow` 列表中的域名可以通过
+2. **正常模式**：`DomainBlock` 列表中的域名会被拒绝
+3. **返回 403 Forbidden**：明确拒绝来自受限域名的请求
+
+#### 3.5 验签失败的响应码
+
+| 失败原因 | HTTP 状态码 | 说明 |
+|---------|-------------|------|
+| 签名缺失 | 401 | 请求未签名 |
+| 签名格式错误 | 400 | Signature 头部格式不正确 |
+| 域名受限 | 403 | 来自被屏蔽或未授权的域名 |
+| 密钥不存在 | 401 | 无法获取公钥 |
+| 密钥已撤销 | 401 | 密钥已被撤销 |
+| 密钥已过期 | 401 | 密钥已过期 |
+| 签名验证失败 | 401 | 签名与内容不匹配 |
+| 网络错误 | 503 | 获取密钥时发生网络错误 |
+| 断路器触发 | 503 | 近期连接失败过多，跳过请求 |
+
+#### 3.6 断路器机制（Stoplight）
+
+为防止频繁请求不可用的远程服务器，系统使用断路器模式：
+
+```ruby
+STOPLIGHT_COOL_OFF_TIME = 5.minutes.seconds  # 冷却时间
+STOPLIGHT_THRESHOLD = 1                        # 失败阈值
+
+def stoplight_wrapper
+  Stoplight(
+    "source:#{request.remote_ip}",
+    cool_off_time: STOPLIGHT_COOL_OFF_TIME,
+    threshold: STOPLIGHT_THRESHOLD,
+    tracked_errors: [HTTP::Error, OpenSSL::SSL::SSLError]
+  )
+end
+```
+
+**断路器状态**：
+1. **关闭（Closed）**：正常状态，请求可以通过
+2. **打开（Open）**：失败次数超过阈值，在冷却时间内拒绝所有请求
+3. **半开（Half-Open）**：冷却时间过后，尝试少量请求
+
+**捕获的错误类型**：
+- `HTTP::Error`：HTTP 协议错误
+- `OpenSSL::SSL::SSLError`：SSL/TLS 错误
+
+### 4. 域名限制处理边界
+
+Mastodon 提供多层域名限制机制，在联邦同步的各个阶段都有应用。
+
+#### 4.1 域名限制类型
+
+**DomainBlock 模型** (`app/models/domain_block.rb`)
+
+```ruby
+enum :severity, { silence: 0, suspend: 1, noop: 2 }, validate: true
+```
+
+| 严重程度 | 说明 | 影响 |
+|---------|------|------|
+| `suspend`（暂停） | 完全阻止该域名 | 无法关注、无法投递、内容不可见 |
+| `silence`（静默） | 限制该域名的可见性 | 内容不出现在公共时间线，未关注的用户看不到 |
+| `noop`（无操作） | 仅记录，不执行限制 | 用于跟踪或准备 future 限制 |
+
+**附加限制**：
+- `reject_media`：拒绝来自该域名的媒体附件
+- `reject_reports`：拒绝来自该域名的举报
+
+#### 4.2 域名控制辅助模块
+
+**DomainControlHelper** (`app/helpers/domain_control_helper.rb`)
+
+```ruby
+def domain_not_allowed?(uri_or_domain)
+  return false if uri_or_domain.blank?
+
+  domain = if uri_or_domain.include?('://')
+             Addressable::URI.parse(uri_or_domain).host
+           else
+             uri_or_domain
+           end
+
+  if limited_federation_mode?
+    !DomainAllow.allowed?(domain)  # 受限模式：只允许白名单
+  else
+    DomainBlock.blocked?(domain)   # 正常模式：拒绝黑名单
+  end
+end
+
+def limited_federation_mode?
+  Rails.configuration.x.mastodon.limited_federation_mode
+end
+```
+
+#### 4.3 两种联邦模式
+
+| 模式 | 配置 | 行为 |
+|------|------|------|
+| **正常模式** | `limited_federation_mode = false` | 允许所有域名，除非在 `DomainBlock` 中 |
+| **受限模式** | `limited_federation_mode = true` | 只允许 `DomainAllow` 中的域名 |
+
+#### 4.4 域名限制的应用阶段
+
+域名限制在联邦同步的多个阶段都有应用：
+
+##### 阶段 1：出站投递前检查
+
+**FollowService** 中的检查：
+
+```ruby
+def following_not_allowed?
+  domain_not_allowed?(@target_account.domain) ||           # 目标域名受限
+    @source_account.domain_blocking?(@target_account.domain) # 源用户屏蔽了目标域名
+end
+```
+
+**用户级域名屏蔽**（`account.domain_blocking?`）：
+- 每个用户可以单独屏蔽特定域名
+- 这会覆盖实例级别的设置
+
+##### 阶段 2：入站验签前检查
+
+**SignatureVerification** 中的检查：
+
+```ruby
+def keypair_from_key_id
+  # ...
+  if domain_not_allowed?(domain)
+    @signature_verification_failure_code = 403
+    return
+  end
+  # ...
+end
+```
+
+这确保：
+- 来自受限域名的所有入站 ActivityPub 请求都被拒绝
+- 即使请求签名有效，也会被拒绝
+
+##### 阶段 3：投递失败后的自动限制
+
+**UnavailableDomain** (`app/models/unavailable_domain.rb`)
+
+当投递失败次数超过阈值时，系统会自动将域名标记为不可用：
+
+```ruby
+class UnavailableDomain < ApplicationRecord
+  include DomainNormalizable
+  validates :domain, presence: true, uniqueness: true
+end
+```
+
+**DeliveryFailureTracker** (`app/lib/delivery_failure_tracker.rb`)
+
+```ruby
+FAILURE_THRESHOLDS = {
+  days: 7,      # 7 天失败标记为不可用
+  minutes: 5,   # 5 分钟失败（用于短期问题）
+}.freeze
+
+def track_failure!
+  redis.sadd(exhausted_deliveries_key, failure_time)
+  UnavailableDomain.create(domain: @host) if reached_failure_threshold?
+end
+
+def track_success!
+  redis.del(exhausted_deliveries_key)
+  UnavailableDomain.find_by(domain: @host)&.destroy
+end
+```
+
+**自动限制机制**：
+
+1. **失败跟踪**：每个投递失败会被记录到 Redis
+2. **阈值检查**：连续 7 天失败后，创建 `UnavailableDomain` 记录
+3. **投递跳过**：`DeliveryWorker` 在投递前检查 `UnavailableDomain`
+4. **自动恢复**：成功投递后删除 `UnavailableDomain` 记录
+
+##### 阶段 4：投递时的可用性检查
+
+**ActivityPub::DeliveryWorker** (`app/workers/activitypub/delivery_worker.rb`)
+
+```ruby
+def perform(json, source_account_id, inbox_url, options = {})
+  @options        = options.with_indifferent_access
+
+  # 检查域名是否可用（除非 bypass_availability）
+  return unless @options[:bypass_availability] || DeliveryFailureTracker.available?(inbox_url)
+
+  # ... 继续投递
+end
+```
+
+**bypass_availability 选项**：
+- 关注请求使用 `{ 'bypass_availability' => true }`
+- 这确保即使目标实例近期不可用，关注请求也会尝试投递
+- 普通投递会尊重 `UnavailableDomain` 标记
+
+#### 4.5 投递失败重试策略
+
+**ActivityPub::DeliveryWorker** 的重试配置：
+
+```ruby
+sidekiq_options queue: 'push', retry: 16, dead: false
+
+# 自定义重试延迟（带抖动）
+sidekiq_retry_in do |count|
+  delay  = (count**4) + 15           # 指数退避：16s, 31s, 96s, 271s...
+  jitter = rand(0.5 * (count**4))    # 随机抖动，避免惊群效应
+  delay + jitter
+end
+```
+
+**重试参数**：
+- 最大重试次数：16 次
+- 重试队列：不进入死信队列（`dead: false`）
+- 延迟策略：指数退避 + 随机抖动
+
+**响应处理**：
+
+```ruby
+def perform_request
+  stoplight_wrapper.run do
+    request_pool.with(@host) do |http_client|
+      build_request(http_client).perform do |response|
+        if response_successful?(response)
+          @performed = true                              # 成功
+        elsif response_error_unsalvageable?(response) || unsalvageable_authorization_failure?(response)
+          @unsalvageable = true                         # 不可恢复错误
+        else
+          raise Mastodon::UnexpectedResponseError, response  # 可恢复错误（触发重试）
+        end
+      end
+    end
+  end
+end
+
+def unsalvageable_authorization_failure?(response)
+  @source_account.permanently_unavailable? && response.code == 401
+end
+```
+
+**响应分类**：
+
+| 响应类型 | HTTP 码 | 处理方式 |
+|---------|---------|----------|
+| **成功** | 2xx | 标记成功，记录成功投递 |
+| **不可恢复错误** | 404, 410, 401（源账户永久不可用） | 标记为 `unsalvageable`，不重试 |
+| **可恢复错误** | 429, 5xx, 其他 | 触发 Sidekiq 重试机制 |
+
+**断路器（Stoplight）**：
+
+```ruby
+STOPLIGHT_COOL_OFF_TIME = 60          # 冷却时间 60 秒
+STOPLIGHT_FAILURE_THRESHOLD = 10       # 失败阈值 10 次
+
+def stoplight_wrapper
+  Stoplight(
+    @inbox_url,
+    cool_off_time: STOPLIGHT_COOL_OFF_TIME,
+    threshold: STOPLIGHT_FAILURE_THRESHOLD
+  )
+end
+```
+
+这为每个 `inbox_url` 维护独立的断路器状态。
+
+#### 4.6 域名限制层级总结
+
+| 层级 | 检查点 | 触发条件 | 影响 |
+|------|--------|----------|------|
+| **用户级屏蔽** | `account.domain_blocking?` | 用户主动屏蔽域名 | 该用户无法与该域名交互 |
+| **实例级暂停** | `DomainBlock.suspend?` | 管理员暂停域名 | 所有用户无法与该域名交互 |
+| **实例级静默** | `DomainBlock.silence?` | 管理员静默域名 | 内容可见性受限 |
+| **受限联邦模式** | `!DomainAllow.allowed?` | 白名单模式 | 只允许白名单域名 |
+| **自动不可用** | `UnavailableDomain` | 连续 7 天投递失败 | 暂停投递，可自动恢复 |
+
+### 5. 入站活动处理边界
+
+当远程实例的 Follow/Block 活动到达本地实例时，系统有严格的处理边界。
+
+#### 5.1 Follow 活动处理
+
+**ActivityPub::Activity::Follow** (`app/lib/activitypub/activity/follow.rb`)
+
+```ruby
+def perform
+  target_account = account_from_uri(object_uri)
+
+  # 边界检查 1：目标必须存在且是本地账户
+  return if target_account.nil? || !target_account.local? || delete_arrived_first?(@json['id'])
+
+  # 边界检查 2：目标是否屏蔽了发起者
+  if target_account.blocking?(@account) || target_account.domain_blocking?(@account.domain) || target_account.moved? || target_account.instance_actor?
+    reject_follow_request!(target_account)  # 自动拒绝
+    return
+  end
+
+  # ... 处理关注请求 ...
+end
+
+def reject_follow_request!(target_account)
+  # 发送 Reject 活动回发起者
+  json = serialize_payload(FollowRequest.new(account: @account, target_account: target_account, uri: @json['id']), ActivityPub::RejectFollowSerializer).to_json
+  ActivityPub::DeliveryWorker.perform_async(json, target_account.id, @account.inbox_url)
+end
+```
+
+**自动拒绝条件**：
+- 目标账户屏蔽了发起者 (`blocking?`)
+- 目标实例屏蔽了发起者的域名 (`domain_blocking?`)
+- 目标账户已迁移 (`moved?`)
+- 目标是实例演员（`instance_actor?`）
+
+#### 5.2 Block 活动处理
+
+**ActivityPub::Activity::Block** (`app/lib/activitypub/activity/block.rb`)
+
+```ruby
+def perform
+  target_account = account_from_uri(object_uri)
+
+  # 边界检查：目标必须是本地账户
+  return if target_account.nil? || !target_account.local?
+
+  # 处理已有的关注关系
+  unless @account.blocking?(target_account)
+    UnfollowService.new.call(@account, target_account) if @account.following?(target_account)
+    UnfollowService.new.call(target_account, @account) if target_account.following?(@account)
+    RejectFollowService.new.call(target_account, @account) if target_account.requested?(@account)
+
+    # 执行屏蔽
+    unless delete_arrived_first?(@json['id'])
+      BlockWorker.perform_async(@account.id, target_account.id)
+      @account.block!(target_account, uri: @json['id'])
+    end
+  end
+end
+```
+
+**关键行为**：
+- 当远程账户屏蔽本地账户时，自动解除双方的关注关系
+- 这确保屏蔽操作的效果在双方都生效
+- 屏蔽关系使用 `uri` 字段记录，便于后续的 Undo 处理
+
+### 6. 同步链路总结
+
+#### 关注操作的完整同步链路
+
+```
+用户导入/点击关注
+    ↓
+FollowService.call()
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 前置检查                                                      │
+│ 1. target_account.unavailable?     → 目标账户不可用          │
+│ 2. domain_not_allowed?(domain)      → 域名受限               │
+│ 3. target_account.blocking?(source) → 目标屏蔽了源           │
+│ 4. source_account.blocking?(target) → 源屏蔽了目标           │
+│ 5. source_account.domain_blocking?  → 源用户屏蔽了目标域名    │
+└─────────────────────────────────────────────────────────────┘
+    ↓ 检查通过
+┌─────────────────────────────────────────────────────────────┐
+│ 目标账户类型判断                                              │
+│                                                              │
+│ 本地账户                     远程 ActivityPub 账户           │
+│     ↓                              ↓                         │
+│ direct_follow!()           request_follow!()                │
+│     ↓                              ↓                         │
+│ LocalNotificationWorker    ActivityPub::DeliveryWorker     │
+│     ↓                              ↓                         │
+│ 本地处理                    POST target_account.inbox_url    │
+│                              携带 HTTP Signature             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 屏蔽操作的完整同步链路
+
+```
+用户导入/点击屏蔽
+    ↓
+BlockService.call()
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 前置处理                                                      │
+│ 1. UnfollowService：解除双方关注关系                          │
+│ 2. RejectFollowService：拒绝待处理的关注请求                  │
+│ 3. 删除通知权限设置                                            │
+└─────────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 创建屏蔽关系                                                   │
+│ account.block!(target_account)                               │
+│     ↓                                                         │
+│ BlockWorker.perform_async()  → 异步清理时间线等              │
+│     ↓                                                         │
+└─────────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 远程账户投递                                                   │
+│ if !target_account.local? && target_account.activitypub?    │
+│     ↓                                                         │
+│ ActivityPub::DeliveryWorker.perform_async(                   │
+│   build_json(block),      → ActivityPub::BlockSerializer    │
+│   block.account_id,                                            │
+│   block.target_account.inbox_url                              │
+│ )                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 入站活动处理链路
+
+```
+远程实例 POST /inbox
+    ↓
+ActivityPub::InboxesController.create()
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 前置过滤器                                                    │
+│ 1. skip_large_payload        → 超过 MAX_JSON_SIZE 返回 413  │
+│ 2. require_actor_signature!  → 验证 HTTP Signature           │
+│    └─ SignatureVerification 模块                              │
+│       ├─ 检查域名是否受限                                      │
+│       ├─ 获取并验证公钥                                        │
+│       ├─ 验证签名                                              │
+│       └─ 失败返回 401/403/503                                │
+└─────────────────────────────────────────────────────────────┘
+    ↓ 验证通过
+┌─────────────────────────────────────────────────────────────┐
+│ 异步处理                                                      │
+│ ActivityPub::ProcessingWorker.perform_async(                 │
+│   signed_request_actor.id,                                     │
+│   body,                                                        │
+│   delivered_to_account_id,                                     │
+│   actor_type                                                   │
+│ )                                                              │
+│     ↓                                                          │
+│ ActivityPub::ProcessCollectionService                         │
+│     ↓                                                          │
+│ 根据 type 字段分派到具体处理器：                               │
+│ - Follow → ActivityPub::Activity::Follow                      │
+│ - Block  → ActivityPub::Activity::Block                       │
+│ - Accept/Reject/Undo 等                                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## 参考代码位置
 
 | 功能 | 文件路径 |
@@ -709,3 +1472,17 @@ end
 | 导入数据清理 | `app/lib/vacuum/imports_vacuum.rb` |
 | Actor 序列化器 | `app/serializers/activitypub/actor_serializer.rb` |
 | Note 序列化器 | `app/serializers/activitypub/note_serializer.rb` |
+| Follow 序列化器 | `app/serializers/activitypub/follow_serializer.rb` |
+| Block 序列化器 | `app/serializers/activitypub/block_serializer.rb` |
+| 关注服务 | `app/services/follow_service.rb` |
+| 屏蔽服务 | `app/services/block_service.rb` |
+| 投递 Worker | `app/workers/activitypub/delivery_worker.rb` |
+| 签名验证 | `app/controllers/concerns/signature_verification.rb` |
+| HTTP 签名 | `app/lib/http_signature_draft.rb` |
+| 域名控制 | `app/helpers/domain_control_helper.rb` |
+| 域名屏蔽 | `app/models/domain_block.rb` |
+| 不可用域名 | `app/models/unavailable_domain.rb` |
+| 投递失败跟踪 | `app/lib/delivery_failure_tracker.rb` |
+| 入箱控制器 | `app/controllers/activitypub/inboxes_controller.rb` |
+| Follow 活动处理 | `app/lib/activitypub/activity/follow.rb` |
+| Block 活动处理 | `app/lib/activitypub/activity/block.rb` |
