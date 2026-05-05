@@ -444,26 +444,62 @@ end
 
 **说明**: 当 `CustomFilterKeyword` 或 `CustomFilterStatus` 变更时，会自动触发所属 `CustomFilter` 的缓存失效。
 
-### 4.4 Streaming 服务事件处理
+### 4.4 三通道架构详解
 
-**文件**: `streaming/index.js:499-517`
+Mastodon 使用三个独立的 Redis Pub/Sub 通道来处理过滤器变更事件，每个通道有不同的发布者、订阅者和用途。
+
+#### 4.4.1 通道概览
+
+| 通道名称 | 格式 | 发布者 | 订阅时机 | 主要事件 |
+|----------|------|--------|----------|----------|
+| **账户级通道** | `timeline:{accountId}` | Rails | 订阅 `user` 流时 | `filters_changed`, `update`, `delete`, `notification` |
+| **系统级通道** | `timeline:system:{accountId}` | Rails | 连接建立时自动订阅 | `filters_changed`, `kill` |
+| **令牌级通道** | `timeline:access_token:{tokenId}` | `AccessTokenExtension` | 连接建立时自动订阅 | **仅 `kill` 事件** |
+
+#### 4.4.2 各通道详细分析
+
+**1. 账户级通道 `timeline:{accountId}`**
+
+**发布来源**: `app/models/custom_filter.rb:116-117`
+
+```ruby
+redis.publish("timeline:#{account_id}", { event: :filters_changed }.to_json)
+```
+
+**订阅时机**: 当客户端订阅 `user` 流时 (`streaming/index.js:1057-1065`)
 
 ```javascript
-// 系统消息监听器
-const createSystemMessageListener = (req, eventHandlers) => {
-  return message => {
-    const { event } = message;
-    
-    if (event === 'filters_changed') {
-      req.log.debug(`Invalidating filters cache for ${req.accountId}`);
-      // 清空 Streaming 服务本地的过滤器缓存
-      req.cachedFilters = null;
-    }
-  };
+const channelsForUserStream = req => {
+  const arr = [`timeline:${req.accountId}`];
+  
+  if (isInScope(req, ['read', 'read:notifications'])) {
+    arr.push(`timeline:${req.accountId}:notifications`);
+  }
+  
+  return arr;
 };
 ```
 
-**订阅系统频道** (`streaming/index.js:1281-1308`):
+**消费路径**:
+- 客户端调用 `connectUserStream()` (`app/javascript/mastodon/actions/streaming.js:164-169`)
+- Streaming 服务通过 `streamFrom` 函数处理事件
+- 事件会通过 `transmit()` 转发给客户端
+
+**关键点**: 只有订阅了 `user` 流的客户端才会收到这个通道的事件。
+
+---
+
+**2. 系统级通道 `timeline:system:{accountId}`**
+
+**发布来源**: `app/models/custom_filter.rb:118`
+
+```ruby
+redis.publish("timeline:system:#{account_id}", { event: :filters_changed }.to_json)
+```
+
+**订阅时机**: 每个 WebSocket/EventSource 连接建立时自动订阅
+
+**WebSocket 订阅** (`streaming/index.js:1281-1308`):
 
 ```javascript
 const subscribeWebsocketToSystemChannel = ({ websocket, request, subscriptions }) => {
@@ -476,13 +512,402 @@ const subscribeWebsocketToSystemChannel = ({ websocket, request, subscriptions }
     },
   });
 
-  // 监听两个频道的 filters_changed 事件
   subscribe(accessTokenChannelId, listener);
   subscribe(systemChannelId, listener);
 };
 ```
 
-### 4.5 Web 前端事件监听
+**事件处理** (`streaming/index.js:499-517`):
+
+```javascript
+const createSystemMessageListener = (req, eventHandlers) => {
+  return message => {
+    const { event } = message;
+    
+    if (event === 'kill') {
+      eventHandlers.onKill();  // 关闭连接
+    } else if (event === 'filters_changed') {
+      req.log.debug(`Invalidating filters cache for ${req.accountId}`);
+      // 关键：只清空本地缓存，不转发给客户端！
+      req.cachedFilters = null;
+    }
+  };
+};
+```
+
+**关键点**: 
+- 所有已认证的连接都会自动订阅这个通道
+- `filters_changed` 事件**不会转发给客户端**，只用于清空 Streaming 服务的本地缓存
+- 这确保了每个连接的缓存都能及时失效
+
+---
+
+**3. 令牌级通道 `timeline:access_token:{tokenId}`**
+
+**发布来源**: `app/lib/access_token_extension.rb:27`
+
+```ruby
+# 只在 token 被撤销或销毁时发布
+redis.publish("timeline:access_token:#{id}", { event: :kill }.to_json) if revoked? || destroyed?
+```
+
+**订阅时机**: 与系统级通道同时订阅（见上方 `subscribeWebsocketToSystemChannel`）
+
+**关键点**:
+- 这个通道**从不发布 `filters_changed` 事件**
+- 只用于 `kill` 事件：当某个 access token 被撤销时，强制断开使用该 token 的所有连接
+- 不同的客户端可能使用不同的 token，这样可以单独断开某个 token 的连接而不影响其他设备
+
+#### 4.4.3 客户端消费路径
+
+| 客户端场景 | 订阅的通道 | 能否收到 `filters_changed` |
+|------------|-----------|---------------------------|
+| 订阅 `user` 流 (主页时间线) | `timeline:{accountId}`, `timeline:system:{accountId}`, `timeline:access_token:{tokenId}` | ✅ 能收到 (通过 `timeline:{accountId}`) |
+| 只订阅 `public` 流 | `timeline:public`, `timeline:system:{accountId}`, `timeline:access_token:{tokenId}` | ❌ 收不到 (没有订阅 `timeline:{accountId}`) |
+| 只订阅 `hashtag` 流 | `timeline:hashtag`, `timeline:system:{accountId}`, `timeline:access_token:{tokenId}` | ❌ 收不到 |
+| 只订阅 `list` 流 | `timeline:list:{listId}`, `timeline:system:{accountId}`, `timeline:access_token:{tokenId}` | ❌ 收不到 |
+
+**重要发现**: 只有订阅了 `user` 流的客户端才能收到 `filters_changed` 事件通知。
+
+---
+
+### 4.5 双通道发布的原因
+
+从 `app/models/custom_filter.rb:116-118` 可以看到，Rails 同时向两个通道发布 `filters_changed` 事件：
+
+```ruby
+redis.publish("timeline:#{account_id}", { event: :filters_changed }.to_json)
+redis.publish("timeline:system:#{account_id}", { event: :filters_changed }.to_json)
+```
+
+#### 4.5.1 双通道的分工
+
+| 通道 | 用途 | 处理方式 |
+|------|------|----------|
+| `timeline:system:{accountId}` | **Streaming 服务内部缓存失效** | 清空 `req.cachedFilters`，**不转发**给客户端 |
+| `timeline:{accountId}` | **通知客户端** | 事件会**转发**给订阅了 `user` 流的客户端 |
+
+#### 4.5.2 为什么需要两个通道？
+
+**原因一：分离关注点**
+
+- **系统级通道** (`timeline:system:{accountId}`)：
+  - 所有已认证连接自动订阅
+  - 确保每个 Streaming 连接的本地缓存都能及时失效
+  - 不涉及客户端，只处理服务端内部状态
+
+- **账户级通道** (`timeline:{accountId}`)：
+  - 只有订阅 `user` 流的客户端才会收到
+  - 用于通知客户端过滤器已变更
+  - 客户端可以选择何时重新拉取过滤器
+
+**原因二：覆盖范围不同**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Rails 服务                                   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  发布 filters_changed 到两个通道                          │    │
+│  │  - timeline:{accountId}                                  │    │
+│  │  - timeline:system:{accountId}                           │    │
+│  └──────────────────────┬──────────────────────────────────┘    │
+└─────────────────────────┼─────────────────────────────────────────┘
+                          │
+          ┌───────────────┴───────────────┐
+          │                                 │
+          ▼                                 ▼
+┌─────────────────────┐         ┌─────────────────────────────────┐
+│  timeline:system    │         │      timeline:{accountId}        │
+│  :{accountId}       │         │                                 │
+├─────────────────────┤         ├─────────────────────────────────┤
+│ 订阅者:              │         │ 订阅者:                         │
+│ - 所有已认证连接      │         │ - 仅订阅 user 流的客户端        │
+│                     │         │                                 │
+│ 处理:                │         │ 处理:                           │
+│ - 清空 req.cachedFilters      │ - 转发给客户端                   │
+│ - 不转发给客户端      │         │ - 客户端可重新拉取过滤器         │
+└─────────────────────┘         └─────────────────────────────────┘
+```
+
+**原因三：令牌级通道的独立性**
+
+`timeline:access_token:{tokenId}` 通道有完全不同的用途：
+
+- 只发布 `kill` 事件（token 撤销时）
+- 每个连接有不同的 token，所以每个连接订阅不同的通道
+- 不参与过滤器变更事件的分发
+
+---
+
+### 4.6 不一致窗口分析
+
+#### 4.6.1 事件时间线
+
+```
+T0: 用户在设备 A 修改过滤器
+    │
+    ├── Rails 更新数据库 (after_commit 触发)
+    │
+    ├── Rails.cache.delete("filters:v3:#{account_id}")
+    │
+    └── Redis.publish 到两个通道
+        │
+        ├── timeline:system:{accountId} ──┐
+        │                                   ├── 两个通道同时发布
+        └── timeline:{accountId} ──────────┘
+    │
+    ▼
+T1: Streaming 服务收到 timeline:system:{accountId} 的事件
+    │
+    └── createSystemMessageListener 处理
+        │
+        └── req.cachedFilters = null (清空本地缓存)
+    │
+    ▼
+T2: 新状态到达 Streaming 服务
+    │
+    ├── 检查 !payload.filtered && !req.cachedFilters
+    │
+    ├── 重新从数据库查询过滤器
+    │
+    ├── 构建新的 req.cachedFilters (包含预编译正则)
+    │
+    └── 对新状态应用过滤
+    │
+    ▼
+T3: 客户端 (如果订阅了 user 流) 收到 filters_changed 事件
+    │
+    └── 前端收到事件... 但什么都不做！
+```
+
+#### 4.6.2 服务端不一致窗口
+
+**窗口 1: T0 ~ T1 (毫秒级)**
+
+- 从 Rails 发布事件到 Streaming 服务收到并处理
+- 在此期间，Streaming 服务可能还在使用旧的 `req.cachedFilters`
+- 新到达的状态会用旧过滤器过滤
+
+**窗口 2: T1 ~ T2 (取决于消息到达时间)**
+
+- 从缓存清空到下一条消息到达
+- `req.cachedFilters = null`，但还没有重新构建
+- 如果没有新消息，缓存会保持 null 状态
+
+**窗口 3: 数据库查询期间**
+
+- 当新消息到达时，Streaming 服务需要重新查询数据库
+- `streaming/index.js:768-770`:
+
+```javascript
+if (!payload.filtered && !req.cachedFilters) {
+  queries.push(client.query('SELECT filter.id AS id, ... FROM custom_filter_keywords ...', [req.accountId]));
+}
+```
+
+- 这是一个数据库查询，有一定的延迟
+- 在此期间，其他连接可能也在执行相同的查询
+
+**服务端缓存重建设计**
+
+`streaming/index.js:794-843` 展示了缓存重建的完整逻辑：
+
+```javascript
+if (!req.cachedFilters) {
+  // 从数据库查询
+  const filterRows = values[accountDomain ? 2 : 1].rows;
+  
+  // 构建缓存结构
+  req.cachedFilters = filterRows.reduce((cache, filter) => {
+    if (cache[filter.id]) {
+      cache[filter.id].keywords.push([filter.keyword, filter.whole_word]);
+    } else {
+      cache[filter.id] = {
+        keywords: [[filter.keyword, filter.whole_word]],
+        expires_at: filter.expires_at,
+        filter: {
+          id: filter.id,
+          title: filter.title,
+          context: filter.context,
+          expires_at: filter.expires_at,
+          filter_action: filter.filter_action
+        }
+      };
+    }
+    return cache;
+  }, {});
+  
+  // 预编译正则表达式 (关键优化)
+  Object.keys(req.cachedFilters).forEach((key) => {
+    req.cachedFilters[key].regexp = new RegExp(req.cachedFilters[key].keywords.map(([keyword, whole_word]) => {
+      // ... 正则构建逻辑
+    }).join('|'), 'i');
+  });
+}
+```
+
+**关键点**：
+- 缓存重建包括数据库查询和正则预编译
+- 正则预编译是昂贵的操作，但只需执行一次
+- 重建后，`req.cachedFilters` 会被复用直到下次 `filters_changed`
+
+#### 4.6.3 客户端不一致窗口（关键发现）
+
+**前端代码现状分析**
+
+从 `app/javascript/mastodon/actions/streaming.js:99-140`：
+
+```javascript
+onReceive(data) {
+  switch (data.event) {
+  case 'update':
+    dispatch(updateTimeline(timelineId, JSON.parse(data.payload), ...));
+    break;
+  case 'status.update':
+    dispatch(updateStatus(JSON.parse(data.payload), ...));
+    break;
+  case 'delete':
+    dispatch(deleteFromTimelines(data.payload));
+    break;
+  case 'notification':
+    dispatch(updateNotifications(notificationJSON, messages, locale));
+    break;
+  case 'notifications_merged':
+    dispatch(refreshStaleNotificationGroups());
+    break;
+  case 'conversation':
+    dispatch(updateConversations(JSON.parse(data.payload)));
+    break;
+  case 'announcement':
+    dispatch(updateAnnouncements(JSON.parse(data.payload)));
+    break;
+  case 'announcement.reaction':
+    dispatch(updateAnnouncementsReaction(JSON.parse(data.payload)));
+    break;
+  case 'announcement.delete':
+    dispatch(deleteAnnouncement(data.payload));
+    break;
+  // ⚠️ 没有 case 'filters_changed' 的处理！
+  }
+}
+```
+
+**重要发现**：前端 `onReceive` 函数**没有处理 `filters_changed` 事件**！
+
+虽然 `app/javascript/mastodon/stream.js:216` 在 `KNOWN_EVENT_TYPES` 中包含了 `filters_changed`：
+
+```javascript
+const KNOWN_EVENT_TYPES = [
+  'update',
+  'delete',
+  'notification',
+  'conversation',
+  'filters_changed',  // 只是声明，但没有处理逻辑
+  'announcement',
+  'announcement.delete',
+  'announcement.reaction',
+];
+```
+
+但实际上没有对应的 action 处理。
+
+**客户端不一致窗口的实际情况**
+
+| 场景 | 客户端行为 | 不一致窗口 |
+|------|-----------|-----------|
+| 订阅 `user` 流，收到 `filters_changed` | ❌ 什么都不做 | 直到手动刷新或重新加载 |
+| 未订阅 `user` 流 | ❌ 收不到事件 | 永远不一致直到刷新 |
+| 新创建过滤器 | ✅ 创建后立即更新本地 Redux | 无窗口（乐观更新） |
+| 其他设备修改过滤器 | ❌ 本设备不知道 | 直到刷新 |
+
+**前端何时会拉取新过滤器？**
+
+从 `app/javascript/mastodon/actions/filters.js:26-44`：
+
+```javascript
+export const fetchFilters = () => (dispatch) => {
+  dispatch({ type: FILTERS_FETCH_REQUEST });
+
+  api()
+    .get('/api/v2/filters')
+    .then(({ data }) => dispatch({
+      type: FILTERS_FETCH_SUCCESS,
+      filters: data,
+      skipLoading: true,
+    }))
+    .catch(err => dispatch({
+      type: FILTERS_FETCH_FAIL,
+      err,
+      skipLoading: true,
+      skipAlert: true,
+    }));
+};
+```
+
+`fetchFilters` 只在以下情况被调用：
+- `filter_modal.jsx:80` - 打开过滤器模态框时
+- 页面重新加载时（通过 initial_state）
+
+**结论**：当前实现中，客户端不会自动响应 `filters_changed` 事件。
+
+#### 4.6.4 不一致窗口总结
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           完整时间线                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  T0 ──────────────────────────────────────────────────────────────────────►│
+│  │                                                                           │
+│  ├── Rails 更新数据库                                                        │
+│  ├── Rails.cache 失效                                                        │
+│  └── Redis.publish (两个通道)                                                │
+│  │                                                                           │
+│  │   服务端不一致窗口 1 (毫秒级)                                              │
+│  │◄─────────────────────────────────►│                                       │
+│  │                                     │                                       │
+│  T1 ──────────────────────────────────────────────────────────────────────►│
+│  │                                     │                                       │
+│  └── Streaming 服务清空 req.cachedFilters                                   │
+│  │                                     │                                       │
+│  │   服务端不一致窗口 2 (取决于消息到达)                                      │
+│  │                                     │◄──────────────────────────────────► │
+│  │                                     │                                       │
+│  T2 ──────────────────────────────────────────────────────────────────────►│
+│  │                                     │                                       │
+│  ├── 新状态到达                                                               │
+│  ├── 重新从数据库查询过滤器                                                    │
+│  └── 重建 req.cachedFilters (含预编译正则)                                    │
+│  │                                                                           │
+│  │   服务端已同步                                                             │
+│  │◄───────────────────────────────────────────────────────────────────────► │
+│  │                                                                           │
+│  │   客户端不一致窗口 (直到手动刷新)                                           │
+│  │                                                                           │
+│  T3 ──────────────────────────────────────────────────────────────────────►│
+│  │                                                                           │
+│  ├── 客户端收到 filters_changed (如果订阅了 user 流)                          │
+│  └── 但前端不处理！继续使用旧的 Redux 缓存                                    │
+│  │                                                                           │
+│  │   客户端不一致窗口将持续到：                                                │
+│  │   - 用户刷新页面                                                           │
+│  │   - 用户打开过滤器模态框                                                     │
+│  │   - 或者永远不会...                                                        │
+│  │                                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键洞察**：
+
+1. **服务端**：通过双通道发布和缓存重建机制，不一致窗口很小（毫秒级到秒级）
+
+2. **客户端**：由于前端没有处理 `filters_changed` 事件，不一致窗口可能**无限期持续**，直到用户手动刷新
+
+3. **这是当前实现的一个限制**：服务端的实时同步机制已经完善，但客户端的响应逻辑尚未完成
+
+---
+
+### 4.7 Web 前端事件监听（现状分析）
 
 **文件**: `app/javascript/mastodon/stream.js:211-220`
 
@@ -493,12 +918,14 @@ const KNOWN_EVENT_TYPES = [
   'delete',
   'notification',
   'conversation',
-  'filters_changed',  // 过滤器变更事件
+  'filters_changed',  // 过滤器变更事件 (已声明)
   'announcement',
   'announcement.delete',
   'announcement.reaction',
 ];
 ```
+
+**注意**：虽然 `filters_changed` 在 `KNOWN_EVENT_TYPES` 中声明，但 `actions/streaming.js` 的 `onReceive` 函数**没有对应的处理逻辑**。这是当前实现的一个待完善点。
 
 ---
 
@@ -1981,4 +2408,37 @@ function createFilterAPI(version: 'v1' | 'v2'): FilterAPI {
 **V2 关键词管理**:
 - `POST /api/v2/filters/:filter_id/keywords` - 添加关键词
 - `PUT /api/v2/filters/:filter_id/keywords/:id` - 更新关键词
-- `DELETE /api/v2/filters/:filter
+- `DELETE /api/v2/filters/:filter_id/keywords/:id` - 删除关键词
+
+**V2 状态过滤管理**:
+- `POST /api/v2/filters/:filter_id/statuses` - 添加状态过滤
+- `DELETE /api/v2/filters/:filter_id/statuses/:id` - 移除状态过滤
+
+**V1 (已废弃)**:
+- `GET /api/v1/filters`
+- `GET /api/v1/filters/:id`
+- `POST /api/v1/filters`
+- `PUT /api/v1/filters/:id`
+- `DELETE /api/v1/filters/:id`
+
+### C. 客户端/服务端边界总结
+
+| 功能 | 服务端 | 客户端 |
+|------|--------|--------|
+| 过滤规则匹配 | ✅ 计算 `status.filtered` | ❌ 不计算 |
+| 过滤结果传递 | ✅ 附加到响应 | ✅ 使用 `filtered` 数组 |
+| `filter_action` 语义 | ✅ 定义 | ✅ 遵循 |
+| UI 表现 | ❌ 不参与 | ✅ 根据 `filter_action` 决定 |
+| 缓存维护 | ✅ Rails.cache + Redis | ✅ 本地持久化 |
+| 变更推送 | ✅ `filters_changed` 事件 | ✅ 监听并刷新 |
+
+---
+
+**文档版本**: 2.0  
+**基于代码版本**: Mastodon 主仓库 (2026-05-05)  
+**更新内容**: 
+- 明确区分现有实现分析与第三方开发指南
+- 补充 PWA 实现细节
+- 扩展移动端特定考虑
+
+> **说明**: 本仓库不包含原生 iOS/Android 应用代码。第二部分"第三方客户端开发指南"为建议性质，供原生应用开发者参考。
