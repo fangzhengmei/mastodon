@@ -1,59 +1,82 @@
 # Mastodon 列表与远端账号同步机制
 
-## 1. 数据模型与关系
+## 1. 核心数据模型与关系
 
-### 1.1 List 模型
+### 1.1 数据库外键约束（关键设计）
 
-列表是用户创建的用于组织关注账号的分组。
+ListAccount 表有两个关键的外键约束，这是理解列表成员生命周期的核心：
 
-**核心属性**：
-- `title`：列表名称
-- `replies_policy`：回复显示策略（`list`/`followed`/`none`）
-- `exclusive`：是否为排他列表（在 exclusive 列表中的账号不会出现在主时间线）
-- `account_id`：列表创建者的账号 ID
-
-**关键关联**：
 ```ruby
-# app/models/list.rb
-belongs_to :account
-has_many :list_accounts, inverse_of: :list, dependent: :destroy
-has_many :accounts, through: :list_accounts
-has_many :active_accounts, -> { merge(ListAccount.active) }, through: :list_accounts, source: :account
+# db/schema.rb
+add_foreign_key "list_accounts", "follows", on_delete: :cascade
+add_foreign_key "list_accounts", "follow_requests", on_delete: :cascade
 ```
+
+**这意味着**：
+- 当 `Follow` 被删除时，引用它的 `ListAccount` 会被**级联删除**
+- 当 `FollowRequest` 被删除时，引用它的 `ListAccount` 会被**级联删除**
+
+这是数据库级别的约束，不是应用层逻辑。
 
 ### 1.2 ListAccount 模型
 
-ListAccount 是列表与账号之间的关联表，管理列表中的成员关系。
+ListAccount 是列表与账号之间的关联表，其生命周期与关注关系**完全绑定**。
 
-**核心属性**：
-- `list_id`：列表 ID
-- `account_id`：账号 ID
-- `follow_id`：关注关系 ID（可为空）
-- `follow_request_id`：关注请求 ID（可为空）
-
-**关键逻辑**：
 ```ruby
 # app/models/list_account.rb
-scope :active, -> { where.not(follow_id: nil) }
+class ListAccount < ApplicationRecord
+  belongs_to :list
+  belongs_to :account
+  belongs_to :follow, optional: true
+  belongs_to :follow_request, optional: true
 
-before_validation :set_follow, unless: :list_owner_account_is_account?
+  validates :account_id, uniqueness: { scope: :list_id }
+  validate :validate_relationship
 
-def set_follow
-  self.follow = Follow.find_by(account_id: list.account_id, target_account_id: account.id)
-  self.follow_request = FollowRequest.find_by(account_id: list.account_id, target_account_id: account.id) if follow.nil?
+  scope :active, -> { where.not(follow_id: nil) }
+
+  before_validation :set_follow, unless: :list_owner_account_is_account?
 end
 ```
 
-**重要特性**：
-1. **必须有关注关系**：除了列表所有者自己，其他账号必须已被关注或有未决的关注请求才能被添加到列表
-2. **active 状态**：只有 `follow_id` 不为空的 ListAccount 才被视为活跃，其状态会参与时间线 fan-out
-3. **自动关联**：添加账号到列表时，自动查找并关联对应的 Follow 或 FollowRequest
+**关键字段**：
+| 字段 | 说明 | 对列表的影响 |
+|------|------|-------------|
+| `list_id` | 列表 ID | 必填 |
+| `account_id` | 成员账号 ID | 必填 |
+| `follow_id` | 关注关系 ID | **关键**：有值 = 活跃成员，参与 fan-out |
+| `follow_request_id` | 关注请求 ID | 有值 = 待审核成员，不参与 fan-out |
 
-### 1.3 Account 模型
+**验证逻辑**：
+```ruby
+def validate_relationship
+  return if list_owner_account_is_account?  # 列表所有者自己不需要关注关系
 
-账号是 Mastodon 的核心实体，通过 `domain` 字段区分本地和远端账号。
+  errors.add(:account_id, :must_be_following) if follow_id.nil? && follow_request_id.nil?
+end
+```
 
-**区分方式**：
+**关键结论**：除了列表所有者自己，其他账号必须有 `follow_id` 或 `follow_request_id` 才能被添加到列表。
+
+### 1.3 List 模型
+
+列表通过 `list_accounts` 关联表管理成员。
+
+```ruby
+# app/models/list.rb
+has_many :list_accounts, inverse_of: :list, dependent: :destroy
+has_many :accounts, through: :list_accounts
+has_many :active_accounts, -> { merge(ListAccount.active) }, through: :list_accounts, source: :account
+
+scope :with_list_account, ->(account) { joins(:list_accounts).where(list_accounts: { account: }) }
+```
+
+**关键**：`has_many :list_accounts, dependent: :destroy` 意味着列表被删除时，所有 ListAccount 也会被删除。
+
+### 1.4 Account 模型
+
+通过 `domain` 字段区分本地和远端账号：
+
 ```ruby
 # app/models/account.rb
 def local?
@@ -65,24 +88,317 @@ def remote?
 end
 ```
 
-**远端账号特征**：
-- `domain` 存储远端实例域名（如 `mastodon.social`）
-- 有 `inbox_url`、`outbox_url`、`shared_inbox_url`、`uri` 等 ActivityPub 相关字段
-- `protocol` 为 `activitypub`（或已废弃的 `ostatus`）
+## 2. 列表成员的完整生命周期
 
-## 2. 列表时间线 Fan-out 机制
+### 2.1 生命周期状态图
 
-### 2.1 触发点：FanOutOnWriteService
+```
+                    ┌─────────────────────────────────────────────────────────┐
+                    │                    列表成员生命周期                         │
+                    └─────────────────────────────────────────────────────────┘
 
-当新状态发布或更新时，`FanOutOnWriteService` 负责将状态分发给相关时间线。
+  ┌──────────────────┐                    ┌──────────────────┐
+  │   待审核状态      │                    │    活跃状态        │
+  │                  │                    │                  │
+  │ follow_request_id│    关注请求被接受   │   follow_id      │
+  │ follow_id: nil   │ ─────────────────► │  有有效值         │
+  │                  │                    │                  │
+  │ 不参与 fan-out   │                    │  参与 fan-out     │
+  │ 历史状态不合并    │                    │  历史状态被合并    │
+  └──────────────────┘                    └──────────────────┘
+           │                                       │
+           │ 关注请求被拒绝/取消                    │
+           │ FollowRequest 被删除                  │ 取消关注
+           │ 触发 ON DELETE CASCADE                │ Follow 被删除
+           │                                       │ 触发 ON DELETE CASCADE
+           ▼                                       ▼
+    ┌──────────────────┐                    ┌──────────────────┐
+    │    被移除         │◄───────────────────│    被移除         │
+    │                  │   显式从列表移除     │                  │
+    │ ListAccount 被   │   ListAccount 被    │ ListAccount 被   │
+    │ 级联删除         │   直接删除          │ 级联删除         │
+    │                  │                    │                  │
+    │ 不再出现在列表    │                    │ 不再出现在列表    │
+    │ 时间线状态被清理  │                    │ 时间线状态被清理  │
+    └──────────────────┘                    └──────────────────┘
+```
 
-**核心流程**：
+### 2.2 状态一：待审核（只有 follow_request_id）
+
+**触发条件**：
+1. 用户 A 发送关注请求给用户 B（B 的账号是 locked）
+2. 用户 A 同时把用户 B 添加到列表
+
+**内部流程**：
+```ruby
+# app/models/list_account.rb
+before_validation :set_follow, unless: :list_owner_account_is_account?
+
+def set_follow
+  self.follow = Follow.find_by(account_id: list.account_id, target_account_id: account.id)
+  self.follow_request = FollowRequest.find_by(account_id: list.account_id, target_account_id: account.id) if follow.nil?
+end
+```
+
+**结果**：
+- ListAccount 的 `follow_request_id` 指向 FollowRequest
+- ListAccount 的 `follow_id` 为 nil
+- `ListAccount.active` scope 不会包含这个记录
+
+**对列表时间线的影响**：
+- `lists_for_local_distribution` 不会包含这个列表
+```ruby
+def lists_for_local_distribution
+  scope.where.not(list_accounts: { follow_id: nil }).or(scope.where(account_id: id))
+  #                                          ^^^^^^^^^^^^^^^^^^^^^
+  #                                    follow_id 为 nil 时不满足这个条件
+end
+```
+- 用户 B 的新状态不会分发到这个列表时间线
+- 历史状态不会被合并
+
+### 2.3 状态二：活跃（有 follow_id）
+
+**触发条件 A：关注请求被接受**
+
+```ruby
+# app/models/follow_request.rb:38
+def authorize!
+  follow = account.follow!(target_account, ...)
+
+  if account.local?
+    # 关键：先显式更新 ListAccount，避免被级联删除
+    ListAccount.where(follow_request: self).update_all(follow_request_id: nil, follow_id: follow.id)
+    
+    MergeWorker.perform_async(target_account.id, account.id, 'home')
+    MergeWorker.push_bulk(account.owned_lists.with_list_account(target_account).pluck(:id)) do |list_id|
+      [target_account.id, list_id, 'list']
+    end
+  end
+
+  destroy!  # 现在删除 FollowRequest 不会级联删除 ListAccount 了
+end
+```
+
+**关键逻辑解释**：
+1. 先创建新的 `Follow` 记录
+2. **显式更新** ListAccount：`follow_request_id: nil, follow_id: follow.id`
+3. 然后才 `destroy!` FollowRequest
+4. 如果不先更新，FollowRequest 的 `destroy!` 会触发 `ON DELETE CASCADE` 删除 ListAccount
+
+**触发条件 B：直接关注（不需要审核）**
+
+```ruby
+# app/services/follow_service.rb:80
+def direct_follow!
+  follow = @source_account.follow!(@target_account, ...)
+
+  MergeWorker.perform_async(@target_account.id, @source_account.id, 'home')
+  MergeWorker.push_bulk(@source_account.owned_lists.with_list_account(@target_account).pluck(:id)) do |list_id|
+    [@target_account.id, list_id, 'list']
+  end
+
+  follow
+end
+```
+
+**后续流程：添加账号到列表时**
+
+```ruby
+# app/services/add_accounts_to_list_service.rb:50
+def merge_account_ids
+  ListAccount.where(list: @list, account: @accounts).where.not(follow_id: nil).pluck(:account_id)
+  #                                                         ^^^^^^^^^^^^^^^^^^^^
+  #                                                  只选择有活跃关注关系的账号
+end
+
+def merge_into_list!
+  MergeWorker.push_bulk(merge_account_ids) do |account_id|
+    [account_id, @list.id, 'list']
+  end
+end
+```
+
+**活跃状态的特征**：
+- ListAccount 的 `follow_id` 有有效值
+- `ListAccount.active` scope 包含这个记录
+- `lists_for_local_distribution` 包含这个列表
+- 新状态会分发到列表时间线
+- 历史状态会被合并
+
+### 2.4 状态三：被移除（ListAccount 被删除）
+
+**情况 A：取消关注（最常见）**
+
+```ruby
+# app/services/unfollow_service.rb:25
+def unfollow!
+  follow = Follow.find_by(account: @follower, target_account: @followee)
+  return unless follow
+
+  # 关键注释：List members are removed immediately with the follow relationship removal,
+  # so we need to fetch the list IDs first
+  #
+  # 翻译：列表成员会随着关注关系的删除而立即被移除，
+  # 所以我们需要先获取列表 ID
+  list_ids = @follower.owned_lists.with_list_account(@followee).pluck(:list_id) unless @options[:skip_unmerge]
+
+  follow.destroy!  # 触发 ON DELETE CASCADE，ListAccount 被级联删除
+
+  # ... 发送 ActivityPub 消息
+
+  unless @options[:skip_unmerge]
+    UnmergeWorker.perform_async(@followee.id, @follower.id, 'home')
+    UnmergeWorker.push_bulk(list_ids) do |list_id|
+      [@followee.id, list_id, 'list']
+    end
+  end
+end
+```
+
+**关键流程**：
+1. **先**获取 `list_ids`（在删除 Follow 之前）
+2. `follow.destroy!` 触发数据库 `ON DELETE CASCADE`
+3. ListAccount 被**级联删除**（不是 `follow_id` 变为 nil）
+4. 触发 `UnmergeWorker` 从 Redis 时间线移除状态
+
+**情况 B：关注请求被拒绝/取消**
+
+```ruby
+# app/models/follow_request.rb:48
+alias reject! destroy!
+```
+
+当 `FollowRequest#destroy!` 被调用时：
+- 数据库 `ON DELETE CASCADE` 触发
+- 引用该 FollowRequest 的 ListAccount 被级联删除
+
+**情况 C：显式从列表移除**
+
+```ruby
+# app/services/remove_accounts_from_list_service.rb:20
+def call(list, accounts)
+  unmerge_from_list!  # 先触发 UnmergeWorker
+  update_list!         # 再删除 ListAccount
+end
+
+def update_list!
+  ListAccount.where(list: @list, account: @accounts).destroy_all
+end
+
+def unmerge_from_list!
+  UnmergeWorker.push_bulk(unmerge_account_ids) do |account_id|
+    [account_id, @list.id, 'list']
+  end
+end
+
+def unmerge_account_ids
+  ListAccount.where(list: @list, account: @accounts).where.not(follow_id: nil).pluck(:account_id)
+end
+```
+
+**情况 D：列表被删除**
+
+```ruby
+# app/models/list.rb
+has_many :list_accounts, inverse_of: :list, dependent: :destroy
+```
+
+当 List 被删除时，所有 ListAccount 也会被删除（应用层 `dependent: :destroy`）。
+
+### 2.5 特殊情况：列表所有者自己
+
+列表所有者可以把自己添加到列表，不需要关注关系：
+
+```ruby
+# app/models/list_account.rb
+def list_owner_account_is_account?
+  list.account_id == account_id
+end
+
+def validate_relationship
+  return if list_owner_account_is_account?  # 跳过验证
+  # ...
+end
+
+def set_follow
+  return if list_owner_account_is_account?  # 跳过设置
+  # ...
+end
+```
+
+**特征**：
+- ListAccount 的 `follow_id` 和 `follow_request_id` 都为 nil
+- 但 `lists_for_local_distribution` 通过 `or(scope.where(account_id: id))` 包含
+- 自己的状态会通过 `deliver_to_self!` 路径分发
+
+## 3. 列表时间线 Fan-out 机制
+
+### 3.1 整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         列表时间线 Fan-out 架构                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐     ┌──────────────────┐     ┌──────────────────────┐   │
+│  │  状态发布/更新 │────►│ FanOutOnWrite    │────►│ lists_for_local_     │   │
+│  │              │     │ Service          │     │ distribution         │   │
+│  └──────────────┘     └──────────────────┘     └──────────────────────┘   │
+│                                                                              │
+│                                                        │                     │
+│                                                        ▼                     │
+│                                              ┌──────────────────┐          │
+│                                              │ FeedInsertWorker │          │
+│                                              │ (异步队列)        │          │
+│                                              └──────────────────┘          │
+│                                                        │                     │
+│                                                        ▼                     │
+│                                              ┌──────────────────┐          │
+│                                              │ FeedManager      │          │
+│                                              │ .push_to_list()  │          │
+│                                              └──────────────────┘          │
+│                                                        │                     │
+│                              ┌─────────────────────────┼─────────────────┐   │
+│                              │                         │                 │   │
+│                              ▼                         ▼                 ▼   │
+│                     ┌──────────────┐          ┌──────────────┐  ┌─────────┐│
+│                     │ Redis 有序集合│          │ PushUpdate   │  │ 裁剪时间线 ││
+│                     │ ZADD 操作     │          │ Worker       │  │ (800条)  ││
+│                     └──────────────┘          └──────────────┘  └─────────┘│
+│                                                        │                     │
+│                                                        ▼                     │
+│                                              ┌──────────────────┐          │
+│                                              │ Redis PUBLISH    │          │
+│                                              │ timeline:list:id │          │
+│                                              └──────────────────┘          │
+│                                                        │                     │
+│                                                        ▼                     │
+│                                              ┌──────────────────┐          │
+│                                              │ Streaming API    │          │
+│                                              │ (Node.js)        │          │
+│                                              └──────────────────┘          │
+│                                                        │                     │
+│                                                        ▼                     │
+│                                              ┌──────────────────┐          │
+│                                              │ WebSocket/SSE    │          │
+│                                              │ 前端实时更新      │          │
+│                                              └──────────────────┘          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 触发点：FanOutOnWriteService
+
+无论本地还是远端账号发布状态，都会经过这个服务。
+
 ```ruby
 # app/services/fan_out_on_write_service.rb
 def call(status, options = {})
   @status    = status
   @account   = status.account
-  
+  @options   = options
+
   fan_out_to_local_recipients!
   fan_out_to_public_recipients! if broadcastable?
   fan_out_to_public_streams! if broadcastable?
@@ -90,8 +406,8 @@ end
 
 def fan_out_to_local_recipients!
   deliver_to_self!
-  # ... 通知相关代码
-  
+  # ...
+
   case @status.visibility.to_sym
   when :public, :unlisted, :private
     deliver_to_all_followers!
@@ -105,11 +421,10 @@ def fan_out_to_local_recipients!
 end
 ```
 
-### 2.2 查找相关列表：lists_for_local_distribution
+### 3.3 核心：lists_for_local_distribution
 
-`deliver_to_lists!` 方法使用 `lists_for_local_distribution` 找到需要更新的列表。
+这个方法决定哪些列表会收到状态更新。
 
-**实现逻辑**：
 ```ruby
 # app/models/concerns/account/interactions.rb
 def lists_for_local_distribution
@@ -119,12 +434,19 @@ def lists_for_local_distribution
 end
 ```
 
-**筛选条件**：
-1. **有活跃关注关系**：`list_accounts.follow_id` 不为空
-2. **或列表所有者就是该账号**：`account_id = id`（自己的列表）
-3. **列表所有者最近登录过**：`User.signed_in_recently`（优化性能，只更新活跃用户）
+**拆解分析**：
+1. `lists.joins(account: :user)` - 关联到列表所有者的 User
+2. `scope.where.not(list_accounts: { follow_id: nil })` - **ListAccount 的 follow_id 不为空**
+3. `.or(scope.where(account_id: id))` - **或者是列表所有者自己**
+4. `.merge(User.signed_in_recently)` - **且列表所有者最近登录过**
 
-**分发代码**：
+**关键结论**：
+- 只有**活跃成员**（`follow_id` 不为空）才会触发列表时间线更新
+- 列表所有者自己即使没有 `follow_id` 也会触发
+- 只更新活跃用户的时间线（性能优化）
+
+### 3.4 分发流程
+
 ```ruby
 # app/services/fan_out_on_write_service.rb
 def deliver_to_lists!
@@ -136,11 +458,12 @@ def deliver_to_lists!
 end
 ```
 
-### 2.3 异步处理：FeedInsertWorker
+**异步处理**：
+- 使用 `push_bulk` 批量推入 Sidekiq 队列
+- 每个列表一个异步任务
 
-`FeedInsertWorker` 异步处理时间线的插入和过滤。
+### 3.5 FeedInsertWorker
 
-**核心逻辑**：
 ```ruby
 # app/workers/feed_insert_worker.rb
 def perform(status_id, id, type = 'home', options = {})
@@ -148,16 +471,14 @@ def perform(status_id, id, type = 'home', options = {})
     @type      = type.to_sym
     @status    = Status.find(status_id)
     @options   = options.symbolize_keys
-    
+
     case @type
-    when :home, :tags
-      @follower = Account.find(id)
     when :list
       @list     = List.find(id)
       @follower = @list.account
     end
   end
-  
+
   with_read_replica do
     check_and_insert
   end
@@ -165,7 +486,7 @@ end
 
 def check_and_insert
   filter_result = feed_filter
-  
+
   if filter_result
     perform_unpush if update?
   else
@@ -175,10 +496,6 @@ end
 
 def feed_filter
   case @type
-  when :home
-    FeedManager.instance.filter(:home, @status, @follower)
-  when :tags
-    FeedManager.instance.filter(:tags, @status, @follower)
   when :list
     FeedManager.instance.filter(:list, @status, @list)
   end
@@ -186,115 +503,415 @@ end
 
 def perform_push
   case @type
-  when :home, :tags
-    FeedManager.instance.push_to_home(@follower, @status, update: update?)
   when :list
     FeedManager.instance.push_to_list(@list, @status, update: update?)
   end
 end
 ```
 
-### 2.4 时间线管理：FeedManager
+### 3.6 FeedManager.push_to_list
 
-`FeedManager` 是单例类，负责管理各种时间线的 Redis 存储和流式更新。
-
-**列表时间线相关方法**：
-
-#### push_to_list - 推送状态到列表时间线
 ```ruby
 # app/lib/feed_manager.rb
 def push_to_list(list, status, update: false)
   return false if filter_from_list?(status, list)
   return false unless list.account.user&.signed_in_recently?
   return false unless add_to_feed(:list, list.id, status, aggregate_reblogs: list.account.user&.aggregates_reblogs?)
-  
+
   trim(:list, list.id)
   PushUpdateWorker.perform_async(list.account_id, status.id, "timeline:list:#{list.id}", { 'update' => update }) if push_update_required?("timeline:list:#{list.id}")
   true
 end
 ```
 
-**关键步骤**：
-1. **过滤检查**：调用 `filter_from_list?` 检查状态是否应该被过滤
-2. **活跃用户检查**：只推送给最近登录的用户
-3. **添加到 Redis**：调用 `add_to_feed` 将状态添加到 Redis 有序集合
-4. **裁剪时间线**：调用 `trim` 保持时间线大小不超过 `MAX_ITEMS`（800）
-5. **推送更新**：如果有客户端订阅，调用 `PushUpdateWorker` 发送流式更新
+**步骤拆解**：
+1. `filter_from_list?` - 检查回复策略
+2. `signed_in_recently?` - 只更新活跃用户
+3. `add_to_feed` - Redis ZADD 操作
+4. `trim` - 保持 800 条限制
+5. `PushUpdateWorker` - 如果有客户端订阅，发送流式更新
 
-#### filter_from_list? - 列表时间线过滤逻辑
+### 3.7 过滤逻辑：filter_from_list?
+
 ```ruby
 # app/lib/feed_manager.rb
 def filter_from_list?(status, list)
-  if status.reply? && status.in_reply_to_account_id != status.account_id  # 状态是对其他账号的回复
-    should_filter = status.in_reply_to_account_id != list.account_id     # 不是回复给列表所有者
-    should_filter &&= !list.show_followed?                                # 列表策略不是 show_followed
-    should_filter &&= !(list.show_list? && ListAccount.exists?(list_id: list.id, account_id: status.in_reply_to_account_id))  # 或者回复对象不在列表中
-    
+  if status.reply? && status.in_reply_to_account_id != status.account_id
+    should_filter = status.in_reply_to_account_id != list.account_id
+    should_filter &&= !list.show_followed?
+    should_filter &&= !(list.show_list? && ListAccount.exists?(list_id: list.id, account_id: status.in_reply_to_account_id))
+
     return !!should_filter
   end
-  
+
   false
 end
 ```
 
-**过滤规则**（仅适用于回复）：
-- 如果 `replies_policy` 是 `list`：只显示对列表中账号的回复
-- 如果 `replies_policy` 是 `followed`：显示对所有已关注账号的回复
-- 如果 `replies_policy` 是 `none`：不显示任何回复
+**回复策略**：
+| replies_policy | 行为 |
+|----------------|------|
+| `list` | 只显示对列表中账号的回复 |
+| `followed` | 显示对所有已关注账号的回复 |
+| `none` | 不显示任何回复 |
 
-#### merge_into_list - 合并历史状态到列表时间线
+## 4. 远端账号状态变化的完整链路
+
+### 4.1 远端账号发布新状态
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                远端账号发布状态触发 Fan-out 流程                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  远端实例 (mastodon.social)                                                  │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 1. @alice@mastodon.social 发布新状态                                    │  │
+│  │ 2. 活动流投递到所有关注者的 shared_inbox 或 inbox                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                          │
+│                                    │ ActivityPub POST /inbox                  │
+│                                    │ (Create Note)                            │
+│                                    ▼                                          │
+│  本地实例 (local.instance)                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 3. ActivityPub::InboxesController#create                               │  │
+│  │    - 验证 HTTP 签名                                                      │  │
+│  │    - 异步处理：ActivityPub::ProcessingWorker                            │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 4. ActivityPub::Activity::Create#perform                                │  │
+│  │    - 创建 Status 记录                                                    │  │
+│  │    - 分发通知                                                             │  │
+│  │    - 检查：if @options[:override_timestamps] || @status.within_retention_period?
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 5. FanOutOnWriteService.call(@status)                                   │  │
+│  │    - 与本地账号发布状态完全相同的流程                                      │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 6. @account.lists_for_local_distribution                                │  │
+│  │    - 查找包含 @alice@mastodon.social 的列表                              │  │
+│  │    - 筛选：follow_id 不为空 且 列表所有者最近登录                         │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 7. FeedInsertWorker.push_bulk                                            │  │
+│  │    - 异步处理每个列表                                                     │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 8. FeedManager.push_to_list                                              │  │
+│  │    - Redis ZADD "feed:list:{list_id}"                                   │  │
+│  │    - PushUpdateWorker (如果有客户端订阅)                                  │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 9. Redis PUBLISH "timeline:list:{list_id}"                              │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 10. Streaming API 服务                                                    │  │
+│  │     - WebSocket/SSE 推送到前端                                           │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码**：
+
 ```ruby
-# app/lib/feed_manager.rb
-def merge_into_list(from_account, list)
-  return unless list.account.user&.signed_in_recently?
+# app/lib/activitypub/activity/create.rb
+def perform
+  # ... 创建 Status
   
-  timeline_key = key(:list, list.id)
-  aggregate    = list.account.user&.aggregates_reblogs?
-  query        = from_account.statuses.list_eligible_visibility.includes(reblog: :account).limit(FeedManager::MAX_ITEMS / 4)
-  
-  # 如果时间线已满，优化查询条件
-  if redis.zcard(timeline_key) >= FeedManager::MAX_ITEMS / 4
-    oldest_home_score = redis.zrange(timeline_key, 0, 0, with_scores: true).first.last.to_i
-    # ... 优化逻辑
+  if @options[:override_timestamps] || @status.within_retention_period?
+    unless @status.account.local? || @options[:delivered_to_owner]
+      # 只在本地接收时通知自己
+      NotifyService.new.call(@status.account, :status, @status) if @options[:notify]
+    end
+
+    # 关键：与本地账号完全相同的 fan-out 流程
+    FanOutOnWriteService.new.call(@status, update: @options[:update], skip_notification: true)
   end
-  
-  statuses = query.to_a
-  crutches = build_crutches(list.account_id, statuses, list: list)
-  
-  statuses.each do |status|
-    next if filter_from_home(status, list.account_id, crutches, :list)
-    
-    add_to_feed(:list, list.id, status, aggregate_reblogs: aggregate)
-  end
-  
-  trim(:list, list.id)
 end
 ```
 
-**使用场景**：
-- 将账号添加到列表时
-- 账号从暂停状态恢复时
+**重要结论**：远端账号发布的状态，经过 ActivityPub 接收后，使用**完全相同**的 `FanOutOnWriteService` 进行分发，包括列表时间线。
 
-#### unmerge_from_list - 从列表时间线移除账号的所有状态
+### 4.2 远端账号取消关注
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  远端账号取消关注触发列表成员移除流程                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  远端实例                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 1. @alice@mastodon.social 取消关注 @bob@local.instance                 │  │
+│  │ 2. 发送 Undo Follow 活动到 @bob 的 inbox                                 │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                          │
+│                                    │ ActivityPub POST /inbox                  │
+│                                    │ (Undo Follow)                             │
+│                                    ▼                                          │
+│  本地实例                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 3. ActivityPub::InboxesController#create                               │  │
+│  │    - 异步处理：ActivityPub::ProcessingWorker                            │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 4. ActivityPub::Activity::Undo#perform                                  │  │
+│  │    case @object['type']                                                 │  │
+│  │    when 'Follow'                                                         │  │
+│  │      undo_follow                                                         │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 5. ActivityPub::Activity::Undo#undo_follow                              │  │
+│  │    if @account.following?(target_account)                               │  │
+│  │      @account.unfollow!(target_account)  # 关键！                        │  │
+│  │    elsif @account.requested?(target_account)                            │  │
+│  │      FollowRequest.find_by(...).destroy                                 │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 6. UnfollowService.call(@alice, @bob)                                   │  │
+│  │    ├──► 先获取 list_ids (在删除 Follow 之前)                              │  │
+│  │    ├──► follow.destroy!  (触发 ON DELETE CASCADE)                        │  │
+│  │    │         │                                                            │  │
+│  │    │         ▼                                                            │  │
+│  │    │    7. ListAccount 被级联删除！                                       │  │
+│  │    │       (数据库级别，不是应用层)                                         │  │
+│  │    │                                                                      │  │
+│  │    └──► UnmergeWorker.push_bulk(list_ids)                                │  │
+│  │              │                                                            │  │
+│  │              ▼                                                            │  │
+│  │    8. FeedManager.unmerge_from_list                                       │  │
+│  │       - 从 Redis 时间线移除该账号的所有状态                                 │  │
+│  │              │                                                            │  │
+│  │              ▼                                                            │  │
+│  │    9. UI 同步：用户刷新列表时，发现该成员已不在列表中                        │  │
+│  │       - 时间线中的旧状态已被移除                                           │  │
+│  │       - 新状态不会再分发                                                   │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码**：
+
 ```ruby
-# app/lib/feed_manager.rb
-def unmerge_from_list(from_account, list)
-  timeline_key        = key(:list, list.id)
-  timeline_status_ids = redis.zrange(timeline_key, 0, -1)
-  
-  from_account.statuses.select(:id, :reblog_of_id).where(id: timeline_status_ids).reorder(nil).find_each do |status|
-    remove_from_feed(:list, list.id, status, aggregate_reblogs: list.account.user&.aggregates_reblogs?)
+# app/lib/activitypub/activity/undo.rb
+def undo_follow
+  target_account = account_from_uri(target_uri)
+
+  return if target_account.nil? || !target_account.local?
+
+  if @account.following?(target_account)
+    @account.unfollow!(target_account)  # 调用 UnfollowService
+  elsif @account.requested?(target_account)
+    FollowRequest.find_by(account: @account, target_account: target_account)&.destroy
+  else
+    delete_later!(object_uri)
   end
 end
 ```
 
-**使用场景**：
-- 从列表移除账号时
-- 账号被暂停时
+### 4.3 远端账号被暂停
 
-### 2.5 流式更新：PushUpdateWorker
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    远端账号被暂停时的列表时间线处理                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  场景 A：远端实例发送 Delete 活动                                              │
+│  ──────────────────────────────────────                                      │
+│                                                                              │
+│  远端实例                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 1. @alice@mastodon.social 被暂停/删除                                   │  │
+│  │ 2. 发送 Delete 活动到所有关注者的 inbox                                   │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                          │
+│                                    ▼                                          │
+│  本地实例                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ 3. ActivityPub::Activity::Delete#perform                               │  │
+│  │    - 处理 Delete Actor                                                   │  │
+│  │    - account.suspended!                                                 │  │
+│  │                                    │                                     │  │
+│  │                                    ▼                                     │  │
+│  │ 4. SuspendAccountService.call(account)                                  │  │
+│  │    ├──► reject_remote_follows!                                          │  │
+│  │    │         │                                                           │  │
+│  │    │         └──► 强制该账号取消关注所有本地账号                           │  │
+│  │    │              - 发送 RejectFollow 到远端实例                         │  │
+│  │    │              - follows.each(&:destroy)  (触发 ON DELETE CASCADE)   │  │
+│  │    │                                                                      │  │
+│  │    ├──► unmerge_from_home_timelines!                                    │  │
+│  │    │                                                                      │  │
+│  │    └──► unmerge_from_list_timelines!  (关键！)                           │  │
+│  │              │                                                            │  │
+│  │              ▼                                                            │  │
+│  │    5. @account.lists_for_local_distribution                              │  │
+│  │       - 查找包含该账号的所有列表                                            │  │
+│  │              │                                                            │  │
+│  │              ▼                                                            │  │
+│  │    6. FeedManager.instance.unmerge_from_list(@account, list)             │  │
+│  │       - 从 Redis 时间线移除该账号的所有状态                                 │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ════════════════════════════════════════════════════════════════════════  │
+│                                                                              │
+│  场景 B：本地管理员手动暂停远端账号                                             │
+│  ────────────────────────────────────────────                                │
+│                                                                              │
+│  1. Admin::Action 创建 suspend 记录                                           │
+│  2. Account.suspended!                                                       │
+│  3. SuspendAccountService.call(account)  (与场景 A 相同的后续流程)            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-当状态被添加到时间线且有客户端订阅时，`PushUpdateWorker` 负责发送流式更新。
+**关键代码**：
+
+```ruby
+# app/services/suspend_account_service.rb
+def call(account)
+  return unless account.suspended?
+
+  @account = account
+
+  reject_remote_follows!      # 强制取消关注
+  distribute_update_actor!     # 通知其他实例
+  unmerge_from_home_timelines! # 从主页时间线移除
+  unmerge_from_list_timelines! # 从列表时间线移除
+  privatize_media_attachments!
+  remove_from_trends!
+end
+
+def unmerge_from_list_timelines!
+  @account.lists_for_local_distribution.reorder(nil).find_each do |list|
+    FeedManager.instance.unmerge_from_list(@account, list)
+  end
+end
+
+def reject_remote_follows!
+  return if @account.local? || !@account.activitypub? || @account.suspension_origin_remote?
+
+  # 当暂停远端账号时，该账号在其源实例上并没有真正被暂停
+  # 为了防止它继续接收状态，必须强制它取消关注
+
+  Follow.where(account: @account).find_in_batches do |follows|
+    ActivityPub::DeliveryWorker.push_bulk(follows) do |follow|
+      [serialize_payload(follow, ActivityPub::RejectFollowSerializer).to_json, follow.target_account_id, @account.inbox_url]
+    end
+
+    follows.each(&:destroy)  # 触发 ON DELETE CASCADE，ListAccount 被级联删除
+  end
+end
+```
+
+### 4.4 远端账号恢复（Unsuspend）
+
+```ruby
+# app/services/unsuspend_account_service.rb
+def call(account)
+  @account = account
+
+  refresh_remote_account!  # 从远端刷新账号信息
+
+  return if @account.nil? || @account.suspended?
+
+  merge_into_home_timelines!
+  merge_into_list_timelines!  # 合并到列表时间线
+  publish_media_attachments!
+  distribute_update_actor!
+end
+
+def merge_into_list_timelines!
+  @account.lists_for_local_distribution.reorder(nil).find_each do |list|
+    FeedManager.instance.merge_into_list(@account, list)
+  end
+end
+```
+
+**注意**：恢复时，如果 ListAccount 还存在（即 `follow_id` 还有效），会合并历史状态到列表时间线。但如果之前因为 `reject_remote_follows!` 导致 ListAccount 被级联删除了，就需要重新添加到列表。
+
+## 5. 列表 UI 与数据变化同步
+
+### 5.1 整体同步架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         列表 UI 同步架构                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                        数据变化触发点                                    │  │
+│  ├──────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  触发方式 1：状态分发（实时）                                             │  │
+│  │  ┌──────────┐    ┌──────────────┐    ┌──────────────┐              │  │
+│  │  │ FanOut   │───►│ PushUpdate   │───►│ Redis        │              │  │
+│  │  │ Service  │    │ Worker       │    │ PUBLISH      │              │  │
+│  │  └──────────┘    └──────────────┘    └──────────────┘              │  │
+│  │                                                                       │  │
+│  │  触发方式 2：列表成员变化（非实时）                                        │  │
+│  │  ┌──────────┐    ┌──────────────┐    ┌──────────────┐              │  │
+│  │  │ List-    │───►│ 数据库记录    │───►│ 下次 API 请求 │              │  │
+│  │  │ Account  │    │ 变化          │    │ 时刷新       │              │  │
+│  │  └──────────┘    └──────────────┘    └──────────────┘              │  │
+│  │                                                                       │  │
+│  │  触发方式 3：时间线清理（非实时）                                          │  │
+│  │  ┌──────────┐    ┌──────────────┐    ┌──────────────┐              │  │
+│  │  │ Unmerge  │───►│ Redis ZREM   │───►│ 下次刷新时    │              │  │
+│  │  │ Worker   │    │ 操作          │    │ 不显示旧状态  │              │  │
+│  │  └──────────┘    └──────────────┘    └──────────────┘              │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                          │
+│                                    ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                        Streaming API 服务 (Node.js)                      │  │
+│  ├──────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  ┌────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ 1. 客户端 WebSocket 连接                                          │  │  │
+│  │  │    - 发送：{ "type": "subscribe", "stream": "list", "list": "123" }
+│  │  │                                                                   │  │  │
+│  │  │ 2. 权限验证                                                        │  │  │
+│  │  │    const result = await pgPool.query(                            │  │  │
+│  │  │      'SELECT id FROM lists WHERE id = $1 AND account_id = $2',  │  │  │
+│  │  │      [listId, accountId]                                          │  │  │
+│  │  │    );                                                              │  │  │
+│  │  │                                                                   │  │  │
+│  │  │ 3. Redis 订阅                                                      │  │  │
+│  │  │    redisSubscribeClient.subscribe(`timeline:list:${listId}`)    │  │  │
+│  │  │                                                                   │  │  │
+│  │  │ 4. 心跳机制                                                        │  │  │
+│  │  │    - 每 6 分钟设置 `subscribed:timeline:list:123`               │  │  │
+│  │  │    - 有效期 18 分钟                                                │  │  │
+│  │  │    - 服务端检查这个键判断是否有客户端订阅                            │  │  │
+│  │  └────────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                          │
+│                                    ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                           前端 UI 层                                     │  │
+│  ├──────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  实时更新（WebSocket）：                                                 │  │
+│  │  - 接收到 update 事件 → 插入新状态到列表顶部                             │  │
+│  │  - 接收到 status.update 事件 → 更新现有状态                               │  │
+│  │  - 接收到 delete 事件 → 从列表移除状态                                   │  │
+│  │                                                                       │  │
+│  │  非实时更新（需要用户操作）：                                              │  │
+│  │  - 列表成员被添加/移除 → 下次请求 GET /api/v1/lists/:id/accounts 时刷新 │
+│  │  - 账号被暂停/恢复 → 时间线状态已被 Unmerge/Merge Worker 处理           │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 流式更新：PushUpdateWorker
 
 ```ruby
 # app/workers/push_update_worker.rb
@@ -303,7 +920,7 @@ def perform(account_id, status_id, timeline_id = nil, options = {})
   @account_id  = account_id
   @timeline_id = timeline_id || "timeline:#{account_id}"
   @options     = options.symbolize_keys
-  
+
   render_payload!
   publish!
 end
@@ -320,232 +937,30 @@ def publish!
 end
 ```
 
-**频道命名**：
-- 列表时间线：`timeline:list:{list_id}`
-- 主页时间线：`timeline:{account_id}`
-- 通知时间线：`timeline:{account_id}:notifications`
+**频道命名规范**：
+| 时间线类型 | 频道名称 |
+|-----------|----------|
+| 列表时间线 | `timeline:list:{list_id}` |
+| 主页时间线 | `timeline:{account_id}` |
+| 通知时间线 | `timeline:{account_id}:notifications` |
+| 公共时间线 | `timeline:public` |
 
-## 3. 远端账号状态变化的检测与处理
+### 5.3 推送更新检查
 
-### 3.1 ActivityPub 消息处理
-
-Mastodon 通过 ActivityPub 协议接收远端实例的消息。
-
-#### 入口：InboxesController
 ```ruby
-# app/controllers/activitypub/inboxes_controller.rb
-def create
-  # ... 签名验证
-  
-  @json = Oj.load(body, mode: :strict)
-  
-  if @json['signature'].present?
-    ActivityPub::ProcessingWorker.perform_async(@account&.id, body.dup)
-  else
-    # ... 处理逻辑
-  end
+# app/lib/feed_manager.rb
+def push_update_required?(timeline_key)
+  redis.exists?("subscribed:#{timeline_key}")
 end
+
+# 调用点
+PushUpdateWorker.perform_async(...) if push_update_required?("timeline:list:#{list.id}")
 ```
 
-#### 消息处理：ActivityPub::ProcessingWorker
-```ruby
-# app/workers/activitypub/processing_worker.rb
-def perform(actor_id, body)
-  # ... 处理逻辑
-  ActivityPub::Activity.factory(json, account, delivery_attempt_options).perform
-end
-```
+**只有当有客户端订阅时才发送流式更新**，这是一个重要的性能优化。
 
-### 3.2 关注关系变化处理
+### 5.4 Streaming API 订阅流程
 
-#### 接收关注请求：ActivityPub::Activity::Follow
-```ruby
-# app/lib/activitypub/activity/follow.rb
-def perform
-  target_account = account_from_uri(object_uri)
-  
-  return if target_account.nil? || !target_account.local?
-  
-  # 检查是否已有关注请求
-  existing_follow_request = ::FollowRequest.find_by(account: @account, target_account: target_account)
-  unless existing_follow_request.nil?
-    existing_follow_request.update!(uri: @json['id'])
-    return
-  end
-  
-  # 检查是否已有关注关系
-  existing_follow = ::Follow.find_by(account: @account, target_account: target_account)
-  unless existing_follow.nil?
-    existing_follow.update!(uri: @json['id'])
-    AuthorizeFollowService.new.call(@account, target_account, skip_follow_request: true, follow_request_uri: @json['id'])
-    return
-  end
-  
-  # 创建新的关注请求
-  follow_request = FollowRequest.create!(account: @account, target_account: target_account, uri: @json['id'])
-  
-  if target_account.locked? || @account.silenced?
-    LocalNotificationWorker.perform_async(target_account.id, follow_request.id, 'FollowRequest', 'follow_request')
-  else
-    AuthorizeFollowService.new.call(@account, target_account)
-    LocalNotificationWorker.perform_async(target_account.id, ::Follow.find_by(account: @account, target_account: target_account).id, 'Follow', 'follow')
-  end
-end
-```
-
-#### 接收取消关注：ActivityPub::Activity::Undo
-```ruby
-# app/lib/activitypub/activity/undo.rb
-def perform
-  case @object['type']
-  when 'Announce'
-    undo_announce
-  when 'Accept'
-    undo_accept
-  when 'Follow'
-    undo_follow  # 处理取消关注
-  when 'Like'
-    undo_like
-  when 'Block'
-    undo_block
-  # ...
-  end
-end
-
-def undo_follow
-  target_account = account_from_uri(target_uri)
-  
-  return if target_account.nil? || !target_account.local?
-  
-  if @account.following?(target_account)
-    @account.unfollow!(target_account)  # 取消关注
-  elsif @account.requested?(target_account)
-    FollowRequest.find_by(account: @account, target_account: target_account)&.destroy
-  else
-    delete_later!(object_uri)
-  end
-end
-```
-
-### 3.3 账号状态变化服务
-
-#### 暂停账号：SuspendAccountService
-```ruby
-# app/services/suspend_account_service.rb
-def call(account)
-  return unless account.suspended?
-  
-  @account = account
-  
-  reject_remote_follows!
-  distribute_update_actor!
-  unmerge_from_home_timelines!
-  unmerge_from_list_timelines!  # 从列表时间线移除
-  privatize_media_attachments!
-  remove_from_trends!
-end
-
-def unmerge_from_list_timelines!
-  @account.lists_for_local_distribution.reorder(nil).find_each do |list|
-    FeedManager.instance.unmerge_from_list(@account, list)
-  end
-end
-```
-
-**远端账号暂停的特殊处理**：
-```ruby
-def reject_remote_follows!
-  return if @account.local? || !@account.activitypub? || @account.suspension_origin_remote?
-  
-  # 当暂停一个远端账号时，该账号在其源实例上并没有真正被暂停
-  # 为了防止它继续接收因为关注本地账号而获得的状态，我们必须强制它取消关注
-  
-  Follow.where(account: @account).find_in_batches do |follows|
-    ActivityPub::DeliveryWorker.push_bulk(follows) do |follow|
-      [serialize_payload(follow, ActivityPub::RejectFollowSerializer).to_json, follow.target_account_id, @account.inbox_url]
-    end
-    
-    follows.each(&:destroy)
-  end
-end
-```
-
-#### 恢复账号：UnsuspendAccountService
-```ruby
-# app/services/unsuspend_account_service.rb
-def call(account)
-  @account = account
-  
-  refresh_remote_account!  # 刷新远端账号信息
-  
-  return if @account.nil? || @account.suspended?
-  
-  merge_into_home_timelines!
-  merge_into_list_timelines!  # 合并回列表时间线
-  publish_media_attachments!
-  distribute_update_actor!
-end
-
-def refresh_remote_account!
-  return if @account.local?
-  
-  # 当我们暂停远端账号时，它可能在其源实例上也被暂停了
-  # 所以需要立即刷新以检查这种情况
-  
-  @account.update!(last_webfingered_at: nil)
-  @account = ResolveAccountService.new.call(@account)
-  
-  # 需要注意的是，远端账号可能不仅被暂停，还被永久删除
-  # 这种情况下 @account 会是 nil
-end
-
-def merge_into_list_timelines!
-  @account.lists_for_local_distribution.reorder(nil).find_each do |list|
-    FeedManager.instance.merge_into_list(@account, list)
-  end
-end
-```
-
-### 3.4 关注关系变化对列表的影响
-
-当关注关系发生变化时，ListAccount 的 `follow_id` 字段会自动更新或失效。
-
-**添加账号到列表时**：
-```ruby
-# app/models/list_account.rb
-before_validation :set_follow, unless: :list_owner_account_is_account?
-
-def set_follow
-  self.follow = Follow.find_by(account_id: list.account_id, target_account_id: account.id)
-  self.follow_request = FollowRequest.find_by(account_id: list.account_id, target_account_id: account.id) if follow.nil?
-end
-```
-
-**关注请求被接受时**：
-- Follow 被创建，ListAccount 的 `follow_id` 会在下次验证时被设置
-
-**关注被取消时**：
-- Follow 被销毁，ListAccount 的 `follow_id` 变为 nil
-- 该账号不再出现在 `lists_for_local_distribution` 中
-- 新状态不再会被分发到包含该账号的列表
-
-## 4. 列表 UI 与数据变化同步
-
-### 4.1 Streaming API 服务
-
-Mastodon 使用独立的 Node.js 服务处理实时流式更新。
-
-**入口文件**：`streaming/index.js`
-
-**核心功能**：
-- 支持 WebSocket 和 Server-Sent Events 两种连接方式
-- 订阅 Redis 频道
-- 处理客户端的订阅/取消订阅请求
-- 过滤和转发消息
-
-### 4.2 列表流订阅
-
-#### 订阅流程
 ```javascript
 // streaming/index.js
 case 'list':
@@ -553,7 +968,7 @@ case 'list':
     reject(new RequestError('Missing list name parameter'));
     return;
   }
-  
+
   authorizeListAccess(params.list, req).then(() => {
     resolve({
       channelIds: [`timeline:list:${params.list}`],
@@ -562,589 +977,210 @@ case 'list':
   }).catch(() => {
     reject(new AuthenticationError('Not authorized to stream this list'));
   });
-  
+
   break;
 ```
 
-#### 权限验证
+**权限验证**：
 ```javascript
 const authorizeListAccess = async (listId, req) => {
   const { accountId } = req;
-  
-  const result = await pgPool.query('SELECT id, account_id FROM lists WHERE id = $1 AND account_id = $2 LIMIT 1', [listId, accountId]);
-  
+
+  const result = await pgPool.query(
+    'SELECT id, account_id FROM lists WHERE id = $1 AND account_id = $2 LIMIT 1',
+    [listId, accountId]
+  );
+
   if (result.rows.length === 0) {
     throw new AuthenticationError('List not found');
   }
 };
 ```
 
-**验证规则**：
-- 用户只能订阅自己创建的列表
-- 通过查询 `lists` 表确认 `account_id` 匹配
+**规则**：用户只能订阅自己创建的列表。
 
-### 4.3 消息分发机制
+### 5.5 列表 API 端点
 
-#### Redis 订阅
-```javascript
-const subscribe = (channel, callback) => {
-  subs[channel] = subs[channel] || [];
-  
-  if (subs[channel].length === 0) {
-    redisSubscribeClient.subscribe(redisNamespaced(channel), (err, count) => {
-      // ...
-    });
-  }
-  
-  subs[channel].push(callback);
-};
-```
+| 端点 | 方法 | 功能 |
+|------|------|------|
+| `/api/v1/lists/:id` | GET | 获取列表信息 |
+| `/api/v1/lists/:id/accounts` | GET | 获取列表成员 |
+| `/api/v1/lists/:id/accounts` | POST | 添加成员到列表 |
+| `/api/v1/lists/:id/accounts` | DELETE | 从列表移除成员 |
+| `/api/v1/timelines/list/:id` | GET | 获取列表时间线 |
 
-#### 消息处理
-```javascript
-const onRedisMessage = (channel, message) => {
-  const key = redisUnnamespaced(channel);
-  const callbacks = subs[key];
-  if (!callbacks) {
-    return;
-  }
-  
-  const json = parseJSON(message, null);
-  if (!json) return;
-  
-  callbacks.forEach(callback => callback(json));
-};
-```
+### 5.6 同步机制总结
 
-#### 发送到客户端
-```javascript
-const transmit = (event, payload) => {
-  const encodedPayload = typeof payload === 'object' ? JSON.stringify(payload) : payload;
-  output(event, encodedPayload);
-};
-```
+**实时同步（WebSocket）**：
+- ✅ 新状态发布 → 立即推送到订阅的客户端
+- ✅ 状态更新 → 立即推送到订阅的客户端
+- ✅ 状态删除 → 立即推送到订阅的客户端
 
-### 4.4 心跳与连接管理
+**非实时同步（需要刷新）**：
+- ❌ 列表成员被添加 → 下次获取列表成员 API 时刷新
+- ❌ 列表成员被移除 → 下次获取列表成员 API 时刷新
+- ❌ 账号被暂停 → 时间线状态已被清理，用户刷新时看不到旧状态
+- ❌ 账号被恢复 → 时间线状态已被合并，用户刷新时看到历史状态
 
-#### 订阅心跳
-```javascript
-const subscriptionHeartbeat = channels => {
-  const interval = 6 * 60;  // 6 分钟
-  
-  const tellSubscribed = () => {
-    channels.forEach(channel => redisClient.set(redisNamespaced(`subscribed:${channel}`), '1', 'EX', interval * 3));
-  };
-  
-  tellSubscribed();
-  
-  const heartbeat = setInterval(tellSubscribed, interval * 1000);
-  
-  return () => {
-    clearInterval(heartbeat);
-  };
-};
-```
+**关键设计**：列表成员的增删不会发送实时通知到前端，只有时间线状态变化会发送实时通知。
 
-**作用**：
-- 在 Redis 中设置 `subscribed:{channel}` 键，有效期 18 分钟
-- 每 6 分钟刷新一次
-- 服务端通过检查该键判断是否有客户端订阅
+## 6. 列表成员生命周期与关注关系绑定总结
 
-#### 推送更新检查
-```ruby
-# app/lib/feed_manager.rb
-def push_update_required?(timeline_key)
-  redis.exists?("subscribed:#{timeline_key}")
-end
-```
-
-### 4.5 列表时间线 API
-
-#### 控制器
-```ruby
-# app/controllers/api/v1/timelines/list_controller.rb
-class Api::V1::Timelines::ListController < Api::V1::Timelines::BaseController
-  def show
-    render json: @statuses,
-           each_serializer: REST::StatusSerializer,
-           relationships: StatusRelationshipsPresenter.new(@statuses, current_user.account_id)
-  end
-  
-  private
-  
-  def set_list
-    @list = List.where(account: current_account).find(params[:id])
-  end
-  
-  def list_statuses
-    list_feed.get(
-      limit_param(DEFAULT_STATUSES_LIMIT),
-      params[:max_id],
-      params[:since_id],
-      params[:min_id]
-    )
-  end
-  
-  def list_feed
-    ListFeed.new(@list)
-  end
-end
-```
-
-#### ListFeed
-```ruby
-# app/models/list_feed.rb
-class ListFeed < Feed
-  def initialize(list)
-    super(:list, list.id)
-  end
-end
-```
-
-#### Feed 基类
-Feed 类封装了对 Redis 有序集合的操作，提供分页获取时间线数据的方法。
-
-## 5. 列表账号管理操作
-
-### 5.1 添加账号到列表
-
-#### 控制器
-```ruby
-# app/controllers/api/v1/lists/accounts_controller.rb
-def create
-  AddAccountsToListService.new.call(@list, Account.find(account_ids))
-  render_empty
-end
-```
-
-#### 服务
-```ruby
-# app/services/add_accounts_to_list_service.rb
-class AddAccountsToListService < BaseService
-  def call(list, accounts)
-    @list = list
-    @accounts = accounts
-    
-    return if @accounts.empty?
-    
-    update_list!
-    merge_into_list!
-  end
-  
-  private
-  
-  def update_list!
-    ApplicationRecord.transaction do
-      @accounts.each do |account|
-        @list.accounts << account
-      end
-    end
-  end
-  
-  def merge_into_list!
-    MergeWorker.push_bulk(merge_account_ids) do |account_id|
-      [account_id, @list.id, 'list']
-    end
-  end
-  
-  def merge_account_ids
-    ListAccount.where(list: @list, account: @accounts).where.not(follow_id: nil).pluck(:account_id)
-  end
-end
-```
-
-**关键点**：
-- `merge_account_ids` 只选择有活跃关注关系的账号
-- 没有 `follow_id` 的账号（如只有 `follow_request_id` 或列表所有者自己）不会触发历史状态合并
-
-### 5.2 从列表移除账号
-
-#### 控制器
-```ruby
-# app/controllers/api/v1/lists/accounts_controller.rb
-def destroy
-  RemoveAccountsFromListService.new.call(@list, Account.where(id: account_ids))
-  render_empty
-end
-```
-
-#### 服务
-```ruby
-# app/services/remove_accounts_from_list_service.rb
-class RemoveAccountsFromListService < BaseService
-  def call(list, accounts)
-    @list = list
-    @accounts = accounts
-    
-    return if @accounts.empty?
-    
-    unmerge_from_list!
-    update_list!
-  end
-  
-  private
-  
-  def update_list!
-    ListAccount.where(list: @list, account: @accounts).destroy_all
-  end
-  
-  def unmerge_from_list!
-    UnmergeWorker.push_bulk(unmerge_account_ids) do |account_id|
-      [account_id, @list.id, 'list']
-    end
-  end
-  
-  def unmerge_account_ids
-    ListAccount.where(list: @list, account: @accounts).where.not(follow_id: nil).pluck(:account_id)
-  end
-end
-```
-
-### 5.3 MergeWorker
-```ruby
-# app/workers/merge_worker.rb
-def merge_into_list!(into_list_id)
-  with_primary do
-    @into_list = List.find(into_list_id)
-  end
-  
-  with_read_replica do
-    FeedManager.instance.merge_into_list(@from_account, @into_list)
-  end
-end
-```
-
-### 5.4 UnmergeWorker
-```ruby
-# app/workers/unmerge_worker.rb
-def unmerge_from_list!(into_list_id)
-  with_primary do
-    @into_list = List.find(into_list_id)
-  end
-  
-  with_read_replica do
-    FeedManager.instance.unmerge_from_list(@from_account, @into_list)
-  end
-end
-```
-
-## 6. 完整流程图
-
-### 6.1 新状态发布到列表时间线
+### 6.1 核心绑定关系
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        新状态发布/更新流程                                      │
+│                    列表成员与关注关系的绑定关系                                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│  1. Status 被创建或更新                                                      │
-│         │                                                                    │
-│         ▼                                                                    │
-│  2. FanOutOnWriteService.call(status)                                       │
-│         │                                                                    │
-│         ▼                                                                    │
-│  3. fan_out_to_local_recipients!                                            │
-│         │                                                                    │
-│         ├──► deliver_to_self!           (推送给自己)                          │
-│         │                                                                    │
-│         ├──► deliver_to_all_followers!  (推送给关注者)                        │
-│         │                                                                    │
-│         └──► deliver_to_lists!          (推送给列表)                          │
-│               │                                                              │
-│               ▼                                                              │
-│  4. @account.lists_for_local_distribution                                   │
-│     - 查找包含该账号的所有列表                                                 │
-│     - 筛选条件：follow_id 不为空 或 列表所有者自己                             │
-│     - 且列表所有者最近登录过                                                   │
-│               │                                                              │
-│               ▼                                                              │
-│  5. FeedInsertWorker.push_bulk(lists)                                       │
-│     - 为每个列表创建异步任务                                                   │
-│               │                                                              │
-│               ▼                                                              │
-│  6. FeedInsertWorker.perform                                                 │
-│     - @list = List.find(id)                                                  │
-│     - @follower = @list.account                                              │
-│               │                                                              │
-│               ▼                                                              │
-│  7. check_and_insert                                                         │
-│     ├──► feed_filter = FeedManager.instance.filter(:list, status, list)    │
-│     │         │                                                              │
-│     │         └──► filter_from_list?  (检查回复策略)                          │
-│     │         └──► filter_from_home    (检查屏蔽、静音、语言等)               │
-│     │                                                                        │
-│     └──► 如果未被过滤                                                        │
-│              │                                                               │
-│              ▼                                                               │
-│  8. perform_push                                                             │
-│     FeedManager.instance.push_to_list(list, status)                         │
-│              │                                                               │
-│              ├──► 1. filter_from_list?  (再次检查)                           │
-│              ├──► 2. list.account.user&.signed_in_recently?                │
-│              ├──► 3. add_to_feed(:list, list.id, status)                   │
-│              │       - Redis ZADD "feed:list:{list_id}"                     │
-│              ├──► 4. trim(:list, list.id)  (保持 800 条限制)                │
-│              └──► 5. PushUpdateWorker.perform_async                          │
-│                       (如果有客户端订阅)                                       │
-│              │                                                               │
-│              ▼                                                               │
-│  9. PushUpdateWorker.perform                                                 │
-│     - @timeline_id = "timeline:list:{list_id}"                              │
-│     - render_payload!  (使用 StatusCacheHydrator)                            │
-│     - publish!                                                                │
-│              │                                                               │
-│              ▼                                                               │
-│  10. redis.publish("timeline:list:{list_id}", message)                      │
-│              │                                                               │
-│              ▼                                                               │
-│  11. Streaming API 服务                                                       │
-│      - Redis 订阅收到消息                                                      │
-│      - 查找订阅该频道的所有客户端                                               │
-│      - 通过 WebSocket/SSE 发送给前端                                          │
-│              │                                                               │
-│              ▼                                                               │
-│  12. 前端 UI 更新                                                              │
-│      - 实时显示新状态                                                          │
+│  数据库约束（核心）：                                                         │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                       │  │
+│  │   list_accounts.follow_id ──────► follows.id                         │  │
+│  │         │                                                              │  │
+│  │         └── ON DELETE CASCADE                                          │  │
+│  │                                                                       │  │
+│  │   list_accounts.follow_request_id ──► follow_requests.id             │  │
+│  │         │                                                              │  │
+│  │         └── ON DELETE CASCADE                                          │  │
+│  │                                                                       │  │
+│  │   这意味着：                                                            │  │
+│  │   - 当 Follow 被删除时，ListAccount 也被删除                           │  │
+│  │   - 当 FollowRequest 被删除时，ListAccount 也被删除                    │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  生命周期状态转换：                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                       │  │
+│  │  初始状态（无 ListAccount）                                              │  │
+│  │       │                                                                 │  │
+│  │       ├──► 用户发送关注请求 + 添加到列表                                  │  │
+│  │       │         │                                                       │  │
+│  │       │         ▼                                                       │  │
+│  │       │    待审核状态                                                    │  │
+│  │       │    - follow_request_id: 有值                                    │  │
+│  │       │    - follow_id: nil                                             │  │
+│  │       │    - 不参与 fan-out                                             │  │
+│  │       │         │                                                       │  │
+│  │       │         ├──► 关注请求被接受                                      │  │
+│  │       │         │         │                                             │  │
+│  │       │         │         ▼                                             │  │
+│  │       │         │    FollowRequest#authorize!                           │  │
+│  │       │         │    - 创建 Follow                                      │  │
+│  │       │         │    - 显式更新 ListAccount:                            │  │
+│  │       │         │      follow_request_id: nil, follow_id: new_id       │  │
+│  │       │         │    - 删除 FollowRequest（不会级联删除 ListAccount）    │  │
+│  │       │         │         │                                             │  │
+│  │       │         │         ▼                                             │  │
+│  │       │         │    活跃状态                                            │  │
+│  │       │         │    - follow_id: 有值                                   │  │
+│  │       │         │    - 参与 fan-out                                      │  │
+│  │       │         │         │                                             │  │
+│  │       │         │         ├──► 取消关注                                  │  │
+│  │       │         │         │         │                                   │  │
+│  │       │         │         │         ▼                                   │  │
+│  │       │         │         │    Follow.destroy!                           │  │
+│  │       │         │         │    - 触发 ON DELETE CASCADE                  │  │
+│  │       │         │         │         │                                   │  │
+│  │       │         │         │         ▼                                   │  │
+│  │       │         │         │    被移除状态                                │  │
+│  │       │         │         │    - ListAccount 已删除                      │  │
+│  │       │         │         │                                              │  │
+│  │       │         │         └──► 显式从列表移除                             │  │
+│  │       │         │                   │                                    │  │
+│  │       │         │                   ▼                                    │  │
+│  │       │         │              ListAccount.destroy_all                    │  │
+│  │       │         │                   │                                    │  │
+│  │       │         │                   ▼                                    │  │
+│  │       │         │              被移除状态                                 │  │
+│  │       │         │                                                         │  │
+│  │       │         └──► 关注请求被拒绝/取消                                   │  │
+│  │       │                   │                                               │  │
+│  │       │                   ▼                                               │  │
+│  │       │              FollowRequest.destroy!                               │  │
+│  │       │              - 触发 ON DELETE CASCADE                             │  │
+│  │       │                   │                                               │  │
+│  │       │                   ▼                                               │  │
+│  │       │              被移除状态                                            │  │
+│  │       │                                                                   │  │
+│  │       └──► 直接关注（不需要审核）+ 添加到列表                               │  │
+│                │                                                            │  │
+│                ▼                                                            │  │
+│           活跃状态（直接进入）                                                │  │
+│                                                                             │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  特殊情况：列表所有者自己                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                       │  │
+│  │  列表所有者可以把自己添加到列表：                                          │  │
+│  │  - 不需要 follow_id 或 follow_request_id                                │  │
+│  │  - list_owner_account_is_account? 返回 true                             │  │
+│  │  - 跳过 validate_relationship 验证                                       │  │
+│  │  - 跳过 set_follow 回调                                                  │  │
+│  │                                                                       │  │
+│  │  但 lists_for_local_distribution 通过 or 条件包含：                        │  │
+│  │  scope.where.not(list_accounts: { follow_id: nil })                    │  │
+│  │    .or(scope.where(account_id: id))  ←── 列表所有者自己                  │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 远端账号被暂停时的处理
+### 6.2 关键代码对照表
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      远端账号暂停处理流程                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  方式 A：通过 ActivityPub 接收 Delete/Suspend 消息                           │
-│  ─────────────────────────────────────────────                               │
-│                                                                              │
-│  1. ActivityPub::InboxesController 接收消息                                   │
-│         │                                                                    │
-│         ▼                                                                    │
-│  2. ActivityPub::ProcessingWorker 处理                                       │
-│         │                                                                    │
-│         ▼                                                                    │
-│  3. ActivityPub::Activity::Delete 或 Update                                  │
-│         │                                                                    │
-│         ▼                                                                    │
-│  4. 更新 Account.suspended_at 字段                                           │
-│         │                                                                    │
-│         ▼                                                                    │
-│  5. SuspendAccountService.call(account)                                      │
-│                                                                              │
-│  ════════════════════════════════════════════════════                        │
-│                                                                              │
-│  方式 B：本地管理员手动暂停账号                                                │
-│  ──────────────────────────────────────                                      │
-│                                                                              │
-│  1. Admin::Action 创建 suspend 记录                                           │
-│         │                                                                    │
-│         ▼                                                                    │
-│  2. Account.suspended!                                                       │
-│         │                                                                    │
-│         ▼                                                                    │
-│  3. SuspendAccountService.call(account)                                      │
-│                                                                              │
-│  ════════════════════════════════════════════════                            │
-│                                                                              │
-│  SuspendAccountService 内部流程：                                             │
-│  ───────────────────────────────                                             │
-│                                                                              │
-│  ├──► reject_remote_follows!  (仅远端账号)                                    │
-│  │         │                                                                 │
-│  │         └──► 对该账号的每个 Follow：                                        │
-│  │              ├──► 发送 RejectFollow 到远端实例                             │
-│  │              └──► 销毁 Follow 记录                                         │
-│  │                                                                           │
-│  ├──► distribute_update_actor!  (仅本地账号)                                  │
-│  │         │                                                                 │
-│  │         └──► 发送 Update Actor 到所有关注者的实例                           │
-│  │                                                                           │
-│  ├──► unmerge_from_home_timelines!                                           │
-│  │         │                                                                 │
-│  │         └──► 从所有关注者的主页时间线移除该账号的状态                        │
-│  │                                                                           │
-│  └──► unmerge_from_list_timelines!  (关键步骤)                               │
-│            │                                                                │
-│            ▼                                                                │
-│     6. @account.lists_for_local_distribution                                │
-│        - 查找包含该账号的所有列表                                              │
-│            │                                                                │
-│            ▼                                                                │
-│     7. 对每个 list：                                                         │
-│        FeedManager.instance.unmerge_from_list(@account, list)             │
-│            │                                                                │
-│            ├──► timeline_key = "feed:list:{list_id}"                       │
-│            ├──► 从 Redis 获取时间线中的所有状态 ID                            │
-│            └──► 对该账号的每个状态：                                           │
-│                 remove_from_feed(:list, list.id, status)                    │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| 场景 | 触发操作 | ListAccount 变化 | 时间线变化 |
+|------|----------|-----------------|-----------|
+| 添加已有 Follow 的账号到列表 | `AddAccountsToListService` | 创建记录，`follow_id` 被设置 | `MergeWorker` 合并历史状态 |
+| 添加有 FollowRequest 的账号到列表 | `AddAccountsToListService` | 创建记录，`follow_request_id` 被设置 | 无变化（不参与 fan-out） |
+| 关注请求被接受 | `FollowRequest#authorize!` | 显式更新：`follow_request_id: nil, follow_id: new_id` | `MergeWorker` 合并历史状态 |
+| 取消关注 | `UnfollowService` | `Follow.destroy!` 触发 `ON DELETE CASCADE`，ListAccount 被级联删除 | `UnmergeWorker` 移除时间线状态 |
+| 关注请求被拒绝 | `FollowRequest#destroy!` | 触发 `ON DELETE CASCADE`，ListAccount 被级联删除 | 无变化（本来就不参与） |
+| 显式从列表移除 | `RemoveAccountsFromListService` | `ListAccount.destroy_all` 直接删除 | `UnmergeWorker` 移除时间线状态 |
+| 列表被删除 | `List#destroy` | `dependent: :destroy` 级联删除 | 无（时间线数据保留在 Redis，可能过期） |
 
-### 6.3 添加账号到列表的流程
+### 6.3 常见问题解答
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        添加账号到列表流程                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. 用户调用 API：POST /api/v1/lists/:list_id/accounts                      │
-│     参数：account_ids: [...]                                                 │
-│         │                                                                    │
-│         ▼                                                                    │
-│  2. Api::V1::Lists::AccountsController#create                                │
-│         │                                                                    │
-│         ▼                                                                    │
-│  3. AddAccountsToListService.call(list, accounts)                            │
-│         │                                                                    │
-│         ├──► update_list!                                                    │
-│         │         │                                                          │
-│         │         ▼                                                          │
-│         │    4. 事务中创建 ListAccount 记录                                   │
-│         │         │                                                          │
-│         │         └──► before_validation :set_follow                          │
-│         │              │                                                      │
-│         │              └──► 自动查找 Follow 或 FollowRequest                  │
-│         │                   - 如果列表所有者关注了该账号：设置 follow_id        │
-│         │                   - 如果只有关注请求：设置 follow_request_id         │
-│         │                   - 如果是列表所有者自己：两个都不设置                │
-│         │                                                                     │
-│         └──► merge_into_list!                                                │
-│                   │                                                           │
-│                   ▼                                                           │
-│            5. merge_account_ids                                               │
-│               ListAccount.where(list: @list, account: @accounts)            │
-│                 .where.not(follow_id: nil)                                   │
-│                 .pluck(:account_id)                                           │
-│               │                                                               │
-│               └──► 只选择有活跃关注关系的账号                                   │
-│                    (follow_id 不为空)                                          │
-│                   │                                                           │
-│                   ▼                                                           │
-│            6. MergeWorker.push_bulk(merge_account_ids)                       │
-│               [account_id, list.id, 'list']                                  │
-│                   │                                                           │
-│                   ▼                                                           │
-│            7. MergeWorker.perform                                             │
-│               ├──► @from_account = Account.find(from_account_id)              │
-│               ├──► @into_list = List.find(into_list_id)                       │
-│               └──► FeedManager.instance.merge_into_list(@from_account, @into_list)
-│                         │                                                      │
-│                         ▼                                                      │
-│                    8. 合并历史状态                                              │
-│                       ├──► 查询该账号最近的状态                                  │
-│                       ├──► 对每个状态：                                          │
-│                       │    ├──► 过滤检查                                        │
-│                       │    └──► add_to_feed(:list, list.id, status)           │
-│                       └──► trim(:list, list.id)                                │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Q1: 取消关注后，ListAccount 是被删除还是只是 follow_id 变为 nil？**
 
-## 7. 关键设计要点总结
+**A: 被删除。** 数据库有 `ON DELETE CASCADE` 约束，当 Follow 被删除时，引用它的 ListAccount 会被级联删除。这不是应用层逻辑，而是数据库级别的约束。
 
-### 7.1 列表成员的活跃状态判定
+**Q2: 为什么 UnfollowService 要先获取 list_ids 再删除 Follow？**
 
-ListAccount 有两个关键字段：
-- `follow_id`：关联的 Follow 记录
-- `follow_request_id`：关联的 FollowRequest 记录
+**A:** 因为 `follow.destroy!` 会触发级联删除，ListAccount 会被立即删除。如果不先获取 `list_ids`，之后就无法知道哪些列表需要清理时间线了。
 
-**只有 `follow_id` 不为空时，该账号才被视为列表的活跃成员：**
-- 新状态会被分发到列表时间线
-- 添加到列表时会合并历史状态
-- 从列表移除时会清理时间线
+**Q3: 关注请求被接受时，为什么要显式更新 ListAccount？**
 
-**这意味着**：
-- 只有关注请求的账号：不会出现在列表时间线中
-- 列表所有者自己：始终可以添加到列表，但不会触发 fan-out（因为自己的状态会通过其他路径分发）
-- 关注被取消后：`follow_id` 变为空，不再参与列表时间线
+**A:** 如果不先更新，`FollowRequest.destroy!` 会触发 `ON DELETE CASCADE` 删除 ListAccount。显式更新 `follow_request_id: nil, follow_id: new_id` 后，ListAccount 不再引用被删除的 FollowRequest，所以不会被级联删除。
 
-### 7.2 性能优化策略
+**Q4: 远端账号发布状态时，列表时间线如何更新？**
 
-1. **lists_for_local_distribution 只选择活跃用户**：
-   ```ruby
-   .merge(User.signed_in_recently)
-   ```
-   只为最近登录的用户更新时间线，避免不必要的 Redis 操作。
+**A:** 与本地账号完全相同。远端状态通过 ActivityPub 接收后，同样使用 `FanOutOnWriteService` 分发，包括 `lists_for_local_distribution` 筛选和 `FeedInsertWorker` 异步处理。
 
-2. **FeedInsertWorker 异步处理**：
-   - 使用 Sidekiq 异步队列
-   - 批量处理：`push_bulk`
+**Q5: 远端账号取消关注时，列表成员会被移除吗？**
 
-3. **时间线裁剪**：
-   - 限制 800 条（`MAX_ITEMS`）
-   - 新状态添加后调用 `trim`
+**A:** 会。远端通过 ActivityPub 发送 `Undo Follow`，本地通过 `UnfollowService` 处理，`Follow.destroy!` 触发 `ON DELETE CASCADE`，ListAccount 被级联删除。
 
-4. **推送更新检查**：
-   ```ruby
-   PushUpdateWorker.perform_async(...) if push_update_required?("timeline:list:#{list.id}")
-   ```
-   只有当有客户端订阅时才发送流式更新。
+**Q6: 列表成员变化时，前端会收到实时通知吗？**
 
-5. **Redis 数据结构**：
-   - 使用有序集合（Sorted Set）存储时间线
-   - score 使用状态 ID（Snowflake ID，包含时间戳）
-   - 高效的范围查询和分页
+**A:** 不会。只有时间线状态变化（新状态、状态更新、状态删除）会通过 WebSocket 实时推送。列表成员的增删需要用户刷新列表成员 API 才能看到。
 
-### 7.3 一致性保证
+## 7. 相关文件索引
 
-1. **数据库事务**：
-   - 添加/移除列表账号时使用事务
-   - ListAccount 有唯一性约束：`validates :account_id, uniqueness: { scope: :list_id }`
-
-2. **Redis 操作**：
-   - `add_to_feed` 和 `remove_from_feed` 是原子操作
-   - 使用 Redis 管道（pipeline）优化批量操作
-
-3. **状态变化处理**：
-   - 账号暂停/恢复时，显式调用 `unmerge_from_list_timelines!` 或 `merge_into_list_timelines!`
-   - 确保时间线与账号状态一致
-
-### 7.4 跨实例数据同步
-
-Mastodon 使用 ActivityPub 协议实现跨实例同步：
-
-1. **消息接收**：
-   - InboxesController 接收 POST 请求
-   - 验证 HTTP 签名
-   - 异步处理消息
-
-2. **消息类型处理**：
-   - `Follow`：创建关注关系
-   - `Undo Follow`：取消关注
-   - `Create`：创建状态
-   - `Delete`：删除状态或账号
-   - `Update`：更新账号信息
-
-3. **状态分发**：
-   - 本地状态：直接通过 `FanOutOnWriteService` 分发
-   - 远端状态：通过 ActivityPub 接收后，同样通过 `FanOutOnWriteService` 分发
-
-## 8. 相关文件索引
-
-| 功能 | 文件路径 |
-|------|----------|
-| List 模型 | `app/models/list.rb` |
-| ListAccount 模型 | `app/models/list_account.rb` |
-| Account 模型 | `app/models/account.rb` |
-| Account 交互关系 | `app/models/concerns/account/interactions.rb` |
-| 列表时间线 API | `app/controllers/api/v1/timelines/list_controller.rb` |
-| 列表管理 API | `app/controllers/api/v1/lists_controller.rb` |
-| 列表账号 API | `app/controllers/api/v1/lists/accounts_controller.rb` |
-| 添加账号到列表服务 | `app/services/add_accounts_to_list_service.rb` |
-| 从列表移除账号服务 | `app/services/remove_accounts_from_list_service.rb` |
-| 时间线管理 | `app/lib/feed_manager.rb` |
-| 状态分发服务 | `app/services/fan_out_on_write_service.rb` |
-| 时间线插入 Worker | `app/workers/feed_insert_worker.rb` |
-| 推送更新 Worker | `app/workers/push_update_worker.rb` |
-| 合并时间线 Worker | `app/workers/merge_worker.rb` |
-| 移除时间线 Worker | `app/workers/unmerge_worker.rb` |
-| 暂停账号服务 | `app/services/suspend_account_service.rb` |
-| 恢复账号服务 | `app/services/unsuspend_account_service.rb` |
-| ActivityPub 入口 | `app/controllers/activitypub/inboxes_controller.rb` |
-| ActivityPub 处理 Worker | `app/workers/activitypub/processing_worker.rb` |
-| ActivityPub Follow 处理 | `app/lib/activitypub/activity/follow.rb` |
-| ActivityPub Undo 处理 | `app/lib/activitypub/activity/undo.rb` |
-| Streaming API 服务 | `streaming/index.js` |
+| 功能 | 文件路径 | 关键代码行 |
+|------|----------|-----------|
+| ListAccount 模型 | `app/models/list_account.rb` | 整个文件 |
+| FollowRequest 授权 | `app/models/follow_request.rb` | 34-46 行 |
+| 数据库外键约束 | `db/schema.rb` | 1528-1531 行 |
+| UnfollowService | `app/services/unfollow_service.rb` | 25-49 行 |
+| AddAccountsToListService | `app/services/add_accounts_to_list_service.rb` | 整个文件 |
+| RemoveAccountsFromListService | `app/services/remove_accounts_from_list_service.rb` | 整个文件 |
+| lists_for_local_distribution | `app/models/concerns/account/interactions.rb` | 114-119 行 |
+| FanOutOnWriteService | `app/services/fan_out_on_write_service.rb` | 整个文件 |
+| FeedManager.push_to_list | `app/lib/feed_manager.rb` | 206-214 行 |
+| ActivityPub Create 处理 | `app/lib/activitypub/activity/create.rb` | 整个文件 |
+| ActivityPub Undo 处理 | `app/lib/activitypub/activity/undo.rb` | 整个文件 |
+| SuspendAccountService | `app/services/suspend_account_service.rb` | 整个文件 |
+| Streaming API 服务 | `streaming/index.js` | 整个文件 |
