@@ -734,14 +734,29 @@ end
 
 ```ruby
 def following_not_allowed?
-  domain_not_allowed?(@target_account.domain) ||           # 域名被限制
+  domain_not_allowed?(@target_account.domain) ||           # 实例级域名限制
     @target_account.blocking?(@source_account) ||          # 目标屏蔽了源
     @source_account.blocking?(@target_account) ||          # 源屏蔽了目标
     @target_account.moved? ||                               # 目标账户已迁移
     (!@target_account.local? && @target_account.ostatus?) || # 远程账户使用旧协议
-    @source_account.domain_blocking?(@target_account.domain) # 源实例屏蔽了目标域名
+    @source_account.domain_blocking?(@target_account.domain) # 用户级域名屏蔽
 end
 ```
+
+**域名限制判定范围**：
+
+`following_not_allowed?` 包含 6 个检查条件，分为两类域名限制：
+
+| 限制类型 | 检查条件 | 触发条件 | 影响范围 |
+|---------|----------|----------|----------|
+| **实例级域名限制** | `domain_not_allowed?(@target_account.domain)` | 管理员设置的 `DomainBlock.suspend?` 或 `!DomainAllow.allowed?` | 所有用户 |
+| **用户级域名屏蔽** | `@source_account.domain_blocking?(@target_account.domain)` | 用户主动屏蔽该域名 | 仅该用户 |
+
+其他检查条件：
+- `@target_account.blocking?(@source_account)`：目标账户屏蔽了源账户
+- `@source_account.blocking?(@target_account)`：源账户屏蔽了目标账户
+- `@target_account.moved?`：目标账户已迁移
+- `(!@target_account.local? && @target_account.ostatus?)`：远程账户使用已废弃的 OStatus 协议
 
 **远程账户的关注请求投递**：
 
