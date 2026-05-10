@@ -566,11 +566,522 @@ end
 
 ---
 
-## 四、审计记录机制
+## 四、自定义账号动作：带/不带举报上下文的差异
 
-### 4.1 审计视图的组成
+### 4.1 两种进入路径概述
 
-#### 4.1.1 举报详情页审计区域
+#### 4.1.1 路径一：从举报详情页进入（带举报上下文）
+
+**触发位置**: `app/views/admin/reports/_actions.html.haml:45-46`
+
+```haml
+= link_to t('admin.accounts.custom'),
+          new_admin_account_action_path(report.target_account_id, report_id: report.id),
+          class: 'button'
+```
+
+**URL 格式**: `/admin/accounts/:account_id/action/new?report_id=:report_id`
+
+**关键点**: URL 中带有 `report_id` 参数
+
+#### 4.1.2 路径二：从账号管理页进入（不带举报上下文）
+
+**触发位置**: `app/views/admin/accounts/_buttons.html.haml`
+
+```haml
+# 发送警告（仅本地）
+= link_to t('admin.accounts.warn'), 
+          new_admin_account_action_path(account.id, type: 'none'), 
+          class: 'button'
+
+# 其他操作（disable/sensitive/silence/suspend）
+= link_to t('admin.accounts.sensitive'), 
+          new_admin_account_action_path(account.id, type: 'sensitive'), 
+          class: 'button'
+```
+
+**URL 格式**: `/admin/accounts/:account_id/action/new` 或 `/admin/accounts/:account_id/action/new?type=xxx`
+
+**关键点**: URL 中**没有** `report_id` 参数
+
+### 4.2 控制器层面的差异
+
+**控制器**: `app/controllers/admin/account_actions_controller.rb`
+
+#### 4.2.1 初始化差异 (`new` 方法)
+
+```ruby
+def new
+  authorize @account, :show?
+
+  @account_action  = Admin::AccountAction.new(
+    type: params[:type], 
+    report_id: params[:report_id],  # ← 关键：从 URL 参数传入
+    send_email_notification: true, 
+    include_statuses: true
+  )
+  @warning_presets = AccountWarningPreset.all
+end
+```
+
+#### 4.2.2 重定向差异 (`create` 方法)
+
+```ruby
+def create
+  # ... 创建 AccountAction ...
+  
+  if @account_action.save
+    if @account_action.with_report?
+      # 带上下文 → 跳转到举报列表
+      redirect_to admin_reports_path, 
+                  notice: I18n.t('admin.reports.processed_msg', id: resource_params[:report_id])
+    else
+      # 不带上下文 → 跳转到账号详情页
+      redirect_to admin_account_path(@account.id)
+    end
+  end
+end
+```
+
+### 4.3 表单视图层面的差异
+
+**视图**: `app/views/admin/account_actions/new.html.haml`
+
+#### 4.3.1 隐藏字段
+
+```haml
+= simple_form_for @account_action, url: admin_account_action_path(@account.id) do |f|
+  = f.input :report_id,
+            as: :hidden  # ← report_id 作为隐藏字段传递
+```
+
+#### 4.3.2 条件显示的字段
+
+```haml
+- if @account.local?
+  .fields-group
+    = f.input :send_email_notification, as: :boolean
+
+  - if params[:report_id].present?  # ← 仅带上下文时显示
+    .fields-group
+      = f.input :include_statuses, as: :boolean  # 是否包含举报的嘟文
+
+  .fields-group
+    = f.input :warning_preset_id, collection: @warning_presets
+
+  .fields-group
+    = f.input :text, as: :text
+```
+
+**字段显示差异表**:
+
+| 字段 | 带举报上下文 | 不带举报上下文 |
+|------|-------------|---------------|
+| `type`（操作类型） | ✓ | ✓ |
+| `send_email_notification` | ✓（仅本地） | ✓（仅本地） |
+| `include_statuses` | ✓ | ✗ |
+| `warning_preset_id` | ✓（仅本地） | ✓（仅本地） |
+| `text` | ✓（仅本地） | ✓（仅本地） |
+
+### 4.4 核心业务逻辑差异：哪些举报被关闭
+
+**关键模型**: `app/models/admin/account_action.rb`
+
+#### 4.4.1 基类方法
+
+**基类**: `app/models/admin/base_action.rb:35-41`
+
+```ruby
+def report
+  @report ||= Report.find(report_id) if report_id.present?
+end
+
+def with_report?
+  !report.nil?  # report_id 存在且能找到 Report 记录
+end
+```
+
+#### 4.4.2 决定要关闭哪些举报的关键逻辑
+
+**核心方法**: `app/models/admin/account_action.rb:131-137`
+
+```ruby
+def reports
+  @reports ||= if type == 'none'
+                 # 类型为 none（仅警告）:
+                 # - 带上下文 → 只关闭当前举报
+                 # - 不带上下文 → 不关闭任何举报
+                 with_report? ? [report] : []
+               else
+                 # 类型为其他（disable/sensitive/silence/suspend）:
+                 # - 无论是否带上下文 → 关闭该账号所有未解决的举报
+                 target_account.targeted_reports.unresolved
+               end
+end
+```
+
+**逻辑解析图**:
+
+```
+reports 方法调用
+       ↓
+type == 'none'?
+       ├─→ YES (仅警告)
+       │         ↓
+       │    with_report?
+       │         ├─→ YES → 返回 [report] → 只关闭当前举报
+       │         └─→ NO  → 返回 [] → 不关闭任何举报
+       │
+       └─→ NO (disable/sensitive/silence/suspend)
+                 ↓
+            返回 target_account.targeted_reports.unresolved
+                 ↓
+            关闭该账号所有未解决的举报
+```
+
+#### 4.4.3 执行关闭逻辑
+
+**方法**: `app/models/admin/account_action.rb:70-83`
+
+```ruby
+def process_reports!
+  # If we're doing "mark as resolved" on a single report,
+  # then we want to keep other reports open in case they
+  # contain new actionable information.
+  #
+  # Otherwise, we will mark all unresolved reports about
+  # the account as resolved.
+
+  reports.each do |report|
+    authorize(report, :update?)
+    log_action(:resolve, report)      # ← 记录审计日志
+    report.resolve!(current_account)  # ← 设置 action_taken_at
+  end
+end
+```
+
+### 4.5 差异汇总表
+
+假设场景：账号 B 有 3 个未解决的举报 R1、R2、R3
+
+| 操作类型 | 进入路径 | report_id | `reports` 返回值 | 被关闭的举报 |
+|---------|---------|-----------|-----------------|-------------|
+| `none`（仅警告） | 举报详情页 R1 | ✓ R1 | `[R1]` | **仅 R1** |
+| `none`（仅警告） | 账号管理页 | ✗ | `[]` | **无** |
+| `silence` | 举报详情页 R1 | ✓ R1 | `[R1, R2, R3]` | **全部 R1, R2, R3** |
+| `silence` | 账号管理页 | ✗ | `[R1, R2, R3]` | **全部 R1, R2, R3** |
+| `suspend` | 举报详情页 R1 | ✓ R1 | `[R1, R2, R3]` | **全部 R1, R2, R3** |
+| `suspend` | 账号管理页 | ✗ | `[R1, R2, R3]` | **全部 R1, R2, R3** |
+
+**关键发现**:
+1. **只有 `type == 'none'`（仅警告）时，路径差异才影响举报关闭范围**
+2. **实际的限制操作（silence/suspend/sensitive/disable）无论从哪进入，都会关闭该账号所有未解决的举报**
+3. 这是因为：限制操作是对账号整体的处理，应该清理所有相关举报；而仅警告可以是针对单个举报的温和处理
+
+### 4.6 审计记录的差异
+
+#### 4.6.1 AccountWarning (Strike) 的关联
+
+**创建逻辑**: `app/models/admin/base_action.rb:45-53`
+
+```ruby
+def process_strike!(action = type)
+  @warning = target_account.strikes.create!(
+    account: current_account,
+    report: report,           # ← 关联的举报（可能为 nil）
+    action:,
+    text: text_for_warning,
+    status_ids: status_ids    # ← 关联的嘟文
+  )
+end
+```
+
+**status_ids 的计算**: `app/models/admin/account_action.rb:127-129`
+
+```ruby
+def status_ids
+  report.status_ids if with_report? && include_statuses?
+  # 只有带上下文且勾选 include_statuses 时，才会关联嘟文
+end
+```
+
+#### 4.6.2 审计记录点
+
+**执行流程**: `app/models/admin/account_action.rb:45-55`
+
+```ruby
+def process_action!
+  ApplicationRecord.transaction do
+    handle_type!         # 1. 执行限制操作 → 记录操作日志
+    process_strike!      # 2. 创建 AccountWarning
+    create_log!          # 3. 仅 none 类型且有文本时，记录 warning 创建
+    process_reports!     # 4. 关闭举报 → 每个关闭的举报都记录 :resolve
+  end
+
+  process_notification!
+  process_queue!
+end
+```
+
+**各类操作的审计记录**:
+
+| 步骤 | 记录内容 | 条件 |
+|------|---------|------|
+| `handle_type!` | `:disable` → User<br>`:sensitive` → Account<br>`:silence` → Account<br>`:suspend` → Account | 总是 |
+| `create_log!` | `:create` → AccountWarning | 仅 `type == 'none'` 且有自定义文本 |
+| `process_reports!` | `:resolve` → Report | 每个被关闭的举报 |
+
+#### 4.6.3 不同路径下的审计记录对比
+
+**场景**: 账号 B 有 R1、R2、R3 三个未解决举报，从 R1 详情页或账号管理页执行操作
+
+| 操作类型 | 路径 | 审计记录 | 说明 |
+|---------|------|---------|------|
+| `none` + 文本 | 举报详情页 R1 | 1. `:create` → Warning(R1)<br>2. `:resolve` → Report(R1) | 仅警告 + 关闭 R1 |
+| `none` + 文本 | 账号管理页 | 1. `:create` → Warning(nil) | 仅警告，不关闭任何举报 |
+| `silence` | 举报详情页 R1 | 1. `:silence` → Account(B)<br>2. `:resolve` → Report(R1)<br>3. `:resolve` → Report(R2)<br>4. `:resolve` → Report(R3) | 静音 + 关闭所有举报 |
+| `silence` | 账号管理页 | 1. `:silence` → Account(B)<br>2. `:resolve` → Report(R1)<br>3. `:resolve` → Report(R2)<br>4. `:resolve` → Report(R3) | **完全相同** |
+| `suspend` | 举报详情页 R1 | 1. `:suspend` → Account(B)<br>2. `:resolve` → Report(R1)<br>3. `:resolve` → Report(R2)<br>4. `:resolve` → Report(R3) | 暂停 + 关闭所有举报 |
+| `suspend` | 账号管理页 | 1. `:suspend` → Account(B)<br>2. `:resolve` → Report(R1)<br>3. `:resolve` → Report(R2)<br>4. `:resolve` → Report(R3) | **完全相同** |
+
+### 4.7 页面展示的差异
+
+#### 4.7.1 举报详情页的审计视图
+
+**视图**: `app/views/admin/reports/show.html.haml:89-105`
+
+```haml
+- unless @action_logs.empty?
+  %h3= t 'admin.reports.action_log'
+  .report-notes
+    = render @action_logs       # Admin::ActionLog
+
+%hr.spacer/
+
+%h3= t 'admin.reports.notes.title'
+.report-notes
+  = render @report_notes        # ReportNote
+```
+
+**数据来源**: `app/controllers/admin/reports_controller.rb:15-17`
+
+```ruby
+def show
+  @report_notes = @report.notes.chronological.includes(:account)  # 该举报的备注
+  @action_logs  = @report.history.includes(:target)               # 该举报关联的操作日志
+end
+```
+
+#### 4.7.2 `Report#history` 的组成
+
+**方法**: `app/models/report.rb:138-162`
+
+```ruby
+def history
+  subquery = [
+    # 1. 举报本身的操作（分配、解决等）
+    Admin::ActionLog.where(target_type: 'Report', target_id: id),
+    
+    # 2. 被举报账号的操作（静音、暂停等）
+    Admin::ActionLog.where(target_type: 'Account', target_id: target_account_id),
+    
+    # 3. 被举报嘟文的操作
+    Admin::ActionLog.where(target_type: 'Status', target_id: status_ids),
+    
+    # 4. 与该举报关联的警告
+    Admin::ActionLog.where(
+      target_type: 'AccountWarning',
+      target_id: AccountWarning.where(report_id: id).select(:id)
+    ),
+  ].reduce { |union, query| Arel::Nodes::UnionAll.new(union, query) }
+
+  Admin::ActionLog.latest.from(Arel::Nodes::As.new(subquery, Admin::ActionLog.arel_table))
+end
+```
+
+#### 4.7.3 不同路径下的展示对比
+
+**场景**: 从 R1 详情页进入执行 `none` 警告（带文本），vs 从账号管理页执行
+
+| 内容 | 从 R1 进入执行 none | 从账号页进入执行 none |
+|------|---------------------|---------------------|
+| **R1 详情页 Action Logs** | 1. `:create` → Warning(R1)<br>2. `:resolve` → Report(R1) | **不会显示**（Warning 不关联 R1） |
+| **R1 详情页 Notes** | 无变化 | 无变化 |
+| **账号页 Strikes 列表** | 显示 Warning（关联 R1） | 显示 Warning（无关联举报） |
+| **R1 的 AccountWarning 关联** | `warning.report_id = R1.id` | `warning.report_id = nil` |
+| **R1 状态** | `action_taken_at: 现在` | `action_taken_at: nil`（仍未解决） |
+
+### 4.8 最小可复核流程对照
+
+#### 4.8.1 场景设定
+
+**前置条件**:
+- 账号 B 有 3 个未解决举报：R1、R2、R3
+- R1 关联嘟文 S1、S2
+- 管理员 M 执行操作
+
+#### 4.8.2 流程一：从举报详情页 R1 执行仅警告 (`type=none`)
+
+**执行步骤**:
+
+| 步骤 | 操作 | 代码路径 | 预期结果 |
+|------|------|---------|---------|
+| 1 | 访问 R1 详情页点击"自定义" | `_actions.html.haml:45` | 跳转至 `/admin/accounts/B/action/new?report_id=R1` |
+| 2 | 表单中 `report_id` 作为隐藏字段 | `new.html.haml:12-13` | `report_id = R1` |
+| 3 | 选择操作类型 `none`，填写文本 | `new.html.haml:16-23` | `type = 'none'` |
+| 4 | 勾选 `include_statuses`（显示因为有 report_id） | `new.html.haml:33-37` | `include_statuses = true` |
+| 5 | 提交表单 | `account_actions_controller#create` | 创建 AccountAction |
+
+**数据变化验证**:
+
+| 验证项 | SQL 查询 | 预期值 |
+|--------|----------|--------|
+| AccountWarning 关联 | `SELECT report_id FROM account_warnings ORDER BY id DESC LIMIT 1` | `R1` |
+| AccountWarning 嘟文 | `SELECT status_ids FROM account_warnings ORDER BY id DESC LIMIT 1` | `[S1, S2]` |
+| R1 状态 | `SELECT action_taken_at FROM reports WHERE id = R1` | **NOT NULL** |
+| R2 状态 | `SELECT action_taken_at FROM reports WHERE id = R2` | **NULL** |
+| R3 状态 | `SELECT action_taken_at FROM reports WHERE id = R3` | **NULL** |
+| Action Log 数量 | `SELECT COUNT(*) FROM admin_action_logs WHERE target_type = 'Report' AND target_id IN (R1,R2,R3)` | **1**（仅 R1） |
+
+**R1 详情页展示**:
+```
+操作日志 (Action Logs):
+  1. admin 创建了警告 #W1
+  2. admin 解决了举报 #R1
+
+备注 (Notes):
+  (空)
+```
+
+#### 4.8.3 流程二：从账号管理页执行仅警告 (`type=none`)
+
+**执行步骤**:
+
+| 步骤 | 操作 | 代码路径 | 预期结果 |
+|------|------|---------|---------|
+| 1 | 访问账号 B 详情页点击"发送警告" | `_buttons.html.haml:15` | 跳转至 `/admin/accounts/B/action/new?type=none` |
+| 2 | 表单中无 `report_id` 隐藏字段 | `new.html.haml:12-13` | `report_id = nil` |
+| 3 | 操作类型已预设为 `none` | `new.html.haml:16-23` | `type = 'none'` |
+| 4 | **不显示** `include_statuses` 选项 | `new.html.haml:33-37` | 条件 `params[:report_id].present?` 不满足 |
+| 5 | 提交表单 | `account_actions_controller#create` | 创建 AccountAction |
+
+**数据变化验证**:
+
+| 验证项 | SQL 查询 | 预期值 |
+|--------|----------|--------|
+| AccountWarning 关联 | `SELECT report_id FROM account_warnings ORDER BY id DESC LIMIT 1` | **NULL** |
+| AccountWarning 嘟文 | `SELECT status_ids FROM account_warnings ORDER BY id DESC LIMIT 1` | **NULL** |
+| R1 状态 | `SELECT action_taken_at FROM reports WHERE id = R1` | **NULL**（仍未解决） |
+| R2 状态 | `SELECT action_taken_at FROM reports WHERE id = R2` | **NULL** |
+| R3 状态 | `SELECT action_taken_at FROM reports WHERE id = R3` | **NULL** |
+| Action Log 数量 | `SELECT COUNT(*) FROM admin_action_logs WHERE target_type = 'Report' AND target_id IN (R1,R2,R3)` | **0** |
+
+**R1 详情页展示**:
+```
+操作日志 (Action Logs):
+  (空，因为 Warning 不关联 R1)
+
+备注 (Notes):
+  (空)
+```
+
+**账号页 Strikes 列表展示**:
+```
+之前的警告 (Previous Strikes):
+  · 警告 - 无关联举报（自定义文本内容）
+```
+
+#### 4.8.4 流程三：从举报详情页 R1 执行静音 (`type=silence`)
+
+**执行步骤**:
+
+| 步骤 | 操作 | 代码路径 | 预期结果 |
+|------|------|---------|---------|
+| 1 | 访问 R1 详情页点击"自定义" | `_actions.html.haml:45` | 跳转至 `/admin/accounts/B/action/new?report_id=R1` |
+| 2 | 选择操作类型 `silence` | `new.html.haml:16-23` | `type = 'silence'` |
+| 3 | 勾选 `include_statuses` | `new.html.haml:33-37` | `include_statuses = true` |
+| 4 | 提交表单 | `account_actions_controller#create` | 创建 AccountAction |
+
+**数据变化验证**:
+
+| 验证项 | SQL 查询 | 预期值 |
+|--------|----------|--------|
+| 账号状态 | `SELECT silenced_at FROM accounts WHERE id = B` | **NOT NULL** |
+| AccountWarning 关联 | `SELECT report_id FROM account_warnings ORDER BY id DESC LIMIT 1` | `R1` |
+| AccountWarning 嘟文 | `SELECT status_ids FROM account_warnings ORDER BY id DESC LIMIT 1` | `[S1, S2]` |
+| R1 状态 | `SELECT action_taken_at FROM reports WHERE id = R1` | **NOT NULL** |
+| R2 状态 | `SELECT action_taken_at FROM reports WHERE id = R2` | **NOT NULL** |
+| R3 状态 | `SELECT action_taken_at FROM reports WHERE id = R3` | **NOT NULL** |
+| Action Log 数量 | `SELECT COUNT(*) FROM admin_action_logs WHERE target_type = 'Report' AND target_id IN (R1,R2,R3)` | **3**（全部关闭） |
+
+**R1 详情页展示**:
+```
+操作日志 (Action Logs):
+  1. admin 静音了账号 @bob@example.com
+  2. admin 解决了举报 #R3
+  3. admin 解决了举报 #R2
+  4. admin 解决了举报 #R1
+  (按倒序排列，最新的在最前)
+
+备注 (Notes):
+  (空)
+```
+
+#### 4.8.5 流程四：从账号管理页执行静音 (`type=silence`)
+
+**执行步骤**:
+
+| 步骤 | 操作 | 代码路径 | 预期结果 |
+|------|------|---------|---------|
+| 1 | 访问账号 B 详情页点击"静音" | `_buttons.html.haml:27` | 跳转至 `/admin/accounts/B/action/new?type=silence` |
+| 2 | 操作类型已预设为 `silence` | `new.html.haml:16-23` | `type = 'silence'` |
+| 3 | **不显示** `include_statuses` 选项 | `new.html.haml:33-37` | 无 report_id |
+| 4 | 提交表单 | `account_actions_controller#create` | 创建 AccountAction |
+
+**数据变化验证**:
+
+| 验证项 | SQL 查询 | 预期值 |
+|--------|----------|--------|
+| 账号状态 | `SELECT silenced_at FROM accounts WHERE id = B` | **NOT NULL** |
+| AccountWarning 关联 | `SELECT report_id FROM account_warnings ORDER BY id DESC LIMIT 1` | **NULL** |
+| AccountWarning 嘟文 | `SELECT status_ids FROM account_warnings ORDER BY id DESC LIMIT 1` | **NULL** |
+| R1 状态 | `SELECT action_taken_at FROM reports WHERE id = R1` | **NOT NULL** |
+| R2 状态 | `SELECT action_taken_at FROM reports WHERE id = R2` | **NOT NULL** |
+| R3 状态 | `SELECT action_taken_at FROM reports WHERE id = R3` | **NOT NULL** |
+| Action Log 数量 | `SELECT COUNT(*) FROM admin_action_logs WHERE target_type = 'Report' AND target_id IN (R1,R2,R3)` | **3**（全部关闭） |
+
+**R1 详情页展示**:
+```
+操作日志 (Action Logs):
+  1. admin 静音了账号 @bob@example.com
+  2. admin 解决了举报 #R3
+  3. admin 解决了举报 #R2
+  4. admin 解决了举报 #R1
+  (与流程三完全相同)
+
+备注 (Notes):
+  (空)
+```
+
+#### 4.8.6 四种流程对比总结
+
+| 对比项 | 流程一<br>举报页+none | 流程二<br>账号页+none | 流程三<br>举报页+silence | 流程四<br>账号页+silence |
+|--------|---------------------|---------------------|-------------------------|-------------------------|
+| `report_id` | ✓ R1 | ✗ | ✓ R1 | ✗ |
+| 账号限制 | 无 | 无 | 静音 | 静音 |
+| 关闭举报数 | 仅 R1 | 无 | R1+R2+R3 | R1+R2+R3 |
+| Warning 关联 R1 | ✓ | ✗ | ✓ | ✗ |
+| Warning 含嘟文 | ✓ S1,S2 | ✗ | ✓ S1,S2 | ✗ |
+| R1 详情页日志 | 显示 Warning 创建+R1 解决 | 不显示 | 显示静音+3 个举报解决 | 显示静音+3 个举报解决 |
+| 重定向目标 | `/admin/reports` | `/admin/accounts/B` | `/admin/reports` | `/admin/accounts/B` |
+
+---
+
+## 五、审计记录机制
+
+### 5.1 审计视图的组成
+
+#### 5.1.1 举报详情页审计区域
 
 **视图**: `app/views/admin/reports/show.html.haml:89-105`
 
@@ -597,7 +1108,7 @@ end
 1. **Action Logs (操作日志)**: 结构化的管理员操作记录
 2. **Notes (备注)**: 管理员自由文本备注
 
-#### 4.1.2 操作日志 (Action Logs)
+#### 5.1.2 操作日志 (Action Logs)
 
 **控制器赋值**: `app/controllers/admin/reports_controller.rb:17`
 
@@ -647,7 +1158,7 @@ end
 | 关联嘟文 | `Status` | destroy, update |
 | 关联警告 | `AccountWarning` | create |
 
-#### 4.1.3 备注 (Notes)
+#### 5.1.3 备注 (Notes)
 
 **举报备注模型**: `app/models/report_note.rb`
 
@@ -697,7 +1208,7 @@ end
 | 创建并重新打开 | 创建备注 + 重新打开举报 + 记录 reopen 操作日志 |
 | 仅创建 | 仅创建备注，不改变举报状态 |
 
-#### 4.1.4 账号管理页的备注系统
+#### 5.1.4 账号管理页的备注系统
 
 **账号审核备注模型**: `app/models/account_moderation_note.rb`
 
@@ -721,7 +1232,7 @@ end
 - 不改变账号状态
 - 仅用于记录账号相关的审核信息
 
-#### 4.1.5 Notes 与 Action Logs 对比
+#### 5.1.5 Notes 与 Action Logs 对比
 
 | 特性 | Notes (备注) | Action Logs (操作日志) |
 |------|-------------|----------------------|
@@ -734,7 +1245,7 @@ end
 | **关联对象** | 举报 或 账号 | 任意多态对象 |
 | **审计覆盖** | 人工补充信息 | 系统自动记录所有操作 |
 
-### 4.2 审计记录模型
+### 5.2 审计记录模型
 
 **模型**: `app/models/admin/action_log.rb`
 
@@ -753,7 +1264,7 @@ end
 | `route_param` | 路由参数 |
 | `created_at` | 操作时间 |
 
-### 4.3 记录创建方式
+### 5.3 记录创建方式
 
 **Concern**: `app/controllers/concerns/accountable_concern.rb`
 
@@ -770,9 +1281,9 @@ end
 2. `set_route_param`: 调用目标对象的 `to_log_route_param`
 3. `set_permalink`: 调用目标对象的 `to_log_permalink`
 
-### 4.4 审计记录点总览
+### 5.4 审计记录点总览
 
-#### 4.4.1 举报相关的记录点
+#### 5.4.1 举报相关的记录点
 
 **举报控制器**: `app/controllers/admin/reports_controller.rb`
 
@@ -790,7 +1301,7 @@ end
 | 创建备注并解决 | `:resolve` | Report |
 | 创建备注并重新打开 | `:reopen` | Report |
 
-#### 4.4.2 账号操作相关的记录点
+#### 5.4.2 账号操作相关的记录点
 
 **账号操作模型**: `app/models/admin/account_action.rb`
 
@@ -818,7 +1329,7 @@ end
 | 移除头部 | `:remove_header` | User |
 | 解除邮箱封锁 | `:unblock_email` | Account |
 
-#### 4.4.3 嘟文操作相关的记录点
+#### 5.4.3 嘟文操作相关的记录点
 
 **嘟文操作模型**: `app/models/admin/moderation_action.rb`
 
@@ -832,9 +1343,9 @@ end
 
 ---
 
-## 五、本地审核与远端账号处理的边界
+## 六、本地审核与远端账号处理的边界
 
-### 5.1 本地/远端账号判断标准
+### 6.1 本地/远端账号判断标准
 
 **判断逻辑**: `app/models/account.rb:208-214`
 
@@ -848,7 +1359,7 @@ def remote?
 end
 ```
 
-### 5.2 举报阶段的差异
+### 6.2 举报阶段的差异
 
 **举报转发机制**: `app/services/report_service.rb:71-81`
 
@@ -868,9 +1379,9 @@ end
 - **本地举报人**: 使用严格的可见性过滤 `AccountStatusesFilter`
 - **远端举报人**: 放宽可见性检查（因为可能已匿名化）
 
-### 5.3 审核操作的边界
+### 6.3 审核操作的边界
 
-#### 5.3.1 可用操作类型差异
+#### 6.3.1 可用操作类型差异
 
 | 操作类型 | 本地账号 | 远端账号 | 说明 |
 |---------|---------|---------|------|
@@ -880,7 +1391,7 @@ end
 | `silence` | ✓ | ✓ | 仅影响本地显示和传播 |
 | `suspend` | ✓ | ✓ | 本地封禁，远端账号仍可在原实例使用 |
 
-#### 5.3.2 暂停操作的深层差异
+#### 6.3.2 暂停操作的深层差异
 
 **暂停来源标记**: `app/models/concerns/account/suspensions.rb:16-18`
 
@@ -915,7 +1426,7 @@ def distribute_update_actor!
 end
 ```
 
-#### 5.3.3 嘟文处理差异
+#### 6.3.3 嘟文处理差异
 
 **删除操作**: `app/models/admin/moderation_action.rb:45-51`
 
@@ -943,7 +1454,7 @@ end
 - 本地账号: 调用完整服务，可能触发联邦更新
 - 远端账号: 直接更新本地数据库，不影响原实例
 
-#### 5.3.4 通知差异
+#### 6.3.4 通知差异
 
 **警告通知**: `app/models/admin/base_action.rb:62-64`
 
@@ -955,7 +1466,7 @@ end
 - 本地账号: 发送邮件和站内通知
 - 远端账号: 无法发送通知（没有本地 User 记录）
 
-### 5.4 处理边界总结
+### 6.4 处理边界总结
 
 | 能力维度 | 本地账号 | 远端账号 |
 |---------|---------|---------|
@@ -975,9 +1486,9 @@ end
 
 ---
 
-## 六、端到端处理时间线
+## 七、端到端处理时间线
 
-### 6.1 场景设定
+### 7.1 场景设定
 
 **角色**:
 - 用户 A: 本地用户 (@alice@local.example)
@@ -988,7 +1499,7 @@ end
 
 ---
 
-### 6.2 详细时间线
+### 7.2 详细时间线
 
 #### T1: 用户提交举报
 
@@ -1264,7 +1775,7 @@ end
 
 ---
 
-### 6.3 时间线可视化
+### 7.3 时间线可视化
 
 ```
 时间轴: T1 ────────── T2 ───────── T3 ───────── T4 ───────── T5 ───────── T6
@@ -1282,7 +1793,7 @@ end
                                        (不改变状态)        (自动记录)
 ```
 
-### 6.4 关键时间点的数据变化
+### 7.4 关键时间点的数据变化
 
 | 时间点 | Report#R1 | ActionLog | ReportNote | Account#B |
 |-------|-----------|-----------|------------|-----------|
@@ -1292,7 +1803,7 @@ end
 | T5 | 不变 | 不变 | 不变 | 后台清理完成 |
 | T6 | 不变 | 不变 | 不变 | 已暂停 |
 
-### 6.5 远端账号 B 的实际状态
+### 7.5 远端账号 B 的实际状态
 
 **在本地实例 (local.example)**:
 - B 已被暂停 (`suspended_at` 已设置)
