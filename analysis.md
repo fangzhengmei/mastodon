@@ -518,7 +518,9 @@ add(tag, status.account_id, at_time) if tag.usable?
 
 ### 5.4 Listable 标志的影响
 
-搜索功能过滤：
+**重要澄清：`listable` 仅影响搜索发现能力，不影响趋势展示！**
+
+#### 5.4.1 搜索功能过滤
 
 `app/models/tag.rb:130-141`：
 
@@ -531,7 +533,33 @@ def search_for(term, limit = 5, offset = 0, options = {})
 end
 ```
 
-默认情况下，`listable = false` 的 tag 不会出现在搜索结果中。
+默认情况下，`listable = false` 的 tag 不会出现在数据库搜索结果中。
+
+#### 5.4.2 Elasticsearch 索引范围
+
+`app/chewy/tags_index.rb:37`：
+
+```ruby
+index_scope ::Tag.listable
+```
+
+Elasticsearch 索引只包含 `listable` 为 true 或 nil 的 tag。这意味着：
+
+- **当 `Chewy.enabled?` 为 true 时（启用 ES）：`listable = false` 的 tag 不会被索引，无法通过搜索找到
+- **当 ES 不可用时**：回退到数据库 `Tag.search_for`，同样应用 `Tag.listable` 过滤
+
+#### 5.4.3 Listable 不影响趋势
+
+在以下链路中，**无任何 `listable` 检查：
+
+| 链路 | 检查的标志位 | 代码位置 |
+|------|---------------|-----------|
+| 发帖验证 | `usable` | `disallowed_hashtags_validator.rb:7` |
+| 趋势注册 | `usable` | `trends/tags.rb:37` |
+| 趋势计算 | 无 | `trends/tags.rb:50-66` |
+| 趋势展示 | `trendable` (通过 `allowed`) | `trends/tags.rb:16-31` |
+
+**关键结论**：一个 `listable = false` 但 `trendable = true` 的 tag，**完全可以正常进入趋势榜并在探索页展示**。用户只是无法通过搜索功能找到这个 hashtag。
 
 ### 5.5 Trendable 标志的影响
 
