@@ -523,9 +523,9 @@ add(tag, status.account_id, at_time) if tag.usable?
 
 ### 5.4 Listable 标志的影响
 
-**重要澄清：`listable` 仅影响搜索发现能力，不影响趋势展示！**
+**重要澄清：`listable` 主要影响搜索发现能力，不影响趋势展示！但在 Elasticsearch 搜索路径下存在例外情况。**
 
-#### 5.4.1 搜索功能过滤
+#### 5.4.1 数据库搜索路径
 
 `app/models/tag.rb:130-141`：
 
@@ -538,9 +538,9 @@ def search_for(term, limit = 5, offset = 0, options = {})
 end
 ```
 
-默认情况下，`listable = false` 的 tag 不会出现在数据库搜索结果中。
+当 ES 不可用时，直接使用数据库搜索，`listable = false` 的 tag **不会出现在搜索结果中**。
 
-#### 5.4.2 Elasticsearch 索引范围
+#### 5.4.2 Elasticsearch 索引范围（主路径）
 
 `app/chewy/tags_index.rb:37`：
 
@@ -548,12 +548,58 @@ end
 index_scope ::Tag.listable
 ```
 
-Elasticsearch 索引只包含 `listable` 为 true 或 nil 的 tag。这意味着：
+Elasticsearch 索引只包含 `listable` 为 true 或 nil 的 tag。因此：
 
-- **当 `Chewy.enabled?` 为 true 时（启用 ES）：`listable = false` 的 tag 不会被索引，无法通过搜索找到
-- **当 ES 不可用时**：回退到数据库 `Tag.search_for`，同样应用 `Tag.listable` 过滤
+- `listable = false` 的 tag **不会被索引**到 ES 中
+- ES 搜索时无法通过模糊匹配找到这些 tag
 
-#### 5.4.3 Listable 不影响趋势
+#### 5.4.3 ES 搜索的例外：Exact Match 兜底逻辑
+
+**这是最重要的例外情况！**
+
+`app/services/tag_search_service.rb:39-51` 的 `ensure_exact_match` 方法：
+
+```ruby
+def ensure_exact_match(results)
+  return results unless @offset.nil? || @offset.zero?
+
+  normalized_query = Tag.normalize_value_for(:name, @query)
+  exact_match = results.find { |tag| tag.name.downcase == normalized_query }
+  exact_match ||= Tag.find_normalized(normalized_query)  # ⚠️ 无任何过滤！
+  unless exact_match.nil?
+    results.delete(exact_match)
+    results = [exact_match] + results
+  end
+  results
+end
+```
+
+`Tag.find_normalized` 方法（`tag.rb:143-145`）：
+
+```ruby
+def find_normalized(name)
+  matching_name(name).first  # 只做名称匹配，不检查 listable、usable、trendable
+end
+```
+
+**逻辑分析：**
+
+1. 当用户搜索时，如果 ES 结果中没有 exact match
+2. 系统会调用 `Tag.find_normalized` **直接从数据库**精确查找
+3. 这个查找**完全没有过滤** —— 不检查 `listable`，也不检查 `usable`
+4. 如果找到了，会把它**插入到结果最前面**
+
+**触发条件：**
+- `Chewy.enabled? = true`（启用了 ES）
+- 用户进行的是**精确搜索**（名字完全匹配）
+- 搜索结果是**第一页**（`offset = 0` 或 `nil`）
+
+**实际影响：**
+- 一个 `listable = false` 的 tag，虽然不在 ES 索引中
+- 但如果用户**精确搜索它的名字**，仍然会被找到
+- 并且会**排到结果第一位**
+
+#### 5.4.4 Listable 不影响趋势
 
 在以下链路中，**无任何 `listable` 检查：
 
@@ -564,7 +610,10 @@ Elasticsearch 索引只包含 `listable` 为 true 或 nil 的 tag。这意味着
 | 趋势计算 | 无 | `trends/tags.rb:50-66` |
 | 趋势展示 | `trendable` (通过 `allowed`) | `trends/tags.rb:16-31` |
 
-**关键结论**：一个 `listable = false` 但 `trendable = true` 的 tag，**完全可以正常进入趋势榜并在探索页展示**。用户只是无法通过搜索功能找到这个 hashtag。
+**关键结论**：一个 `listable = false` 但 `trendable = true` 的 tag，**完全可以正常进入趋势榜并在探索页展示**。对于搜索发现：
+- **数据库搜索路径**：无法被搜索到
+- **ES 搜索路径（模糊匹配）**：无法被搜索到
+- **ES 搜索路径（精确匹配 + 第一页）**：**可以被搜索到**（例外情况）
 
 ### 5.5 Trendable 标志的影响
 
@@ -766,11 +815,13 @@ Mastodon 的 hashtag 趋势系统设计体现了以下特点：
 1. **技术先进性**：使用 Redis HyperLogLog 进行高效去重计数，使用卡方统计量检测异常增长，使用指数衰减处理热度消退
 
 2. **审核灵活性**：三级标志位（usable、listable、trendable）提供精细的内容控制粒度，**三条链路完全解耦**：
-   - `usable` 控制发帖和趋势计数
+   - `usable` 控制发帖和趋势计数，**不影响搜索可见性**
    - `listable` 仅控制搜索（含 ES 索引），**不影响趋势**
    - `trendable` 仅控制趋势展示，**不影响搜索**
    
-   ⚠️ **重要澄清**：设置 `listable = false` 不会阻止 hashtag 上趋势榜！
+   ⚠️ **两个重要澄清**：
+   - 设置 `listable = false` 不会阻止 hashtag 上趋势榜（场景 3 可证明）
+   - 设置 `usable = false` 不会阻止 hashtag 被搜索到（场景 5a 可证明）
 
 3. **隐私保护**：默认 `trendable_by_default = false`，需要人工审核才能上趋势榜，防止算法滥用
 
