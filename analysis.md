@@ -458,13 +458,13 @@ Explore/Tags 组件渲染
 
 ### 5.1 Tag 的三级审核标志
 
-`app/models/tag.rb` 定义了三个关键标志位：
+`app/models/tag.rb` 定义了三个**独立的**标志位，各自控制不同的发现渠道，**互不影响**：
 
 | 标志位 | 默认值 | 控制范围 | 影响 |
 |--------|--------|----------|------|
-| `usable` | `true` | 发帖时 | 禁止使用该 hashtag 发帖 |
-| `listable` | `true` | 搜索时 | 不出现在搜索结果和自动补全中 |
-| `trendable` | 依赖 `Setting.trendable_by_default` | 趋势榜 | 无法进入趋势榜 |
+| `usable` | `true` | 发帖验证 + 趋势计数 | 禁止使用该 hashtag 发帖，且不计入趋势统计 |
+| `listable` | `true` | 搜索功能（数据库搜索 + ES 索引） | 不出现在搜索结果中，但**不影响趋势** |
+| `trendable` | 依赖 `Setting.trendable_by_default` | 趋势展示 | 决定能否在探索页的趋势榜中显示 |
 
 ```ruby
 scope :usable, -> { where(usable: [true, nil]) }
@@ -473,6 +473,11 @@ scope :trendable, -> {
   Setting.trendable_by_default ? where(trendable: [true, nil]) : where(trendable: true) 
 }
 ```
+
+**关键设计原则：**
+- 三个标志位是**完全独立**的
+- 每个标志位控制一个独立的发现渠道
+- 不存在级联影响（如 `listable` 不影响 `trendable`）
 
 ### 5.2 默认设置
 
@@ -694,7 +699,8 @@ end
 | **场景 2** | `usable=true, listable=true, trendable=false` | ✅ 允许 | ✅ 可见 | ❌ 需审核（`allowed=false`） |
 | **场景 3** | `usable=true, listable=false, trendable=true` | ✅ 允许 | ❌ 搜索隐藏 | ✅ **正常上趋势** ⭐ |
 | **场景 4** | `usable=true, listable=false, trendable=false` | ✅ 允许 | ❌ 搜索隐藏 | ❌ 需审核 |
-| **场景 5** | `usable=false, listable=任意, trendable=任意` | ❌ 禁止 | N/A | ❌ 不计入趋势 |
+| **场景 5a** | `usable=false, listable=true, trendable=任意` | ❌ 禁止 | ✅ 仍可见 | ❌ 不计入趋势 |
+| **场景 5b** | `usable=false, listable=false, trendable=任意` | ❌ 禁止 | ❌ 搜索隐藏 | ❌ 不计入趋势 |
 
 #### 5.8.2 关键发现（与代码一致）
 
@@ -702,6 +708,11 @@ end
 - 一个 tag 被设置为 `listable = false`，但 `trendable = true`
 - **用户无法通过搜索找到它**（ES 不索引、数据库搜索过滤）
 - **但它可以正常出现在趋势榜上**（趋势链路无 listable 检查）
+
+**场景 5a/5b 的关键发现：**
+- `usable = false` 只影响"能否发帖使用"和"能否计入趋势"
+- **搜索可见性完全由 `listable` 决定，与 `usable` 无关**
+- 即使一个 tag 被禁用（`usable=false`），只要 `listable=true`，用户仍然可以搜索到它
 
 **代码依据：**
 
@@ -711,8 +722,8 @@ end
 | 趋势注册 | `usable` | `trends/tags.rb:37` | `if tag.usable?` |
 | 趋势计算 | 无任何检查 | `trends/tags.rb:50-66` | 直接从 `recently_used_ids` 获取 |
 | 趋势展示 | `trendable` | `trends/tags.rb:125` | `allowed: tag.trendable?` |
-| 搜索（DB） | `listable` | `tag.rb:135` | `query.merge(Tag.listable)` |
-| 搜索（ES） | `listable` | `tags_index.rb:37` | `index_scope ::Tag.listable` |
+| 搜索（DB） | `listable` | `tag.rb:135` | `query.merge(Tag.listable)` — **无 usable 检查** |
+| 搜索（ES） | `listable` | `tags_index.rb:37` | `index_scope ::Tag.listable` — **无 usable 检查** |
 
 #### 5.8.3 三条链路的独立性总结
 
