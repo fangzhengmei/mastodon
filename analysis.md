@@ -686,12 +686,50 @@ end
 
 ### 5.8 审核策略对发现能力的综合影响
 
-| 场景 | usable=true listable=true trendable=true | usable=true listable=true trendable=false | usable=true listable=false | usable=false |
-|------|------------------------------------------|------------------------------------------|---------------------------|--------------|
-| 发帖使用 | ✅ 允许 | ✅ 允许 | ✅ 允许 | ❌ 禁止 |
-| 搜索发现 | ✅ 可见 | ✅ 可见 | ❌ 隐藏 | ❌ 隐藏 |
-| 趋势榜单 | ✅ 允许 | ❌ 需审核 | ❌ 需审核 | ❌ 禁止 |
-| 公开发现能力 | 完全开放 | 发帖可用但无法上趋势 | 发帖可用但无法被搜索 | 完全禁止 |
+#### 5.8.1 完整场景矩阵（按代码事实）
+
+| 场景 | 标志位组合 | 发帖使用 | 搜索发现 | 趋势榜单 |
+|------|------------|-----------|-----------|-----------|
+| **场景 1** | `usable=true, listable=true, trendable=true` | ✅ 允许 | ✅ 可见 | ✅ 正常展示 |
+| **场景 2** | `usable=true, listable=true, trendable=false` | ✅ 允许 | ✅ 可见 | ❌ 需审核（`allowed=false`） |
+| **场景 3** | `usable=true, listable=false, trendable=true` | ✅ 允许 | ❌ 搜索隐藏 | ✅ **正常上趋势** ⭐ |
+| **场景 4** | `usable=true, listable=false, trendable=false` | ✅ 允许 | ❌ 搜索隐藏 | ❌ 需审核 |
+| **场景 5** | `usable=false, listable=任意, trendable=任意` | ❌ 禁止 | N/A | ❌ 不计入趋势 |
+
+#### 5.8.2 关键发现（与代码一致）
+
+**场景 3 是最重要的发现：**
+- 一个 tag 被设置为 `listable = false`，但 `trendable = true`
+- **用户无法通过搜索找到它**（ES 不索引、数据库搜索过滤）
+- **但它可以正常出现在趋势榜上**（趋势链路无 listable 检查）
+
+**代码依据：**
+
+| 链路 | 检查的标志位 | 代码位置 | 结论 |
+|------|---------------|-----------|------|
+| 发帖验证 | `usable` | `disallowed_hashtags_validator.rb:7` | `reject(&:usable?)` |
+| 趋势注册 | `usable` | `trends/tags.rb:37` | `if tag.usable?` |
+| 趋势计算 | 无任何检查 | `trends/tags.rb:50-66` | 直接从 `recently_used_ids` 获取 |
+| 趋势展示 | `trendable` | `trends/tags.rb:125` | `allowed: tag.trendable?` |
+| 搜索（DB） | `listable` | `tag.rb:135` | `query.merge(Tag.listable)` |
+| 搜索（ES） | `listable` | `tags_index.rb:37` | `index_scope ::Tag.listable` |
+
+#### 5.8.3 三条链路的独立性总结
+
+**三条链路完全解耦，互不影响：**
+
+```
+usable  ──→  发帖验证 + 趋势计数
+
+listable ──→  搜索功能（含 Elasticsearch 索引）
+
+trendable ──→ 趋势展示（通过 TagTrend.allowed）
+```
+
+**结论：**
+- 管理员可以单独控制"能否发帖使用"、"能否被搜索"、"能否上趋势"
+- `listable = false` **绝不会**阻止 hashtag 上趋势榜（场景 3 完全合法）
+- 只有 `trendable = false` 会阻止趋势展示
 
 ### 5.9 实例级别的发现控制
 
@@ -716,7 +754,12 @@ Mastodon 的 hashtag 趋势系统设计体现了以下特点：
 
 1. **技术先进性**：使用 Redis HyperLogLog 进行高效去重计数，使用卡方统计量检测异常增长，使用指数衰减处理热度消退
 
-2. **审核灵活性**：三级标志位（usable、listable、trendable）提供精细的内容控制粒度
+2. **审核灵活性**：三级标志位（usable、listable、trendable）提供精细的内容控制粒度，**三条链路完全解耦**：
+   - `usable` 控制发帖和趋势计数
+   - `listable` 仅控制搜索（含 ES 索引），**不影响趋势**
+   - `trendable` 仅控制趋势展示，**不影响搜索**
+   
+   ⚠️ **重要澄清**：设置 `listable = false` 不会阻止 hashtag 上趋势榜！
 
 3. **隐私保护**：默认 `trendable_by_default = false`，需要人工审核才能上趋势榜，防止算法滥用
 
