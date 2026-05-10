@@ -585,21 +585,54 @@ end
 
 **远端账号表单字段对比**：
 
-| 字段 | 带举报上下文 (report_id=R1) | 不带举报上下文 | 说明 |
-|------|---------------------------|---------------|------|
-| `report_id` 隐藏字段 | ✓ (值为 R1) | ✓ (值为 nil) | 始终存在 |
-| `type` 操作类型 | ✓ (仅 3 种: sensitive/silence/suspend) | ✓ (仅 3 种) | 无 none/disable |
-| `send_email_notification` | ✗ | ✗ | 远端账号不显示 |
-| `include_statuses` | ✗ | ✗ | 条件 `@account.local?` 不满足 |
-| `warning_preset_id` | ✗ | ✗ | 远端账号不显示 |
-| `text` 自定义文本 | ✗ | ✗ | 远端账号不显示 |
+| 字段 | 带举报上下文 (report_id=R1) | 不带举报上下文 | 字段可见性 | 实际值 | 说明 |
+|------|---------------------------|---------------|-----------|--------|------|
+| `report_id` 隐藏字段 | ✓ (值为 R1) | ✓ (值为 nil) | 始终隐藏 | R1 / nil | `new.html.haml:12-13` 始终渲染 |
+| `type` 操作类型 | ✓ (仅 3 种) | ✓ (仅 3 种) | ✓ 可见 | 用户选择 | 无 none/disable |
+| `send_email_notification` | ✗ | ✗ | ✗ 不可见 | false (未提交) | `@account.local?` 为 false |
+| `include_statuses` | ✗ | ✗ | ✗ 不可见 | **true** (默认值) | 模型默认值 + 控制器显式设置 |
+| `warning_preset_id` | ✗ | ✗ | ✗ 不可见 | nil | `@account.local?` 为 false |
+| `text` 自定义文本 | ✗ | ✗ | ✗ 不可见 | 空字符串 | 字段不渲染，提交时无参数 |
+
+**关键理解：字段不可见 ≠ 默认值不生效**：
+
+```
+链路分析:
+
+1. 模型层默认值 (app/models/admin/account_action.rb:15):
+   attribute :include_statuses, :boolean, default: true
+
+2. 控制器初始化 (app/controllers/admin/account_actions_controller.rb:10):
+   @account_action = Admin::AccountAction.new(
+     type: params[:type],
+     report_id: params[:report_id],
+     send_email_notification: true,
+     include_statuses: true   ← 显式设置为 true
+   )
+
+3. 表单渲染 (app/views/admin/account_actions/new.html.haml:12-13):
+   = f.input :report_id, as: :hidden  ← report_id 始终传递
+
+4. 条件判断 (app/views/admin/account_actions/new.html.haml:33-37):
+   - if @account.local?
+     - if params[:report_id].present?
+       = f.input :include_statuses, as: :boolean
+       ← 远端账号: @account.local? = false，字段不渲染
+       ← 但 include_statuses 的值仍然是 true（默认值）
+
+5. status_ids 赋值 (app/models/admin/account_action.rb:127-129):
+   def status_ids
+     report.status_ids if with_report? && include_statuses?
+     ← 远端账号带 report_id 时: with_report? = true, include_statuses? = true
+     ← 所以 status_ids 会被赋值！
+```
 
 **远端账号 vs 本地账号表单差异总结**：
 
-| 账号类型 | 可用 type | send_email | include_statuses | warning_preset | 自定义文本 |
-|---------|-----------|-----------|-----------------|---------------|-----------|
-| 本地账号 | 5 种 | ✓ | ✓ (带 report_id) | ✓ | ✓ |
-| 远端账号 | 3 种 | ✗ | ✗ | ✗ | ✗ |
+| 账号类型 | 可用 type | send_email (值) | include_statuses (可见性) | include_statuses (实际值) | warning_preset | text (值) |
+|---------|-----------|---------------|----------------------|---------------------|---------------|----------|
+| 本地账号 | 5 种 | ✓ true | ✓ (带 report_id 可见) | true | ✓ | 用户输入 |
+| 远端账号 | 3 种 | ✗ false | ✗ 不可见 | **true (默认生效) | ✗ | 空字符串 |
 
 ### 5.3 举报关闭范围差异
 
