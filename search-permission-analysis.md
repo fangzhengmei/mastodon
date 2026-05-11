@@ -4,74 +4,198 @@
 
 Mastodon 的全文搜索采用了**多层权限控制机制**，确保搜索结果只对有权限的用户可见。权限控制发生在多个关键环节：
 
-1. **登录态门禁**：未登录用户无法进入状态全文搜索链路
-2. **索引构建阶段**：通过 `searchable_by` 字段预计算可访问用户列表
-3. **查询执行阶段**：根据 `in:` 参数选择不同索引并应用权限过滤
-4. **结果过滤阶段**：对返回结果进行二次精细权限检查
+1. **全局未认证访问开关**：`DISALLOW_UNAUTHENTICATED_API_ACCESS` 和 `limited_federation_mode` 可在 API 入口层拦截所有未认证请求
+2. **登录态门禁**：状态全文搜索链路要求用户必须登录
+3. **索引构建阶段**：通过 `searchable_by` 字段预计算可访问用户列表
+4. **查询执行阶段**：根据 `in:` 参数选择不同索引并应用权限过滤
+5. **结果过滤阶段**：对返回结果进行二次精细权限检查
 
 ## 2. 整体架构流程图
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         搜索请求入口 (API Controller)                    │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  登录态门禁: @account.present? (SearchService#status_searchable?) │    │
-│  │  - 未登录用户: 直接跳过状态搜索，返回空数组                         │    │
-│  │  - 已登录用户: 进入完整搜索链路                                   │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    全局开关层 (API BaseController)                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  require_authenticated_user! (if disallow_unauthenticated_api_access?) │    │
+│  │  - DISALLOW_UNAUTHENTICATED_API_ACCESS=true  → 强制认证              │    │
+│  │  - limited_federation_mode=true         → 强制认证                  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        查询参数解析 (SearchQueryParser)                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  in: 参数解析 (SearchQueryTransformer#indexes)                    │    │
-│  │  - in:public  → 只搜索 PublicStatusesIndex                       │    │
-│  │  - in:library → 只搜索 StatusesIndex                             │    │
-│  │  - 无参数     → 同时搜索两个索引                                  │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         搜索请求入口 (Search Controller)                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  authorize_if_got_token! :read, :'read:search'                       │    │
+│  │  - 有 token → 验证 scope                                            │    │
+│  │  - 无 token → 放行（默认配置下）                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        索引构建阶段 (权限预计算)                         │
-│  ┌──────────────────────┐    ┌──────────────────────────────────┐      │
-│  │ PublicStatusesIndex  │    │         StatusesIndex             │      │
-│  │ - 公开可见性状态      │    │ - 所有非转发状态                   │      │
-│  │ - 作者可索引          │    │ - 含 searchable_by 字段           │      │
-│  │ - 无 searchable_by    │    │ - 预计算可访问用户ID列表           │      │
-│  └──────────────────────┘    └──────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      登录态门禁 (SearchService)                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  status_searchable? = Chewy.enabled? && status_search? && @account.present? │    │
+│  │  - 未登录(@account.nil?) → 跳过状态搜索，返回空数组                    │    │
+│  │  - 已登录 → 进入完整搜索链路                                          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        查询执行阶段 (ES查询过滤)                         │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  default_filter 权限过滤 (SearchQueryTransformer)                │    │
-│  │  - PublicStatusesIndex: 无条件可见                               │    │
-│  │  - StatusesIndex: searchable_by 包含当前用户ID                   │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        查询参数解析 (SearchQueryParser)                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  in: 参数解析 (SearchQueryTransformer#indexes)                        │    │
+│  │  - in:public  → 只搜索 PublicStatusesIndex                           │    │
+│  │  - in:library → 只搜索 StatusesIndex                                 │    │
+│  │  - 无参数     → 同时搜索两个索引                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        结果过滤阶段 (二次检查)                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  StatusFilter + StatusPolicy 精细检查                             │    │
-│  │  - 作者不可用: 过滤                                             │    │
-│  │  - 可见性级别检查: 私信/私有/公开                                │    │
-│  │  - 拉黑/静音关系检查                                            │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        索引构建阶段 (权限预计算)                             │
+│  ┌──────────────────────┐    ┌──────────────────────────────────┐          │
+│  │ PublicStatusesIndex  │    │         StatusesIndex             │          │
+│  │ - 公开可见性状态      │    │ - 所有非转发状态                   │          │
+│  │ - 作者可索引          │    │ - 含 searchable_by 字段           │          │
+│  │ - 无 searchable_by    │    │ - 预计算可访问用户ID列表           │          │
+│  └──────────────────────┘    └──────────────────────────────────┘          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        查询执行阶段 (ES查询过滤)                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  default_filter 权限过滤 (SearchQueryTransformer)                    │    │
+│  │  - PublicStatusesIndex: 无条件可见                                   │    │
+│  │  - StatusesIndex: searchable_by 包含当前用户ID                       │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        结果过滤阶段 (二次检查)                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  StatusFilter + StatusPolicy 精细检查                                 │    │
+│  │  - 作者不可用: 过滤                                                 │    │
+│  │  - 可见性级别检查: 私信/私有/公开                                    │    │
+│  │  - 拉黑/静音关系检查                                                │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 3. 登录态门禁：未登录用户无法进入状态搜索链路
+## 3. 全局未认证访问开关
 
-### 3.1 门禁位置与实现
+### 3.1 开关定义与触发条件
 
-状态全文搜索有**两层登录态检查**，确保未登录用户无法进入该搜索链路：
+**文件位置**：`app/controllers/api/base_controller.rb:94-96`
 
-#### 第一层：API 控制器层
+```ruby
+def disallow_unauthenticated_api_access?
+  ENV['DISALLOW_UNAUTHENTICATED_API_ACCESS'] == 'true' || Rails.configuration.x.mastodon.limited_federation_mode
+end
+```
+
+两个开关是 **OR** 关系，任一启用即触发强制认证：
+
+| 开关 | 配置方式 | 说明 |
+|------|----------|------|
+| `DISALLOW_UNAUTHENTICATED_API_ACCESS` | 环境变量 | 显式禁止所有未认证 API 访问 |
+| `limited_federation_mode` | 环境变量 `LIMITED_FEDERATION_MODE` 或 `WHITELIST_MODE` | 有限联邦模式，仅与白名单域名通信 |
+
+**配置文件位置**：`config/mastodon.yml:4`
+
+```yaml
+limited_federation_mode: <%= (ENV.fetch('LIMITED_FEDERATION_MODE', nil) || ENV.fetch('WHITELIST_MODE', nil)) == 'true' %>
+```
+
+### 3.2 开关对搜索入口的影响
+
+**文件位置**：`app/controllers/api/base_controller.rb:14-17`
+
+```ruby
+skip_before_action :require_functional!, unless: :limited_federation_mode?
+
+before_action :require_authenticated_user!, if: :disallow_unauthenticated_api_access?
+before_action :require_not_suspended!
+```
+
+当任一开关启用时，`before_action :require_authenticated_user!` 会被触发：
+
+**文件位置**：`app/controllers/api/base_controller.rb:57-59`
+
+```ruby
+def require_authenticated_user!
+  render json: { error: 'This method requires an authenticated user' }, status: 401 unless current_user
+end
+```
+
+### 3.3 不同配置场景下的搜索入口行为
+
+#### 场景 A：默认配置（两个开关均关闭）
+
+```
+未认证请求 → authorize_if_got_token! (无 token 放行)
+                    ↓
+           SearchService#call
+                    ↓
+           status_searchable? = ... && @account.present?
+                    ↓
+           @account.nil? → 跳过状态搜索，返回空数组
+```
+
+**结果**：
+- API 入口允许访问
+- 状态搜索结果为空（`@account.present?` 门禁拦截）
+- 账户和标签搜索可能返回结果（不受此门禁限制）
+
+#### 场景 B：DISALLOW_UNAUTHENTICATED_API_ACCESS=true
+
+```
+未认证请求 → require_authenticated_user!
+                    ↓
+           current_user.nil?
+                    ↓
+           返回 401: "This method requires an authenticated user"
+```
+
+**结果**：
+- API 入口直接拒绝
+- 返回 401 错误
+- 所有搜索类型（账户、状态、标签）均不可用
+
+#### 场景 C：limited_federation_mode=true
+
+```
+未认证请求 → require_authenticated_user!
+                    ↓
+           current_user.nil?
+                    ↓
+           返回 401: "This method requires an authenticated user"
+```
+
+**结果**：
+- 与场景 B 完全相同
+- 有限联邦模式下，所有 API 访问必须认证
+
+### 3.4 全局开关与登录态门禁的层次关系
+
+| 层次 | 检查点 | 默认配置 | 开关启用时 |
+|------|--------|----------|-----------|
+| 第 0 层 | `require_authenticated_user!` | 不执行 | 强制 401 |
+| 第 1 层 | `authorize_if_got_token!` | 无 token 放行 | 需通过第 0 层 |
+| 第 2 层 | `@account.present?` | 状态搜索返回空 | 需通过第 0 层 |
+
+**关键理解**：
+- 全局开关是**更底层、更严格**的控制
+- 登录态门禁是**服务层**的控制，仅影响状态搜索
+- 开关启用时，请求在更早阶段被拦截，根本不会到达 `SearchService`
+
+## 4. 登录态门禁：状态搜索链路的登录要求
+
+### 4.1 控制器层的 token 检查
 
 **文件位置**：`app/controllers/api/v2/search_controller.rb:9-15`
 
@@ -85,9 +209,20 @@ with_options unless: :user_signed_in? do
 end
 ```
 
-虽然控制器允许未登录用户进行基础搜索（需 `authorize_if_got_token!`），但关键限制在服务层。
+**文件位置**：`app/controllers/api/base_controller.rb:90-92`
 
-#### 第二层：SearchService 服务层（关键门禁）
+```ruby
+def authorize_if_got_token!(*scopes)
+  doorkeeper_authorize!(*scopes) if doorkeeper_token
+end
+```
+
+**关键行为**：
+- `authorize_if_got_token!` 是"有 token 才检查"的逻辑
+- 如果请求不带 token，此方法直接放行（不报错）
+- 未登录用户可以到达 `SearchService`
+
+### 4.2 SearchService 层的关键门禁
 
 **文件位置**：`app/services/search_service.rb:86-88`
 
@@ -97,7 +232,7 @@ def status_searchable?
 end
 ```
 
-这是**关键的登录态门禁**。让我们查看 `perform_statuses_search!` 的调用逻辑：
+这是**状态全文搜索链路的关键门禁**。让我们查看调用逻辑：
 
 **文件位置**：`app/services/search_service.rb:16-27`
 
@@ -115,7 +250,7 @@ default_results.tap do |results|
 end
 ```
 
-### 3.2 为什么未登录用户不会进入状态搜索链路
+### 4.3 为什么未登录用户不会进入状态搜索链路
 
 `status_searchable?` 方法的三个条件：
 
@@ -131,7 +266,7 @@ end
 - `results[:statuses]` 保持为默认值 `[]`（空数组）
 - 未登录用户的状态搜索结果始终为空
 
-### 3.3 门禁的设计意图
+### 4.4 门禁的设计意图
 
 这个门禁设计有以下考虑：
 
@@ -140,9 +275,9 @@ end
 3. **性能优化**：减少无效的 Elasticsearch 查询
 4. **与索引设计匹配**：`StatusesIndex` 的 `searchable_by` 字段需要用户 ID 进行过滤
 
-## 4. 索引更新阶段（权限预计算）
+## 5. 索引更新阶段（权限预计算）
 
-### 4.1 触发机制
+### 5.1 触发机制
 
 当内容（Status、Account、Tag）被创建或更新时，Chewy gem 的 Mastodon 策略会捕获这些变更：
 
@@ -171,7 +306,7 @@ end
 - 变更记录被添加到 Redis 队列 `chewy:queue:{index_name}`
 - 由 `Scheduler::IndexingScheduler` 定期处理队列并更新 Elasticsearch 索引
 
-### 4.2 双索引设计
+### 5.2 双索引设计
 
 Mastodon 使用两个独立的状态索引，这是理解 `in:public` 和 `in:library` 差异的基础：
 
@@ -200,7 +335,7 @@ end
 - 仅索引**公开可见性**（`public_visibility`）的状态
 - 要求作者账户设置为可索引（`indexable: true`）
 - **不包含 `searchable_by` 字段**
-- 设计目标：对所有用户（包括未登录）可搜索的公开内容
+- 设计目标：存储可被公开搜索的内容
 
 让我们验证 `indexable` scope 的定义：
 
@@ -238,7 +373,7 @@ end
 - **包含 `searchable_by` 字段**，存储有权限访问该状态的用户 ID 列表
 - 设计目标：用户可以搜索自己互动过的非公开状态
 
-### 4.3 searchable_by 字段计算
+### 5.3 searchable_by 字段计算
 
 **文件位置**：`app/models/concerns/status/search_concern.rb:10-24`
 
@@ -266,9 +401,9 @@ end
 - 仅限本地用户，避免索引膨胀
 - 如果没有任何本地用户互动过，`searchable_by` 为空，状态不会被索引到 `StatusesIndex`
 
-## 5. in:public 与 in:library 查询参数分析
+## 6. in:public 与 in:library 查询参数分析
 
-### 5.1 索引选择逻辑
+### 6.1 索引选择逻辑
 
 **文件位置**：`app/lib/search_query_transformer.rb:57-66`
 
@@ -318,7 +453,7 @@ def flags_from_clauses!
 end
 ```
 
-### 5.2 in:public 与 in:library 的详细对比
+### 6.2 in:public 与 in:library 的详细对比
 
 | 特性 | in:public | in:library | 默认（无参数） |
 |------|-----------|------------|----------------|
@@ -328,7 +463,89 @@ end
 | 权限过滤方式 | 无（索引时已筛选） | searchable_by 匹配 | 组合过滤 |
 | 典型用例 | 搜索公开推文 | 搜索自己点赞/收藏过的内容 | 综合搜索 |
 
-### 5.3 不同参数下的权限裁剪环节
+### 6.3 in:public 场景的两层权限概念澄清
+
+**重要澄清**：`in:public` 场景下存在两个独立的权限概念，需要分开理解：
+
+#### 概念 A：索引层的"公开可见性"
+
+这是指**被索引的内容本身的属性**：
+
+- **位置**：索引构建阶段（`PublicStatusesIndex` 的 `index_scope`）
+- **逻辑**：`public_visibility` + 作者 `indexable: true`
+- **含义**：这个状态**内容本身**是公开的，可以被任何用户看到
+
+```ruby
+# app/models/concerns/status/search_concern.rb:6-8
+scope :indexable, -> { 
+  without_reblogs
+    .public_visibility           # 状态可见性为 public
+    .joins(:account)
+    .where(account: { indexable: true })  # 作者允许被索引
+}
+```
+
+#### 概念 B：状态搜索链路的"登录要求"
+
+这是指**能否进入搜索链路**的门禁：
+
+- **位置**：`SearchService#status_searchable?`
+- **逻辑**：`@account.present?`
+- **含义**：即使搜索的是公开内容，**用户也必须登录才能使用状态搜索功能**
+
+```ruby
+# app/services/search_service.rb:86-88
+def status_searchable?
+  Chewy.enabled? && status_search? && @account.present?  # 必须有登录账户
+end
+```
+
+#### 两层概念的关系与区别
+
+| 维度 | 索引层公开可见性 (A) | 搜索链路登录要求 (B) |
+|------|---------------------|---------------------|
+| 控制目标 | 哪些内容可以被索引 | 谁可以使用搜索功能 |
+| 检查时机 | 索引构建时 | 搜索请求时 |
+| 依赖条件 | 状态可见性 + 作者设置 | 用户登录状态 |
+| 是否可绕过 | 不能（由索引定义决定） | 能（登录即可） |
+| 对 in:public 的影响 | 决定搜索范围是公开内容 | 决定能否执行搜索 |
+
+**关键理解**：
+- `in:public` 只影响**搜索哪些索引**（概念 A）
+- 登录态门禁影响**能否进入搜索链路**（概念 B）
+- 这是两个**独立**的权限控制，互不影响
+- 即使使用 `in:public` 搜索"公开索引"，用户仍需登录才能通过 `@account.present?` 门禁
+
+#### in:public 场景的完整流程
+
+```
+用户发送 in:public 搜索请求
+           ↓
+    全局开关检查（第 0 层）
+           ↓
+    authorize_if_got_token!（第 1 层）
+           ↓
+    status_searchable?（第 2 层）
+           ↓
+    @account.present? 检查
+      ├── true  → 进入搜索链路
+      │              ↓
+      │         解析 in:public
+      │              ↓
+      │         indexes = [PublicStatusesIndex]
+      │              ↓
+      │         ES 查询公开索引
+      │              ↓
+      │         StatusFilter 二次检查
+      │              ↓
+      │         返回公开状态结果
+      │
+      └── false → 跳过搜索链路
+                     ↓
+               results[:statuses] = []
+```
+
+### 6.4 不同参数下的权限裁剪环节
 
 #### 场景 1：in:public 查询
 
@@ -367,7 +584,8 @@ end
 
 | 环节 | 是否生效 | 说明 |
 |------|----------|------|
-| 1. 登录态门禁 | 生效 | 仍需 `@account.present?` 才能进入状态搜索链路 |
+| 0. 全局开关 | 可能生效 | 开关启用时所有未认证请求被拦截 |
+| 1. 登录态门禁 | **生效** | 仍需 `@account.present?` 才能进入状态搜索链路 |
 | 2. 索引构建阶段 | 已预筛选 | PublicStatusesIndex 只包含公开可见性状态 |
 | 3. 查询执行阶段 | 简化 | 只命中 `_index == PublicStatusesIndex` 分支，无额外权限过滤 |
 | 4. 结果过滤阶段 | **完整生效** | StatusFilter + StatusPolicy 仍会检查：<br>- 作者是否拉黑当前用户<br>- 作者是否拉黑当前用户域名<br>- 当前用户是否拉黑/静音作者 |
@@ -389,6 +607,7 @@ end
 
 | 环节 | 是否生效 | 说明 |
 |------|----------|------|
+| 0. 全局开关 | 可能生效 | 开关启用时所有未认证请求被拦截 |
 | 1. 登录态门禁 | 生效 | 必须登录才能使用 |
 | 2. 索引构建阶段 | 生效 | `searchable_by` 预计算可访问用户列表 |
 | 3. 查询执行阶段 | **关键过滤** | ES 查询时要求 `searchable_by` 包含当前用户 ID |
@@ -412,9 +631,9 @@ end
 - 结合了 `in:public` 和 `in:library` 的所有环节
 - 返回结果是两个索引的并集
 
-## 6. 查询执行阶段（搜索请求处理）
+## 7. 查询执行阶段（搜索请求处理）
 
-### 6.1 搜索服务入口
+### 7.1 搜索服务入口
 
 **文件位置**：`app/services/search_service.rb:6-27`
 
@@ -442,7 +661,7 @@ def call(query, account, limit, options = {})
 end
 ```
 
-### 6.2 状态搜索服务
+### 7.2 状态搜索服务
 
 **文件位置**：`app/services/statuses_search_service.rb:27-38`
 
@@ -461,7 +680,7 @@ rescue Faraday::ConnectionFailed, Parslet::ParseFailed, Errno::ENETUNREACH
 end
 ```
 
-### 6.3 查询构建与权限过滤
+### 7.3 查询构建与权限过滤
 
 **文件位置**：`app/lib/search_query_transformer.rb:25-98`
 
@@ -482,9 +701,9 @@ end
 - 应用 `default_filter` 进行权限过滤
 - 对于 `StatusesIndex`，要求 `searchable_by` 包含当前用户 ID
 
-## 7. 结果过滤阶段（二次过滤）
+## 8. 结果过滤阶段（二次过滤）
 
-### 7.1 StatusFilter 过滤器
+### 8.1 StatusFilter 过滤器
 
 **文件位置**：`app/services/statuses_search_service.rb:35`
 
@@ -494,7 +713,7 @@ results.reject { |status| StatusFilter.new(status, @account).filtered? }
 
 **权限裁剪环节 3（结果过滤阶段）**：对 Elasticsearch 返回的结果进行二次精细过滤。
 
-### 7.2 StatusFilter 详细实现
+### 8.2 StatusFilter 详细实现
 
 **文件位置**：`app/lib/status_filter.rb:11-71`
 
@@ -518,7 +737,7 @@ def filtered_status?
 end
 ```
 
-### 7.3 StatusPolicy 权限检查
+### 8.3 StatusPolicy 权限检查
 
 **文件位置**：`app/policies/status_policy.rb:4-14`
 
@@ -548,104 +767,233 @@ end
 - 索引更新有延迟，二次过滤可以弥补
 - 提供额外的安全保障，即使索引权限计算有误也不会泄露隐私
 
-## 8. 权限裁剪环节完整总结
+## 9. 权限裁剪环节完整总结
 
-### 8.1 整体环节表
+### 9.1 整体环节表
 
-| 环节 | 阶段 | 实现位置 | 检查内容 | 未登录状态 | in:public | in:library |
-|------|------|----------|----------|------------|-----------|------------|
-| 0 | 登录态门禁 | `SearchService#status_searchable?` | `@account.present?` | ❌ 不进入链路 | ✅ 需登录 | ✅ 需登录 |
-| 1 | 索引构建 | `Status#searchable_by` | 预计算可访问用户列表 | N/A | N/A（公开索引无此字段） | ✅ 生效 |
-| 2 | 查询执行 | `SearchQueryTransformer#indexes` | 根据 `in:` 参数选择索引 | N/A | `[PublicStatusesIndex]` | `[StatusesIndex]` |
-| 3 | 查询执行 | `SearchQueryTransformer#default_filter` | ES查询时的权限过滤 | N/A | 简化（只检查索引名） | ✅ `searchable_by` 匹配 |
-| 4 | 结果过滤 | `StatusFilter` + `StatusPolicy` | 二次检查：可见性、拉黑/静音 | N/A | ✅ 完整检查 | ✅ 完整检查 |
+| 环节 | 阶段 | 实现位置 | 检查内容 | 未登录(默认) | 未登录(开关启用) | 已登录 + in:public | 已登录 + in:library |
+|------|------|----------|----------|--------------|-----------------|-------------------|---------------------|
+| 0 | 全局开关 | `Api::BaseController` | `disallow_unauthenticated_api_access?` | 不触发 | ❌ 401 错误 | 不触发 | 不触发 |
+| 1 | 登录态门禁 | `SearchService#status_searchable?` | `@account.present?` | ❌ 不进入链路 | N/A | ✅ 通过 | ✅ 通过 |
+| 2 | 索引构建 | `Status#searchable_by` | 预计算可访问用户列表 | N/A | N/A | N/A（公开索引无此字段） | ✅ 生效 |
+| 3 | 查询执行 | `SearchQueryTransformer#indexes` | 根据 `in:` 参数选择索引 | N/A | N/A | `[PublicStatusesIndex]` | `[StatusesIndex]` |
+| 4 | 查询执行 | `SearchQueryTransformer#default_filter` | ES查询时的权限过滤 | N/A | N/A | 简化（只检查索引名） | ✅ `searchable_by` 匹配 |
+| 5 | 结果过滤 | `StatusFilter` + `StatusPolicy` | 二次检查：可见性、拉黑/静音 | N/A | N/A | ✅ 完整检查 | ✅ 完整检查 |
 
-### 8.2 不同场景的权限裁剪流程
+### 9.2 不同场景的权限裁剪流程
 
-#### 场景 A：未登录用户搜索状态
-
-```
-用户请求 → API Controller → SearchService#status_searchable?
-                                    ↓
-                           @account.present? == false
-                                    ↓
-                           perform_statuses_search! 不执行
-                                    ↓
-                           results[:statuses] = []
-```
-
-**结果**：始终返回空数组
-
-#### 场景 B：已登录用户 + in:public
+#### 场景 A：默认配置 + 未登录用户
 
 ```
-用户请求 → 登录态门禁通过 → 解析 in:public
-                                    ↓
-                          indexes = [PublicStatusesIndex]
-                                    ↓
-                          default_filter: _index 匹配即可
-                                    ↓
-                          ES 返回公开状态
-                                    ↓
-                          StatusFilter 二次检查
-                                    ↓
-                          过滤掉被拉黑/静音的内容
+用户请求 → authorize_if_got_token! (无 token 放行)
+                    ↓
+           SearchService#status_searchable?
+                    ↓
+           @account.present? == false
+                    ↓
+           perform_statuses_search! 不执行
+                    ↓
+           results[:statuses] = []
 ```
 
-#### 场景 C：已登录用户 + in:library
+**结果**：API 允许访问，但状态搜索结果为空
+
+#### 场景 B：全局开关启用 + 未登录用户
 
 ```
-用户请求 → 登录态门禁通过 → 解析 in:library
-                                    ↓
-                          indexes = [StatusesIndex]
-                                    ↓
-                          default_filter: searchable_by 包含当前用户ID
-                                    ↓
-                          ES 返回用户互动过的状态
-                                    ↓
-                          StatusFilter 二次检查
-                                    ↓
-                          过滤掉被拉黑/静音的内容
+用户请求 → require_authenticated_user!
+                    ↓
+           current_user.nil?
+                    ↓
+           返回 401: "This method requires an authenticated user"
 ```
 
-#### 场景 D：已登录用户 + 默认查询
+**结果**：API 入口直接拒绝，返回 401
+
+#### 场景 C：已登录用户 + in:public
 
 ```
-用户请求 → 登录态门禁通过 → 无 in: 参数
-                                    ↓
-                    indexes = [PublicStatusesIndex, StatusesIndex]
-                                    ↓
-                    default_filter: 任一索引条件满足即可
-                                    ↓
-                    ES 返回两个索引的合并结果
-                                    ↓
-                    StatusFilter 二次检查
-                                    ↓
-                    返回最终结果
+用户请求 → 全局开关检查通过
+                    ↓
+           authorize_if_got_token! (有 token 或无 token 均可)
+                    ↓
+           @account.present? == true
+                    ↓
+           解析 in:public → indexes = [PublicStatusesIndex]
+                    ↓
+           default_filter: _index 匹配即可
+                    ↓
+           ES 返回公开状态
+                    ↓
+           StatusFilter 二次检查（拉黑/静音）
+                    ↓
+           返回过滤后的公开状态
 ```
 
-## 9. 技术设计特点
+#### 场景 D：已登录用户 + in:library
 
-### 9.1 多层过滤的优势
+```
+用户请求 → 全局开关检查通过
+                    ↓
+           @account.present? == true
+                    ↓
+           解析 in:library → indexes = [StatusesIndex]
+                    ↓
+           default_filter: searchable_by 包含当前用户ID
+                    ↓
+           ES 返回用户互动过的状态
+                    ↓
+           StatusFilter 二次检查
+                    ↓
+           返回最终结果
+```
+
+#### 场景 E：已登录用户 + 默认查询
+
+```
+用户请求 → 全局开关检查通过
+                    ↓
+           @account.present? == true
+                    ↓
+           无 in: 参数 → indexes = [PublicStatusesIndex, StatusesIndex]
+                    ↓
+           default_filter: 任一索引条件满足即可
+                    ↓
+           ES 返回两个索引的合并结果
+                    ↓
+           StatusFilter 二次检查
+                    ↓
+           返回最终结果
+```
+
+## 10. 统一结论
+
+### 10.1 权限控制的层次结构
+
+Mastodon 的状态全文搜索权限控制是一个**多层递进**的体系，各层相互独立但协同工作：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  第 0 层：全局未认证访问开关                                              │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  触发条件：DISALLOW_UNAUTHENTICATED_API_ACCESS 或 limited_federation_mode │  │
+│  │  效果：所有未认证 API 请求返回 401                                 │  │
+│  │  范围：整个 API，包括搜索、时间线等所有端点                        │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  第 1 层：状态搜索链路登录门禁                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  触发条件：SearchService#status_searchable? 中的 @account.present?  │  │
+│  │  效果：未登录用户的状态搜索结果为空（但其他搜索类型可能可用）         │  │
+│  │  范围：仅状态搜索，不影响账户/标签搜索                              │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  第 2 层：in: 参数索引选择                                               │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  触发条件：查询字符串中的 in:public 或 in:library                  │  │
+│  │  效果：决定搜索 PublicStatusesIndex 还是 StatusesIndex             │  │
+│  │  范围：搜索范围（公开内容 vs 互动内容）                             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  第 3 层：ES 查询过滤                                                    │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  触发条件：SearchQueryTransformer#default_filter                   │  │
+│  │  效果：StatusesIndex 需要 searchable_by 匹配当前用户               │  │
+│  │  范围：索引级别的权限过滤                                          │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  第 4 层：结果二次过滤                                                   │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  触发条件：StatusFilter + StatusPolicy                             │  │
+│  │  效果：检查可见性级别、拉黑/静音等动态关系                          │  │
+│  │  范围：最终结果的精细检查                                          │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 关键澄清：避免常见误解
+
+#### 误解 1："in:public 允许未登录用户搜索"
+
+**事实**：
+- `in:public` 只影响**搜索哪些索引**
+- 登录态门禁（`@account.present?`）是**独立**的检查
+- 即使使用 `in:public`，用户仍需登录才能通过门禁
+- 未登录用户的 `in:public` 搜索结果仍为空
+
+#### 误解 2："全局开关和登录态门禁是重复的"
+
+**事实**：
+- 全局开关是**API 入口层**的控制，影响所有 API 端点
+- 登录态门禁是**服务层**的控制，仅影响状态搜索
+- 全局开关更严格（直接 401），登录态门禁更精细（仅状态搜索返回空）
+- 两层控制提供了不同粒度的配置选项
+
+#### 误解 3："PublicStatusesIndex 中的内容任何人都能搜索到"
+
+**事实**：
+- 索引层只保证内容**本身**是公开的
+- 结果过滤阶段仍会检查：
+  - 作者是否拉黑当前用户
+  - 当前用户是否拉黑作者
+- 即使内容是公开的，被拉黑的用户也搜不到
+
+### 10.3 设计意图总结
+
+Mastodon 的这种多层权限设计体现了以下设计哲学：
+
+1. **安全优先**：
+   - 多层过滤确保即使某一层出现问题，其他层仍能提供保护
+   - 二次过滤弥补索引更新延迟的问题
+
+2. **灵活配置**：
+   - 全局开关允许实例管理员完全禁止未认证访问
+   - 默认配置下提供相对开放的体验，但状态搜索仍需登录
+   - `in:` 参数允许用户精确控制搜索范围
+
+3. **隐私保护**：
+   - 未登录用户无法搜索状态（即使是公开状态）
+   - `StatusesIndex` 通过 `searchable_by` 限制私有内容的可见性
+   - 拉黑/静音关系在结果阶段强制执行
+
+4. **性能平衡**：
+   - 索引阶段预计算权限，减少查询时的计算量
+   - ES 查询阶段过滤大部分无权限内容
+   - 结果阶段只对少量候选结果进行精细检查
+
+## 11. 技术设计特点
+
+### 11.1 多层过滤的优势
 
 1. **性能优化**：
-   - 登录态门禁：在最早阶段拦截无效请求
+   - 全局开关：在最早阶段拦截无效请求
+   - 登录态门禁：在服务层拦截状态搜索
    - 索引阶段预计算权限，减少查询时的计算量
    - ES 查询阶段过滤掉大部分无权限的内容
    - 结果阶段只对少量候选结果进行精细检查
 
 2. **安全性保障**：
-   - 未登录用户完全无法进入状态搜索链路
+   - 全局开关可完全禁止未认证访问
+   - 登录态门禁确保状态搜索需要登录
    - `in:public` 和 `in:library` 提供明确的内容隔离
    - 即使索引权限计算有误，结果阶段的二次过滤仍能保障安全
    - 动态变化的关系（如拉黑、关注）在结果阶段实时检查
 
 3. **灵活性**：
+   - 管理员可通过全局开关控制整体访问策略
    - `searchable_by` 字段可以覆盖复杂的权限场景
    - `in:` 参数允许用户精确控制搜索范围
    - `StatusPolicy` 可以实现精细化的权限规则
 
-### 9.2 潜在注意事项
+### 11.2 潜在注意事项
 
 1. **索引更新延迟**：
    - 权限关系变更（如关注、拉黑）不会立即反映在 `searchable_by` 字段中
@@ -661,10 +1009,12 @@ end
    - 这是设计决策，可能限制了未登录用户的搜索体验
    - 但增强了隐私保护和防止滥用
 
-## 10. 关键代码位置汇总
+## 12. 关键代码位置汇总
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
+| 全局开关判断 | `app/controllers/api/base_controller.rb` | 94-96 |
+| 强制认证逻辑 | `app/controllers/api/base_controller.rb` | 16, 57-59 |
 | 登录态门禁 | `app/services/search_service.rb` | 86-88 |
 | 搜索服务入口 | `app/services/search_service.rb` | 6-27 |
 | 状态搜索服务 | `app/services/statuses_search_service.rb` | 27-38 |
@@ -679,3 +1029,4 @@ end
 | API 控制器 | `app/controllers/api/v2/search_controller.rb` | 9-15, 65-72 |
 | Chewy 策略 | `lib/chewy/strategy/mastodon.rb` | 12-27 |
 | 索引调度器 | `app/workers/scheduler/indexing_scheduler.rb` | 13-31 |
+| 配置定义 | `config/mastodon.yml` | 4 |
