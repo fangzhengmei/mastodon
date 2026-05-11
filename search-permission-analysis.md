@@ -4,7 +4,7 @@
 
 Mastodon 的全文搜索采用了**多层权限控制机制**，确保搜索结果只对有权限的用户可见。权限控制发生在多个关键环节：
 
-1. **OAuth 令牌形态识别**：区分无 token、client credentials token、resource owner token
+1. **OAuth 令牌形态识别**：区分无 token、无 token+session 登录、client credentials token、resource owner token
 2. **全局未认证访问开关**：`DISALLOW_UNAUTHENTICATED_API_ACCESS` 和 `limited_federation_mode` 可在 API 入口层拦截
 3. **登录态门禁**：状态全文搜索链路要求 `@account.present?`
 4. **索引构建阶段**：通过 `searchable_by` 字段预计算可访问用户列表
@@ -15,12 +15,13 @@ Mastodon 的全文搜索采用了**多层权限控制机制**，确保搜索结�
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    OAuth 令牌形态识别 (Doorkeeper)                           │
+│                    OAuth 令牌形态识别 (Doorkeeper + Devise)                   │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  doorkeeper_token 的三种形态:                                        │    │
-│  │  - 无 token: doorkeeper_token = nil                                │    │
-│  │  - client credentials: resource_owner_id = nil                      │    │
-│  │  - resource owner: resource_owner_id = 用户 ID                      │    │
+│  │  四种身份场景:                                                        │    │
+│  │  - 无 token + 未登录 session: doorkeeper_token=nil, current_user=nil│    │
+│  │  - 无 token + 已登录 session: doorkeeper_token=nil, current_user=super│    │
+│  │  - client credentials: resource_owner_id=nil, current_user=nil      │    │
+│  │  - resource owner: resource_owner_id=用户ID, current_user=User对象   │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -29,8 +30,9 @@ Mastodon 的全文搜索采用了**多层权限控制机制**，确保搜索结�
 │                    全局开关层 (API BaseController)                           │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │  require_authenticated_user! (if disallow_unauthenticated_api_access?) │    │
-│  │  - DISALLOW_UNAUTHENTICATED_API_ACCESS=true  → 强制认证              │    │
-│  │  - limited_federation_mode=true         → 强制认证                  │    │
+│  │  - 检查 current_user 是否存在                                          │    │
+│  │  - 无 token+未登录、client credentials: 401                            │    │
+│  │  - 无 token+已登录、resource owner: 通过                               │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -40,7 +42,10 @@ Mastodon 的全文搜索采用了**多层权限控制机制**，确保搜索结�
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │  authorize_if_got_token! :read, :'read:search'                       │    │
 │  │  - 有 token → 验证 scope                                            │    │
-│  │  - 无 token → 放行（默认配置下）                                      │    │
+│  │  - 无 token → 放行（包括 session 登录场景）                            │    │
+│  │                                                                   │    │
+│  │  user_signed_in? 额外检查:                                          │    │
+│  │  - 未登录时限制分页和远程解析                                         │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -99,26 +104,27 @@ Mastodon 的全文搜索采用了**多层权限控制机制**，确保搜索结�
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 3. OAuth 令牌形态分析
+## 3. OAuth 令牌形态与 Session 登录分析
 
-### 3.1 三种令牌形态的定义
+### 3.1 四种身份场景的定义
 
-Mastodon 使用 Doorkeeper 作为 OAuth 2.0 实现，支持三种令牌形态：
+Mastodon 结合了 Doorkeeper（OAuth 2.0）和 Devise（Session 认证），存在四种身份场景：
 
 **授权流程配置**：`config/initializers/doorkeeper.rb:170`
 ```ruby
 grant_flows %w(authorization_code client_credentials)
 ```
 
-| 令牌形态 | OAuth 流程 | resource_owner_id | 典型场景 |
-|----------|------------|-------------------|----------|
-| 无 token | N/A | 不存在 | 未认证的浏览器/脚本访问 |
-| client credentials | Client Credentials Grant | `nil` | 服务器到服务器调用，无用户上下文 |
-| resource owner | Authorization Code Grant | 用户的 User.id | 用户授权的第三方应用 |
+| 场景 | OAuth Token | Session 状态 | 身份来源 | 典型场景 |
+|------|-------------|--------------|----------|----------|
+| **无 token + 未登录** | 无 | 未登录 | 无 | 未认证的浏览器/脚本访问 |
+| **无 token + 已登录** | 无 | 已登录 | Devise session | 浏览器中已登录的用户直接访问 API |
+| **client credentials** | 有 | 无关 | Doorkeeper | 服务器到服务器调用，无用户上下文 |
+| **resource owner** | 有 | 无关 | Doorkeeper + 用户授权 | 第三方应用代表用户操作 |
 
-### 3.2 令牌识别与 current_user/current_account 求值链
+### 3.2 身份识别与 current_user/current_account 求值链
 
-**文件位置**：`app/controllers/api/base_controller.rb:43-51`
+**核心求值逻辑**：`app/controllers/api/base_controller.rb:43-51`
 
 ```ruby
 def current_resource_owner
@@ -126,13 +132,13 @@ def current_resource_owner
 end
 
 def current_user
-  current_resource_owner || super
+  current_resource_owner || super  # 关键：|| super
 rescue ActiveRecord::RecordNotFound
   nil
 end
 ```
 
-**文件位置**：`app/controllers/application_controller.rb:119-123`
+**current_account 求值**：`app/controllers/application_controller.rb:119-123`
 
 ```ruby
 def current_account
@@ -142,36 +148,182 @@ def current_account
 end
 ```
 
-**文件位置**：`app/controllers/api/base_controller.rb:90-92`
-
-```ruby
-def authorize_if_got_token!(*scopes)
-  doorkeeper_authorize!(*scopes) if doorkeeper_token
-end
-```
-
-### 3.3 三种令牌形态的求值结果
-
-| 令牌形态 | doorkeeper_token | resource_owner_id | current_user | current_account | authorize_if_got_token! 行为 |
-|----------|------------------|-------------------|--------------|-----------------|------------------------------|
-| **无 token** | `nil` | 不存在 | `nil`（或 session 中的用户） | `nil`（或 session 中的账户） | 直接放行（不执行验证） |
-| **client credentials** | 存在 | `nil` | `nil` | `nil` | 验证 scope（如 `read:search`），通过后 `current_user` 仍为 `nil` |
-| **resource owner** | 存在 | 用户 ID | 该用户对象 | 用户的 Account 对象 | 验证 scope，通过后 `current_user` 和 `current_account` 均有值 |
-
 **关键理解**：
-- `client credentials token` 即使通过了 `authorize_if_got_token!` 验证，`current_user` 和 `current_account` 仍然是 `nil`
-- 这意味着 `client credentials` 本质上是"已认证但无用户"的状态
+- `current_user` 的求值顺序是：**先检查 OAuth token，再回退到 Devise session（`super`）**
+- `super` 会调用 Devise 的 `current_user` 方法，从 session 中获取登录用户
+- 这意味着：**即使没有 OAuth token，只要 session 已登录，`current_user` 也会有值**
 
-### 3.4 不同令牌形态对状态搜索结果的影响
+### 3.3 四种场景的求值结果详解
 
-让我们跟踪三种令牌形态在状态搜索链路中的表现：
-
-#### 形态 1：无 token
+#### 场景 1：无 token + 未登录 session
 
 ```
 请求 → doorkeeper_token = nil
            ↓
-    authorize_if_got_token! → 直接放行
+    current_resource_owner = nil (doorkeeper_token 为 nil)
+           ↓
+    current_user = nil || super
+           ↓
+    super (Devise current_user) = nil (session 未登录)
+           ↓
+    current_user = nil
+           ↓
+    current_account = nil&.account = nil
+```
+
+| 变量 | 值 | 来源 |
+|------|-----|------|
+| `doorkeeper_token` | `nil` | 无 OAuth token |
+| `current_resource_owner` | `nil` | `doorkeeper_token` 为 nil |
+| `current_user` | `nil` | `super` 返回 nil |
+| `current_account` | `nil` | `current_user` 为 nil |
+
+#### 场景 2：无 token + 已登录 session（浏览器用户）
+
+```
+请求 → doorkeeper_token = nil
+           ↓
+    current_resource_owner = nil (doorkeeper_token 为 nil)
+           ↓
+    current_user = nil || super
+           ↓
+    super (Devise current_user) = User对象 (从 session cookie 读取)
+           ↓
+    current_user = User对象
+           ↓
+    current_account = User对象.account = Account对象
+```
+
+| 变量 | 值 | 来源 |
+|------|-----|------|
+| `doorkeeper_token` | `nil` | 无 OAuth token |
+| `current_resource_owner` | `nil` | `doorkeeper_token` 为 nil |
+| `current_user` | User 对象 | `super`（Devise session） |
+| `current_account` | Account 对象 | `current_user.account` |
+
+**重要发现**：
+- 这是浏览器中已登录用户访问 API 的常见场景
+- 用户通过表单登录后，session cookie 被设置
+- 后续 API 调用通过 cookie 中的 session ID 进行认证
+- 不需要 OAuth token 也能获得完整的用户身份
+
+#### 场景 3：client credentials token
+
+```
+请求 → doorkeeper_token 存在 (client_credentials 类型)
+           ↓
+    current_resource_owner = User.find(nil) → nil (resource_owner_id 为 nil)
+           ↓
+    current_user = nil || super
+           ↓
+    super 可能返回 User对象 或 nil (取决于 session)
+           ↓
+    current_user = (取决于 session)
+           ↓
+    current_account = (取决于 current_user)
+```
+
+| 变量 | 值 | 来源 |
+|------|-----|------|
+| `doorkeeper_token` | 存在 | Client Credentials Grant |
+| `current_resource_owner` | `nil` | `resource_owner_id` 为 nil |
+| `current_user` | 取决于 session | `super`（Devise session） |
+| `current_account` | 取决于 session | `current_user.account` |
+
+**关键理解**：
+- `client credentials` 的 `resource_owner_id` 始终为 `nil`
+- 但 `current_user` 仍可能通过 `super` 从 session 获得值
+- 这意味着：**client credentials + 已登录 session = 完整用户身份**
+- 但纯 client credentials 调用（无 session）的 `current_user` 为 `nil`
+
+#### 场景 4：resource owner token
+
+```
+请求 → doorkeeper_token 存在 (authorization_code 类型)
+           ↓
+    current_resource_owner = User.find(123) → User对象 (resource_owner_id = 123)
+           ↓
+    current_user = User对象 || super
+           ↓
+    current_user = User对象 (|| 短路，super 不执行)
+           ↓
+    current_account = User对象.account = Account对象
+```
+
+| 变量 | 值 | 来源 |
+|------|-----|------|
+| `doorkeeper_token` | 存在 | Authorization Code Grant |
+| `current_resource_owner` | User 对象 | `User.find(resource_owner_id)` |
+| `current_user` | User 对象 | `current_resource_owner`（短路 super） |
+| `current_account` | Account 对象 | `current_user.account` |
+
+### 3.4 四种身份场景的对比总结
+
+| 场景 | doorkeeper_token | resource_owner_id | current_user 来源 | current_user | current_account |
+|------|------------------|-------------------|-------------------|--------------|-----------------|
+| **无 token + 未登录** | `nil` | N/A | 无 | `nil` | `nil` |
+| **无 token + 已登录** | `nil` | N/A | Devise session (`super`) | User 对象 | Account 对象 |
+| **client credentials** | 存在 | `nil` | 取决于 session | 取决于 session | 取决于 session |
+| **resource owner** | 存在 | 用户 ID | Doorkeeper | User 对象 | Account 对象 |
+
+### 3.5 四种身份场景对状态搜索结果的影响
+
+让我们跟踪四种场景在状态搜索链路中的表现：
+
+#### 场景 A：无 token + 未登录
+
+```
+请求 → current_user = nil
+           ↓
+    SearchService#call(account: nil)
+           ↓
+    status_searchable? = ... && @account.present?
+           ↓
+    @account.nil? → false
+           ↓
+    perform_statuses_search! 不执行
+           ↓
+    results[:statuses] = []
+```
+
+**结果**：状态搜索返回空数组
+
+#### 场景 B：无 token + 已登录（浏览器用户）
+
+```
+请求 → current_user = User对象 (来自 super)
+           ↓
+    current_account = Account对象
+           ↓
+    SearchService#call(account: Account对象)
+           ↓
+    status_searchable? = ... && @account.present?
+           ↓
+    @account.present? → true
+           ↓
+    perform_statuses_search! 执行
+           ↓
+    进入完整搜索链路
+           ↓
+    返回搜索结果
+```
+
+**结果**：完整的状态搜索结果（与 resource owner token 相同）
+
+#### 场景 C：client credentials token（无 session）
+
+```
+请求 → doorkeeper_token 存在
+           ↓
+    authorize_if_got_token! → 验证 scope（read:search）
+           ↓
+    scope 验证通过
+           ↓
+    current_resource_owner = User.find(nil) → nil
+           ↓
+    current_user = nil || super
+           ↓
+    super = nil (无 session)
            ↓
     current_user = nil
            ↓
@@ -190,7 +342,7 @@ end
 
 **结果**：状态搜索返回空数组
 
-#### 形态 2：client credentials token
+#### 场景 D：resource owner token
 
 ```
 请求 → doorkeeper_token 存在
@@ -199,43 +351,11 @@ end
            ↓
     scope 验证通过
            ↓
-    current_resource_owner = User.find(nil) → nil
+    current_resource_owner = User.find(123) → User对象
            ↓
-    current_user = nil
+    current_user = User对象
            ↓
-    current_account = nil
-           ↓
-    SearchService#call(account: nil)
-           ↓
-    status_searchable? = ... && @account.present?
-           ↓
-    @account.nil? → false
-           ↓
-    perform_statuses_search! 不执行
-           ↓
-    results[:statuses] = []
-```
-
-**关键发现**：
-- `client credentials token` 即使通过了 OAuth 认证和 scope 验证
-- 但由于 `resource_owner_id` 为 `nil`，`current_user` 仍为 `nil`
-- 因此 `status_searchable?` 中的 `@account.present?` 检查失败
-- **状态搜索结果仍为空数组**
-
-#### 形态 3：resource owner token
-
-```
-请求 → doorkeeper_token 存在
-           ↓
-    authorize_if_got_token! → 验证 scope（read:search）
-           ↓
-    scope 验证通过
-           ↓
-    current_resource_owner = User.find(123) → 用户对象
-           ↓
-    current_user = 用户对象
-           ↓
-    current_account = 用户对象.account → Account 对象
+    current_account = Account对象
            ↓
     SearchService#call(account: Account对象)
            ↓
@@ -252,18 +372,20 @@ end
 
 **结果**：完整的状态搜索结果
 
-### 3.5 三种令牌形态的对比总结
+### 3.6 四种场景的最终对比
 
-| 令牌形态 | OAuth 认证 | Scope 验证 | current_user | current_account | status_searchable? | 状态搜索结果 |
-|----------|-----------|------------|--------------|-----------------|-------------------|-------------|
-| 无 token | ❌ | 不执行 | `nil` | `nil` | ❌ | `[]` |
-| client credentials | ✅ | ✅（如果 scope 正确） | `nil` | `nil` | ❌ | `[]` |
-| resource owner | ✅ | ✅（如果 scope 正确） | 用户对象 | Account 对象 | ✅ | 完整结果 |
+| 场景 | OAuth 认证 | Session 认证 | current_user | current_account | status_searchable? | 状态搜索结果 |
+|------|-----------|-------------|--------------|-----------------|-------------------|-------------|
+| 无 token + 未登录 | ❌ | ❌ | `nil` | `nil` | ❌ | `[]` |
+| 无 token + 已登录 | ❌ | ✅ | User 对象 | Account 对象 | ✅ | 完整结果 |
+| client credentials | ✅ | ❌ | `nil` | `nil` | ❌ | `[]` |
+| resource owner | ✅ | 无关 | User 对象 | Account 对象 | ✅ | 完整结果 |
 
 **重要结论**：
-- `client credentials token` 只能被视为"应用认证"，而非"用户认证"
-- 只有 `resource owner token` 才能提供完整的用户上下文，通过 `status_searchable?` 检查
-- 这是 Mastodon 的安全设计：即使是可信的第三方应用，没有用户授权也不能代表用户搜索状态
+- **无 token + 已登录 session** 与 **resource owner token** 具有相同的权限
+- 这是 Mastodon 前端 Web 应用的标准认证方式
+- `client credentials` 即使通过了 OAuth 认证，没有 session 的话仍无法搜索状态
+- 身份识别的核心是 `current_user` 是否存在，而不是 token 类型
 
 ## 4. 全局未认证访问开关
 
@@ -311,11 +433,11 @@ def require_authenticated_user!
 end
 ```
 
-### 4.3 开关与令牌形态的交互
+### 4.3 开关与四种身份场景的交互
 
-让我们分析全局开关启用时，不同令牌形态的行为：
+让我们分析全局开关启用时，四种身份场景的行为：
 
-#### 场景 A：全局开关启用 + 无 token
+#### 场景 A：全局开关启用 + 无 token + 未登录
 
 ```
 请求 → require_authenticated_user!
@@ -327,12 +449,30 @@ end
 
 **结果**：直接 401 拒绝
 
-#### 场景 B：全局开关启用 + client credentials token
+#### 场景 B：全局开关启用 + 无 token + 已登录
+
+```
+请求 → current_user = User对象 (来自 super)
+           ↓
+    require_authenticated_user!
+           ↓
+    current_user.present? → 通过
+           ↓
+    继续执行后续逻辑
+```
+
+**结果**：通过认证检查，继续执行
+
+#### 场景 C：全局开关启用 + client credentials + 未登录
 
 ```
 请求 → doorkeeper_token 存在（client credentials）
            ↓
     current_resource_owner = User.find(nil) → nil
+           ↓
+    current_user = nil || super
+           ↓
+    super = nil (无 session)
            ↓
     current_user = nil
            ↓
@@ -345,17 +485,17 @@ end
 
 **关键发现**：
 - `client credentials token` 即使通过了 OAuth 认证
-- 但 `current_user` 仍为 `nil`
+- 但 `current_user` 仍为 `nil`（无 session 时）
 - 全局开关启用时，也会被 `require_authenticated_user!` 拦截
 
-#### 场景 C：全局开关启用 + resource owner token
+#### 场景 D：全局开关启用 + resource owner token
 
 ```
 请求 → doorkeeper_token 存在（resource owner）
            ↓
-    current_resource_owner = User.find(123) → 用户对象
+    current_resource_owner = User.find(123) → User对象
            ↓
-    current_user = 用户对象
+    current_user = User对象
            ↓
     require_authenticated_user!
            ↓
@@ -366,56 +506,25 @@ end
 
 **结果**：通过认证检查，继续执行
 
-### 4.4 不同配置场景下的入口行为
+### 4.4 开关与四种场景的对照表
 
-#### 场景 A：默认配置（两个开关均关闭）
-
-```
-未认证请求 → authorize_if_got_token! (无 token 放行)
-                    ↓
-           SearchService#call
-                    ↓
-           status_searchable? = ... && @account.present?
-                    ↓
-           @account.nil? → 跳过状态搜索，返回空数组
-           account_searchable? → 可能执行账户搜索
-           hashtag_searchable? → 可能执行标签搜索
-```
-
-**结果**：
-- API 入口允许访问
-- 状态搜索结果为空（`@account.present?` 门禁拦截）
-- 账户和标签搜索可能返回结果（不受此门禁限制）
-
-#### 场景 B：DISALLOW_UNAUTHENTICATED_API_ACCESS=true 或 limited_federation_mode=true
-
-```
-未认证请求 → require_authenticated_user!
-                    ↓
-           current_user.nil?
-                    ↓
-           返回 401: "This method requires an authenticated user"
-```
-
-**结果**：
-- API 入口直接拒绝
-- 返回 401 错误
-- 所有搜索类型（账户、状态、标签）均不可用
-
-### 4.5 全局开关与登录态门禁的层次关系
-
-| 层次 | 检查点 | 检查条件 | 默认配置 | 开关启用时 |
-|------|--------|----------|----------|-----------|
-| 第 0 层 | `require_authenticated_user!` | `current_user` | 不执行 | 强制 401（无 token 和 client credentials 均失败） |
-| 第 1 层 | `authorize_if_got_token!` | scope 验证 | 无 token 放行 | 需通过第 0 层 |
-| 第 2 层 | `@account.present?` | 分类型检查 | 状态搜索返回空 | 需通过第 0 层 |
+| 全局开关 | 身份场景 | current_user | 开关行为 |
+|----------|----------|--------------|----------|
+| **关** | 无 token + 未登录 | `nil` | 不拦截 |
+| **关** | 无 token + 已登录 | User 对象 | 不拦截 |
+| **关** | client credentials | 取决于 session | 不拦截 |
+| **关** | resource owner | User 对象 | 不拦截 |
+| **开** | 无 token + 未登录 | `nil` | ❌ 401 |
+| **开** | 无 token + 已登录 | User 对象 | ✅ 通过 |
+| **开** | client credentials (无 session) | `nil` | ❌ 401 |
+| **开** | client credentials (有 session) | User 对象 | ✅ 通过 |
+| **开** | resource owner | User 对象 | ✅ 通过 |
 
 **关键理解**：
-- 全局开关是**更底层、更严格**的控制
-- `client credentials token` 在全局开关启用时也会被拦截，因为 `current_user` 为 `nil`
-- 只有 `resource owner token` 才能完整通过所有层次
-- 登录态门禁是**服务层**的控制，仅影响状态搜索
-- 全局开关启用时，请求在更早阶段被拦截，根本不会到达 `SearchService`
+- 全局开关检查的是 `current_user` 是否存在
+- 与 token 类型无关，只看最终的 `current_user` 值
+- `无 token + 已登录 session` 和 `resource owner token` 都能通过
+- `client credentials` 只有在有 session 登录时才能通过
 
 ## 5. 入口权限矩阵
 
@@ -442,80 +551,106 @@ end
 - `account_searchable?`：只检查搜索类型 → **无需登录**
 - `hashtag_searchable?`：只检查搜索类型 → **无需登录**
 
-### 5.2 完整入口权限矩阵
+### 5.2 完整入口权限矩阵（四种身份场景）
 
 矩阵维度：
 - **全局开关**：关（默认）/ 开（DISALLOW_UNAUTHENTICATED_API_ACCESS 或 limited_federation_mode）
-- **令牌类型**：无 token / client credentials / resource owner
+- **身份场景**：无 token+未登录 / 无 token+已登录 / client credentials / resource owner
 - **搜索类型**：statuses / accounts / hashtags
 
-| 全局开关 | 令牌类型 | current_user | statuses | accounts | hashtags | 说明 |
-|----------|----------|--------------|----------|----------|----------|------|
-| **关** | **无 token** | `nil` | ❌ 空数组 | ✅ 可搜索 | ✅ 可搜索 | 状态搜索被 `@account.present?` 拦截 |
-| **关** | **client credentials** | `nil` | ❌ 空数组 | ✅ 可搜索 | ✅ 可搜索 | scope 验证通过，但 `current_user` 仍为 `nil` |
-| **关** | **resource owner** | 用户对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 | 完整用户上下文 |
-| **开** | **无 token** | `nil` | ❌ 401 错误 | ❌ 401 错误 | ❌ 401 错误 | 被 `require_authenticated_user!` 拦截 |
-| **开** | **client credentials** | `nil` | ❌ 401 错误 | ❌ 401 错误 | ❌ 401 错误 | `current_user` 为 `nil`，被拦截 |
-| **开** | **resource owner** | 用户对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 | 通过所有检查 |
+#### 矩阵 1：全局开关关闭（默认配置）
+
+| 身份场景 | current_user | current_account | statuses | accounts | hashtags | 说明 |
+|----------|--------------|-----------------|----------|----------|----------|------|
+| **无 token + 未登录** | `nil` | `nil` | ❌ 空数组 | ✅ 可搜索 | ✅ 可搜索 | 状态搜索被 `@account.present?` 拦截 |
+| **无 token + 已登录** | User 对象 | Account 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 | 浏览器已登录用户，通过 session 认证 |
+| **client credentials (无 session)** | `nil` | `nil` | ❌ 空数组 | ✅ 可搜索 | ✅ 可搜索 | scope 验证通过，但 `current_user` 为 `nil` |
+| **client credentials (有 session)** | User 对象 | Account 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 | 不常见场景，token + session 双重认证 |
+| **resource owner** | User 对象 | Account 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 | OAuth 用户授权，完整用户上下文 |
+
+#### 矩阵 2：全局开关开启
+
+| 身份场景 | current_user | statuses | accounts | hashtags | 说明 |
+|----------|--------------|----------|----------|----------|------|
+| **无 token + 未登录** | `nil` | ❌ 401 | ❌ 401 | ❌ 401 | 被 `require_authenticated_user!` 拦截 |
+| **无 token + 已登录** | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 | session 认证通过 |
+| **client credentials (无 session)** | `nil` | ❌ 401 | ❌ 401 | ❌ 401 | `current_user` 为 `nil`，被拦截 |
+| **client credentials (有 session)** | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 | session 认证通过 |
+| **resource owner** | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 | OAuth 认证通过 |
 
 ### 5.3 矩阵解读
 
-#### 行 1-3：全局开关关闭（默认配置）
+#### 关键差异：无 token + 未登录 vs 无 token + 已登录
 
-**行 1：无 token**
-- 这是最常见的"未登录用户"场景
-- 状态搜索：`status_searchable?` 中的 `@account.present?` 为 `false`，跳过执行，返回空数组
-- 账户/标签搜索：不受 `@account.present?` 限制，可以返回公开结果
+这是最容易混淆的两种场景：
 
-**行 2：client credentials token**
-- 这是"服务器到服务器"的调用场景
-- 虽然通过了 OAuth 认证和 scope 验证
-- 但 `resource_owner_id` 为 `nil`，导致 `current_user` 为 `nil`
-- 状态搜索结果与"无 token"完全相同：空数组
-- 账户/标签搜索：可以搜索（公开数据）
+| 维度 | 无 token + 未登录 | 无 token + 已登录 |
+|------|------------------|------------------|
+| OAuth token | 无 | 无 |
+| Session cookie | 无/无效 | 有效 |
+| `current_user` | `nil` | User 对象 |
+| `current_account` | `nil` | Account 对象 |
+| `user_signed_in?` | `false` | `true` |
+| 全局开关（开） | ❌ 401 | ✅ 通过 |
+| `status_searchable?` | ❌ | ✅ |
+| 状态搜索结果 | 空数组 | 完整结果 |
 
-**行 3：resource owner token**
-- 这是完整的"用户授权"场景
-- `current_user` 和 `current_account` 都有值
-- 所有搜索类型都可用
-- 状态搜索可以返回个性化结果（如 `in:library` 的内容）
+**典型场景**：
+- **无 token + 未登录**：匿名脚本访问 API，或未登录浏览器
+- **无 token + 已登录**：用户在浏览器中登录后，前端 JavaScript 调用 API
 
-#### 行 4-6：全局开关开启
+#### 全局开关关闭时的行为（默认）
 
-**行 4：无 token**
-- 被 `require_authenticated_user!` 直接拦截
-- 返回 401 错误
-- 所有搜索类型都不可用
+- **无 token + 未登录**：API 允许访问，但状态搜索被 `@account.present?` 拦截，返回空数组；账户和标签搜索可用
+- **无 token + 已登录**：完整权限，所有搜索类型可用
+- **client credentials (无 session)**：OAuth 认证通过，但状态搜索仍为空（`current_user` 为 `nil`）
+- **resource owner**：完整权限，所有搜索类型可用
 
-**行 5：client credentials token**
-- **重要发现**：即使使用了 client credentials token
-- `current_user` 仍为 `nil`（因为 `resource_owner_id` 为 `nil`）
-- 被 `require_authenticated_user!` 拦截
-- 返回 401 错误
-- 这意味着全局开关要求的是"用户认证"，而非"应用认证"
+#### 全局开关开启时的行为
 
-**行 6：resource owner token**
-- 完整的用户认证
-- 通过所有检查
-- 所有搜索类型都可用
+- **无 token + 未登录**：被 `require_authenticated_user!` 拦截，返回 401
+- **无 token + 已登录**：通过 `current_user` 检查，完整权限
+- **client credentials (无 session)**：被拦截，返回 401（`current_user` 为 `nil`）
+- **resource owner**：通过检查，完整权限
 
-### 5.4 client credentials 与 resource owner 的关键区别
+### 5.4 user_signed_in? 的额外限制
 
-| 维度 | client credentials | resource owner |
-|------|-------------------|----------------|
-| OAuth 流程 | Client Credentials Grant | Authorization Code Grant |
-| resource_owner_id | `nil` | 用户 ID |
-| current_user | `nil` | 用户对象 |
-| current_account | `nil` | Account 对象 |
-| 全局开关检查 | ❌ 失败（current_user 为 nil） | ✅ 通过 |
-| 状态搜索 | ❌ 空数组 | ✅ 完整结果 |
-| 代表身份 | 应用 | 用户 |
+**文件位置**：`app/controllers/api/v2/search_controller.rb:12-15`
 
-**设计意图**：
-- `client credentials` 是"应用认证"，代表应用本身的权限
-- `resource owner` 是"用户认证"，代表用户的授权
-- 全局开关 `require_authenticated_user!` 明确要求的是"用户"（`current_user`）
-- 状态搜索 `status_searchable?` 也明确要求的是"用户账户"（`@account.present?`）
+```ruby
+with_options unless: :user_signed_in? do
+  before_action :query_pagination_error, if: :pagination_requested?
+  before_action :remote_resolve_error, if: :remote_resolve_requested?
+end
+```
+
+即使 `current_user` 存在（通过 token 或 session），`user_signed_in?` 还会对未登录用户施加额外限制：
+
+| 限制项 | 未登录用户 | 已登录用户 |
+|--------|-----------|-----------|
+| 分页 (`offset` 参数) | ❌ 401 错误 | ✅ 可用 |
+| 远程解析 (`resolve` 参数) | ❌ 401 错误 | ✅ 可用 |
+
+**关键理解**：
+- `user_signed_in?` 是 Devise 提供的方法，检查的是 session 登录状态
+- 即使 `current_user` 存在（通过 resource owner token），`user_signed_in?` 也可能返回 `false`
+- 这意味着：**resource owner token 认证的用户可能无法使用分页和远程解析**
+- 只有 **无 token + 已登录 session** 的用户才能完全绕过这些限制
+
+### 5.5 四种身份场景的完整权限对比
+
+| 场景 | current_user | user_signed_in? | 全局开关(开) | status_searchable? | 分页 | 远程解析 |
+|------|--------------|-----------------|-------------|-------------------|------|----------|
+| 无 token + 未登录 | `nil` | `false` | ❌ 401 | ❌ | ❌ | ❌ |
+| 无 token + 已登录 | User 对象 | `true` | ✅ | ✅ | ✅ | ✅ |
+| client credentials (无 session) | `nil` | `false` | ❌ 401 | ❌ | ❌ | ❌ |
+| client credentials (有 session) | User 对象 | `true` | ✅ | ✅ | ✅ | ✅ |
+| resource owner | User 对象 | `false` | ✅ | ✅ | ❌ | ❌ |
+
+**发现**：
+- **无 token + 已登录 session** 是权限最完整的场景（浏览器标准用户）
+- **resource owner token** 虽然能搜索状态，但无法使用分页和远程解析
+- 这是 Mastodon 前端（Web UI）和 API 客户端的权限差异
 
 ## 6. 登录态门禁：状态搜索链路的登录要求
 
@@ -544,8 +679,8 @@ end
 **关键行为**：
 - `authorize_if_got_token!` 是"有 token 才检查"的逻辑
 - 如果请求不带 token，此方法直接放行（不报错）
-- 如果带了 client credentials token，scope 验证通过但 `current_user` 仍为 `nil`
-- 未登录用户（无 token 或 client credentials）可以到达 `SearchService`
+- 如果带了 client credentials token，scope 验证通过但 `current_user` 可能仍为 `nil`
+- 无 token 但有 session 的用户可以完全通过此检查
 
 ### 6.2 SearchService 层的关键门禁
 
@@ -583,21 +718,19 @@ default_results.tap do |results|
 end
 ```
 
-### 6.3 为什么未登录用户不会进入状态搜索链路
+### 6.3 四种身份场景的登录态门禁检查
 
 `status_searchable?` 方法的三个条件：
 
-| 条件 | 说明 | 无 token 时 | client credentials 时 | resource owner 时 |
-|------|------|-------------|----------------------|-------------------|
-| `Chewy.enabled?` | Elasticsearch 是否启用 | 可能为 true | 可能为 true | 可能为 true |
-| `status_search?` | 搜索类型是否包含 statuses | 可能为 true | 可能为 true | 可能为 true |
-| `@account.present?` | 当前是否有登录账户 | **false** | **false** | **true** |
+| 条件 | 说明 | 无 token+未登录 | 无 token+已登录 | client credentials (无 session) | resource owner |
+|------|------|----------------|----------------|-------------------------------|----------------|
+| `Chewy.enabled?` | ES 是否启用 | 可能为 true | 可能为 true | 可能为 true | 可能为 true |
+| `status_search?` | 搜索类型 | 可能为 true | 可能为 true | 可能为 true | 可能为 true |
+| `@account.present?` | 登录账户 | **false** | **true** | **false** | **true** |
 
 **关键结论**：
-- 当 `@account.nil?`（无 token 或 client credentials）时，`status_searchable?` 返回 `false`
-- 因此 `perform_statuses_search!` 永远不会被调用
-- `results[:statuses]` 保持为默认值 `[]`（空数组）
-- 未登录用户的状态搜索结果始终为空
+- `无 token + 未登录` 和 `client credentials (无 session)`：`@account.nil?` → 跳过状态搜索
+- `无 token + 已登录` 和 `resource owner`：`@account.present?` → 执行状态搜索
 
 ### 6.4 门禁的设计意图
 
@@ -607,7 +740,7 @@ end
 2. **避免滥用**：未登录用户无法大规模搜索状态内容
 3. **性能优化**：减少无效的 Elasticsearch 查询
 4. **与索引设计匹配**：`StatusesIndex` 的 `searchable_by` 字段需要用户 ID 进行过滤
-5. **身份明确性**：只有 `resource owner token` 才能明确代表用户身份
+5. **身份明确性**：只有具有 `current_account` 的身份才能进行个性化搜索
 
 ## 7. 索引更新阶段（权限预计算）
 
@@ -834,34 +967,31 @@ def status_searchable?
 end
 ```
 
-#### 两层概念的关系与区别
+#### 两层概念与四种身份场景的关系
 
-| 维度 | 索引层公开可见性 (A) | 搜索链路登录要求 (B) |
-|------|---------------------|---------------------|
-| 控制目标 | 哪些内容可以被索引 | 谁可以使用搜索功能 |
-| 检查时机 | 索引构建时 | 搜索请求时 |
-| 依赖条件 | 状态可见性 + 作者设置 | 用户登录状态 |
-| 是否可绕过 | 不能（由索引定义决定） | 能（登录即可） |
-| 对 in:public 的影响 | 决定搜索范围是公开内容 | 决定能否执行搜索 |
-| 与令牌形态的关系 | 无关 | 只有 resource owner token 能通过 |
+| 身份场景 | 索引层公开可见性 (A) | 搜索链路登录要求 (B) | 最终结果 |
+|----------|---------------------|---------------------|----------|
+| 无 token + 未登录 | 始终可用（索引定义） | ❌ `@account.present? = false` | 空数组 |
+| 无 token + 已登录 | 始终可用（索引定义） | ✅ `@account.present? = true` | 完整结果 |
+| client credentials (无 session) | 始终可用（索引定义） | ❌ `@account.present? = false` | 空数组 |
+| resource owner | 始终可用（索引定义） | ✅ `@account.present? = true` | 完整结果 |
 
 **关键理解**：
 - `in:public` 只影响**搜索哪些索引**（概念 A）
 - 登录态门禁影响**能否进入搜索链路**（概念 B）
 - 这是两个**独立**的权限控制，互不影响
-- 即使使用 `in:public` 搜索"公开索引"，用户仍需登录（resource owner token）才能通过 `@account.present?` 门禁
-- `client credentials token` 即使通过了 OAuth 认证，也无法通过此门禁
+- 即使使用 `in:public` 搜索"公开索引"，用户仍需登录才能通过 `@account.present?` 门禁
+- `无 token + 已登录 session` 和 `resource owner token` 都能通过门禁
 
 #### in:public 场景的完整流程
 
 ```
 用户发送 in:public 搜索请求
            ↓
-    OAuth 令牌检查
-           ↓
-    令牌形态判断
-      ├── 无 token → @account = nil → status_searchable? = false → 结果空
-      ├── client credentials → @account = nil → status_searchable? = false → 结果空
+    身份场景判断
+      ├── 无 token + 未登录 → @account = nil → status_searchable? = false → 结果空
+      ├── client credentials (无 session) → @account = nil → status_searchable? = false → 结果空
+      ├── 无 token + 已登录 → @account 有值 → 继续
       └── resource owner → @account 有值 → 继续
                                 ↓
                           全局开关检查（第 0 层）
@@ -918,8 +1048,8 @@ end
 
 | 环节 | 是否生效 | 说明 |
 |------|----------|------|
-| 0. OAuth 令牌形态 | 生效 | 只有 resource owner token 能提供 `@account` |
-| 1. 全局开关 | 可能生效 | 开关启用时所有未认证请求被拦截（包括 client credentials） |
+| 0. 身份场景识别 | 生效 | 只有提供 `@account` 的场景能通过门禁 |
+| 1. 全局开关 | 可能生效 | 开关启用时需要 `current_user` 存在 |
 | 2. 登录态门禁 | **生效** | 仍需 `@account.present?` 才能进入状态搜索链路 |
 | 3. 索引构建阶段 | 已预筛选 | PublicStatusesIndex 只包含公开可见性状态 |
 | 4. 查询执行阶段 | 简化 | 只命中 `_index == PublicStatusesIndex` 分支，无额外权限过滤 |
@@ -942,8 +1072,8 @@ end
 
 | 环节 | 是否生效 | 说明 |
 |------|----------|------|
-| 0. OAuth 令牌形态 | 生效 | 只有 resource owner token 能提供 `@account` |
-| 1. 全局开关 | 可能生效 | 开关启用时所有未认证请求被拦截 |
+| 0. 身份场景识别 | 生效 | 只有提供 `@account` 的场景能通过门禁 |
+| 1. 全局开关 | 可能生效 | 开关启用时需要 `current_user` 存在 |
 | 2. 登录态门禁 | 生效 | 必须登录才能使用 |
 | 3. 索引构建阶段 | 生效 | `searchable_by` 预计算可访问用户列表 |
 | 4. 查询执行阶段 | **关键过滤** | ES 查询时要求 `searchable_by` 包含当前用户 ID |
@@ -1105,29 +1235,26 @@ end
 
 ## 11. 权限裁剪环节完整总结
 
-### 11.1 整体环节表（含令牌形态）
+### 11.1 整体环节表（含四种身份场景）
 
-| 环节 | 阶段 | 实现位置 | 检查内容 | 无 token | client credentials | resource owner |
-|------|------|----------|----------|----------|-------------------|----------------|
-| 0 | OAuth 令牌形态 | Doorkeeper | resource_owner_id 是否存在 | `nil` | `nil` | 用户 ID |
-| 1 | current_user 求值 | `Api::BaseController` | `User.find(resource_owner_id)` | `nil` | `nil` | 用户对象 |
-| 2 | 全局开关 | `Api::BaseController` | `disallow_unauthenticated_api_access?` | 可能触发 401 | 可能触发 401 | 通过 |
-| 3 | 登录态门禁 | `SearchService#status_searchable?` | `@account.present?` | ❌ | ❌ | ✅ |
-| 4 | 索引构建 | `Status#searchable_by` | 预计算可访问用户列表 | N/A | N/A | ✅ 生效 |
-| 5 | 查询执行 | `SearchQueryTransformer#indexes` | 根据 `in:` 参数选择索引 | N/A | N/A | 根据参数 |
-| 6 | 查询执行 | `SearchQueryTransformer#default_filter` | ES查询时的权限过滤 | N/A | N/A | ✅ 生效 |
-| 7 | 结果过滤 | `StatusFilter` + `StatusPolicy` | 二次检查：可见性、拉黑/静音 | N/A | N/A | ✅ 完整检查 |
+| 环节 | 阶段 | 实现位置 | 检查内容 | 无 token+未登录 | 无 token+已登录 | client credentials (无 session) | resource owner |
+|------|------|----------|----------|----------------|----------------|-------------------------------|----------------|
+| 0 | 身份识别 | Doorkeeper + Devise | `current_user` 求值链 | `nil` | User 对象 | `nil` | User 对象 |
+| 1 | 全局开关 | `Api::BaseController` | `disallow_unauthenticated_api_access?` | 可能 401 | 通过 | 可能 401 | 通过 |
+| 2 | 登录态门禁 | `SearchService#status_searchable?` | `@account.present?` | ❌ | ✅ | ❌ | ✅ |
+| 3 | 索引构建 | `Status#searchable_by` | 预计算可访问用户列表 | N/A | ✅ 生效 | N/A | ✅ 生效 |
+| 4 | 查询执行 | `SearchQueryTransformer#indexes` | 根据 `in:` 参数选择索引 | N/A | 根据参数 | N/A | 根据参数 |
+| 5 | 查询执行 | `SearchQueryTransformer#default_filter` | ES查询时的权限过滤 | N/A | ✅ 生效 | N/A | ✅ 生效 |
+| 6 | 结果过滤 | `StatusFilter` + `StatusPolicy` | 二次检查：可见性、拉黑/静音 | N/A | ✅ 完整检查 | N/A | ✅ 完整检查 |
 
 ### 11.2 不同场景的权限裁剪流程
 
-#### 场景 A：默认配置 + 无 token
+#### 场景 A：默认配置 + 无 token + 未登录
 
 ```
 用户请求 → doorkeeper_token = nil
                     ↓
-           authorize_if_got_token! → 直接放行
-                    ↓
-           current_user = nil
+           current_user = nil || super = nil
                     ↓
            current_account = nil
                     ↓
@@ -1146,37 +1273,31 @@ end
 
 **结果**：API 允许访问，但状态搜索结果为空
 
-#### 场景 B：默认配置 + client credentials token
+#### 场景 B：默认配置 + 无 token + 已登录（浏览器用户）
 
 ```
-用户请求 → doorkeeper_token 存在
+用户请求 → doorkeeper_token = nil
                     ↓
-           authorize_if_got_token! → 验证 scope（read:search）
+           current_user = nil || super = User对象 (session)
                     ↓
-           scope 验证通过
+           current_account = Account对象
                     ↓
-           current_resource_owner = User.find(nil) → nil
-                    ↓
-           current_user = nil
-                    ↓
-           current_account = nil
-                    ↓
-           SearchService#call(account: nil)
+           SearchService#call(account: Account对象)
                     ↓
            status_searchable? = ... && @account.present?
                     ↓
-           @account.nil? → false
+           @account.present? → true
                     ↓
-           perform_statuses_search! 不执行
+           perform_statuses_search! 执行
                     ↓
-           results[:statuses] = []
-           results[:accounts] = 可能有结果
-           results[:hashtags] = 可能有结果
+           进入完整搜索链路
+                    ↓
+           返回搜索结果
 ```
 
-**结果**：OAuth 认证通过，但状态搜索结果仍为空
+**结果**：完整的状态搜索结果
 
-#### 场景 C：全局开关启用 + client credentials token
+#### 场景 C：全局开关启用 + 无 token + 未登录
 
 ```
 用户请求 → require_authenticated_user!
@@ -1188,16 +1309,34 @@ end
 
 **结果**：API 入口直接拒绝，返回 401
 
-#### 场景 D：resource owner token + in:public
+#### 场景 D：全局开关启用 + client credentials + 无 session
+
+```
+用户请求 → doorkeeper_token 存在
+                    ↓
+           current_resource_owner = User.find(nil) → nil
+                    ↓
+           current_user = nil || super = nil
+                    ↓
+           require_authenticated_user!
+                    ↓
+           current_user.nil?
+                    ↓
+           返回 401: "This method requires an authenticated user"
+```
+
+**结果**：API 入口直接拒绝，返回 401
+
+#### 场景 E：resource owner token + in:public
 
 ```
 用户请求 → doorkeeper_token 存在（resource owner）
                     ↓
-           authorize_if_got_token! → 验证 scope
+           current_resource_owner = User.find(123) → User对象
                     ↓
-           current_user = 用户对象
+           current_user = User对象
                     ↓
-           current_account = Account 对象
+           current_account = Account对象
                     ↓
            @account.present? == true
                     ↓
@@ -1212,7 +1351,7 @@ end
            返回过滤后的公开状态
 ```
 
-#### 场景 E：resource owner token + in:library
+#### 场景 F：resource owner token + in:library
 
 ```
 用户请求 → 全局开关检查通过
@@ -1230,24 +1369,6 @@ end
            返回最终结果
 ```
 
-#### 场景 F：resource owner token + 默认查询
-
-```
-用户请求 → 全局开关检查通过
-                    ↓
-           @account.present? == true
-                    ↓
-           无 in: 参数 → indexes = [PublicStatusesIndex, StatusesIndex]
-                    ↓
-           default_filter: 任一索引条件满足即可
-                    ↓
-           ES 返回两个索引的合并结果
-                    ↓
-           StatusFilter 二次检查
-                    ↓
-           返回最终结果
-```
-
 ## 12. 统一结论
 
 ### 12.1 权限控制的层次结构
@@ -1256,14 +1377,15 @@ Mastodon 的状态全文搜索权限控制是一个**多层递进**的体系，�
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  第 0 层：OAuth 令牌形态识别                                             │
+│  第 0 层：身份场景识别（OAuth + Session）                                 │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  三种形态:                                                          │  │
-│  │  - 无 token: doorkeeper_token = nil                               │  │
-│  │  - client credentials: resource_owner_id = nil                     │  │
-│  │  - resource owner: resource_owner_id = 用户 ID                     │  │
+│  │  四种场景:                                                          │  │
+│  │  - 无 token + 未登录: current_user = nil                          │  │
+│  │  - 无 token + 已登录: current_user = User对象 (super)              │  │
+│  │  - client credentials (无 session): current_user = nil            │  │
+│  │  - resource owner: current_user = User对象 (Doorkeeper)           │  │
 │  │                                                                   │  │
-│  │  关键区别: 只有 resource owner token 能提供 current_user          │  │
+│  │  关键: current_user = current_resource_owner || super             │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
@@ -1272,7 +1394,7 @@ Mastodon 的状态全文搜索权限控制是一个**多层递进**的体系，�
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │  触发条件：DISALLOW_UNAUTHENTICATED_API_ACCESS 或 limited_federation_mode │  │
 │  │  检查逻辑：require_authenticated_user! → current_user 是否存在    │  │
-│  │  效果：无 token 和 client credentials 均返回 401                  │  │
+│  │  效果：无 token+未登录、client credentials (无 session) 返回 401   │  │
 │  │  范围：整个 API，包括搜索、时间线等所有端点                        │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -1318,49 +1440,68 @@ Mastodon 的状态全文搜索权限控制是一个**多层递进**的体系，�
 
 ### 12.2 关键澄清：避免常见误解
 
-#### 误解 1："client credentials token 可以搜索状态"
+#### 误解 1："无 token 就一定是未登录"
+
+**事实**：
+- `current_user = current_resource_owner || super`
+- `super` 会从 Devise session 中获取登录用户
+- **无 token + 已登录 session** 也是一种合法的已认证状态
+- 这是 Mastodon 前端 Web 应用的标准认证方式
+
+#### 误解 2："client credentials token 可以搜索状态"
 
 **事实**：
 - `client credentials token` 通过 OAuth 认证和 scope 验证
-- 但 `resource_owner_id` 为 `nil`，导致 `current_user` 为 `nil`
+- 但 `resource_owner_id` 为 `nil`，导致 `current_resource_owner` 为 `nil`
+- 如果没有 session 登录，`super` 也返回 `nil`
 - `status_searchable?` 中的 `@account.present?` 检查失败
 - **状态搜索结果为空数组**
-- 只有 `resource owner token` 才能提供完整的用户上下文
 
-#### 误解 2："全局开关只拦截无 token 的请求"
+#### 误解 3："全局开关只拦截无 token 的请求"
 
 **事实**：
 - 全局开关检查的是 `current_user`
-- `client credentials token` 的 `current_user` 为 `nil`
+- `client credentials (无 session)` 的 `current_user` 为 `nil`
 - 全局开关启用时，`client credentials` 也会被拦截并返回 401
 - 全局开关要求的是"用户认证"，而非"应用认证"
 
-#### 误解 3："in:public 允许未登录用户搜索"
+#### 误解 4："in:public 允许未登录用户搜索"
 
 **事实**：
 - `in:public` 只影响**搜索哪些索引**
 - 登录态门禁（`@account.present?`）是**独立**的检查
-- 即使使用 `in:public`，用户仍需登录（resource owner token）才能通过门禁
-- `client credentials token` 也无法通过此门禁
+- 即使使用 `in:public`，用户仍需登录才能通过门禁
+- `无 token + 未登录` 和 `client credentials (无 session)` 都无法通过此门禁
 
-#### 误解 4："account_searchable? 也需要登录"
+#### 误解 5："resource owner token 与 session 登录权限相同"
 
 **事实**：
-- `status_searchable?` 额外检查 `@account.present?`
-- `account_searchable?` 和 `hashtag_searchable?` 只检查搜索类型
-- 账户和标签搜索对未登录用户（包括 client credentials）是开放的
-- 这是因为账户和标签是公开数据，而状态可能包含私人互动
+- `resource owner token`：`current_user` 存在，但 `user_signed_in?` 可能为 `false`
+- `无 token + 已登录 session`：`current_user` 存在，且 `user_signed_in? = true`
+- **差异**：`user_signed_in?` 为 `false` 时，无法使用分页和远程解析
+- 这是前端 Web UI 与 API 客户端的权限差异
 
 ### 12.3 入口权限矩阵总结回顾
 
-| 全局开关 | 令牌类型 | current_user | statuses | accounts | hashtags |
-|----------|----------|--------------|----------|----------|----------|
-| **关** | **无 token** | `nil` | ❌ 空数组 | ✅ 可搜索 | ✅ 可搜索 |
-| **关** | **client credentials** | `nil` | ❌ 空数组 | ✅ 可搜索 | ✅ 可搜索 |
-| **关** | **resource owner** | 用户对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 |
-| **开** | **无 token** | `nil` | ❌ 401 错误 | ❌ 401 错误 | ❌ 401 错误 |
-| **开** | **client credentials** | `nil` | ❌ 401 错误 | ❌ 401 错误 | ❌ 401 错误 |
-| **开** | **resource owner** | 用户对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 |
+#### 全局开关关闭（默认）
+
+| 身份场景 | current_user | statuses | accounts | hashtags |
+|----------|--------------|----------|----------|----------|
+| 无 token + 未登录 | `nil` | ❌ 空数组 | ✅ 可搜索 | ✅ 可搜索 |
+| 无 token + 已登录 | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 |
+| client credentials (无 session) | `nil` | ❌ 空数组 | ✅ 可搜索 | ✅ 可搜索 |
+| client credentials (有 session) | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 |
+| resource owner | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 |
+
+#### 全局开关开启
+
+| 身份场景 | current_user | statuses | accounts | hashtags |
+|----------|--------------|----------|----------|----------|
+| 无 token + 未登录 | `nil` | ❌ 401 | ❌ 401 | ❌ 401 |
+| 无 token + 已登录 | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 |
+| client credentials (无 session) | `nil` | ❌ 401 | ❌ 401 | ❌ 401 |
+| client credentials (有 session) | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 |
+| resource owner | User 对象 | ✅ 完整结果 | ✅ 可搜索 | ✅ 可搜索 |
 
 ### 12.4 设计意图总结
 
@@ -1368,7 +1509,7 @@ Mastodon 的这种多层权限设计体现了以下设计哲学：
 
 1. **身份明确性优先**：
    - `client credentials` 是"应用认证"，不代表用户身份
-   - 只有 `resource owner` 才是明确的"用户授权"
+   - 只有 `resource owner` 或 `session 登录` 才是明确的"用户授权"
    - 状态搜索需要明确的用户身份来进行个性化权限判断
 
 2. **安全分层防御**：
@@ -1396,7 +1537,7 @@ Mastodon 的这种多层权限设计体现了以下设计哲学：
 ### 13.1 多层过滤的优势
 
 1. **性能优化**：
-   - OAuth 令牌识别：在最早阶段确定身份
+   - 身份识别：在最早阶段确定身份
    - 全局开关：拦截无效请求
    - 登录态门禁：在服务层拦截状态搜索
    - 索引阶段预计算权限，减少查询时的计算量
@@ -1404,7 +1545,7 @@ Mastodon 的这种多层权限设计体现了以下设计哲学：
    - 结果阶段只对少量候选结果进行精细检查
 
 2. **安全性保障**：
-   - `client credentials` 无法伪装成用户
+   - `client credentials (无 session)` 无法伪装成用户
    - 全局开关可完全禁止未认证访问
    - 登录态门禁确保状态搜索需要登录
    - `in:public` 和 `in:library` 提供明确的内容隔离
@@ -1439,12 +1580,13 @@ Mastodon 的这种多层权限设计体现了以下设计哲学：
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
 | current_resource_owner | `app/controllers/api/base_controller.rb` | 43-45 |
-| current_user 重定义 | `app/controllers/api/base_controller.rb` | 47-51 |
+| current_user 重定义（含 super） | `app/controllers/api/base_controller.rb` | 47-51 |
 | require_authenticated_user! | `app/controllers/api/base_controller.rb` | 57-59 |
 | require_client_credentials! | `app/controllers/api/base_controller.rb` | 53-55 |
 | authorize_if_got_token! | `app/controllers/api/base_controller.rb` | 90-92 |
 | 全局开关判断 | `app/controllers/api/base_controller.rb` | 94-96 |
 | current_account | `app/controllers/application_controller.rb` | 119-123 |
+| user_signed_in? 额外限制 | `app/controllers/api/v2/search_controller.rb` | 12-15 |
 | 状态搜索门禁 | `app/services/search_service.rb` | 86-88 |
 | 账户搜索门禁 | `app/services/search_service.rb` | 90-92 |
 | 标签搜索门禁 | `app/services/search_service.rb` | 94-96 |
